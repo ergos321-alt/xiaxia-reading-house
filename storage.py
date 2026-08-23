@@ -82,7 +82,8 @@ def ping() -> bool:
             if isinstance(bucket, dict)
             else getattr(bucket, "public", None)
         )
-        return public is not True
+        # Missing/unknown visibility is not safe enough for private books.
+        return public is False
     except Exception:
         return False
 

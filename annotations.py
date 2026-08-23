@@ -1,7 +1,8 @@
-"""Persistent user highlights, notes, Xiaxia replies, and status transitions."""
+"""Persistent user annotations, Xiaxia replies, and independent thoughts."""
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from uuid import UUID
 
@@ -9,23 +10,35 @@ from flask import Blueprint, jsonify, request
 
 import database as db
 from auth import api_or_session_required
-from reading import _json_safe, _uuid_or_none
+from reading import _chapter_blocks, _json_safe, _text_across_blocks, _uuid_or_none
 
 
 annotations_bp = Blueprint("annotations", __name__)
 
 
+USER_ANNOTATION_FIELDS = """
+    a.id, a.book_id, a.chapter_id, a.selected_text,
+    a.start_block_id, a.start_offset, a.end_block_id, a.end_offset,
+    a.prefix_text, a.suffix_text, a.comment, a.status,
+    a.created_at, a.updated_at,
+    ar.response as xiaxia_response, ar.created_at as reply_created_at,
+    ar.updated_at as reply_updated_at
+"""
+
+XIA_THOUGHT_FIELDS = """
+    xt.id, xt.book_id, xt.chapter_id, xt.scope, xt.mark_type, xt.content,
+    xt.selected_text, xt.start_block_id, xt.start_offset,
+    xt.end_block_id, xt.end_offset, xt.prefix_text, xt.suffix_text,
+    xt.created_at, xt.updated_at
+"""
+
+
 @annotations_bp.get("/api/books/<uuid:book_id>/chapters/<uuid:chapter_id>/annotations")
 @api_or_session_required
 def list_chapter_annotations(book_id: UUID, chapter_id: UUID):
-    rows = db.fetch_all(
-        """
-        select a.id, a.book_id, a.chapter_id, a.selected_text,
-               a.start_block_id, a.start_offset, a.end_block_id, a.end_offset,
-               a.prefix_text, a.suffix_text, a.comment, a.status,
-               a.created_at, a.updated_at,
-               ar.response as xiaxia_response, ar.created_at as reply_created_at,
-               ar.updated_at as reply_updated_at
+    annotations = db.fetch_all(
+        f"""
+        select {USER_ANNOTATION_FIELDS}
         from annotations a
         left join annotation_replies ar on ar.annotation_id = a.id
         where a.book_id = %s and a.chapter_id = %s
@@ -33,7 +46,73 @@ def list_chapter_annotations(book_id: UUID, chapter_id: UUID):
         """,
         (book_id, chapter_id),
     )
-    return jsonify({"annotations": [_json_safe(row) for row in rows]})
+    thoughts = db.fetch_all(
+        f"""
+        select {XIA_THOUGHT_FIELDS}
+        from xiaxia_thoughts xt
+        where xt.book_id = %s and xt.chapter_id = %s
+        order by xt.created_at
+        """,
+        (book_id, chapter_id),
+    )
+    return jsonify(
+        {
+            "annotations": [_json_safe(row) for row in annotations],
+            "xiaxia_thoughts": [_json_safe(row) for row in thoughts],
+            "sync_token": _latest_sync_token(annotations, thoughts),
+        }
+    )
+
+
+@annotations_bp.get("/api/books/<uuid:book_id>/annotations")
+@api_or_session_required
+def list_book_annotations(book_id: UUID):
+    filter_name = request.args.get("filter", "all").strip().lower()
+    filters = {
+        "all": "true",
+        "highlights": "a.comment = ''",
+        "comments": "a.comment <> ''",
+        "replies": "ar.annotation_id is not null",
+    }
+    if filter_name not in filters:
+        return jsonify({"error": "invalid_annotation_filter"}), 400
+
+    annotations = db.fetch_all(
+        f"""
+        select {USER_ANNOTATION_FIELDS},
+               c.title as chapter_title, c.chapter_index
+        from annotations a
+        join chapters c on c.id = a.chapter_id
+        left join annotation_replies ar on ar.annotation_id = a.id
+        where a.book_id = %s and {filters[filter_name]}
+        order by c.chapter_index, a.created_at
+        """,
+        (book_id,),
+    )
+    thoughts: list[dict[str, Any]] = []
+    if filter_name == "all":
+        thoughts = db.fetch_all(
+            f"""
+            select {XIA_THOUGHT_FIELDS},
+                   c.title as chapter_title, c.chapter_index
+            from xiaxia_thoughts xt
+            join chapters c on c.id = xt.chapter_id
+            where xt.book_id = %s
+            order by c.chapter_index, xt.created_at
+            """,
+            (book_id,),
+        )
+    return jsonify(
+        {
+            "filter": filter_name,
+            "annotations": [_json_safe(row) for row in annotations],
+            "xiaxia_thoughts": [_json_safe(row) for row in thoughts],
+            "counts": {
+                "annotations": len(annotations),
+                "xiaxia_thoughts": len(thoughts),
+            },
+        }
+    )
 
 
 @annotations_bp.post("/api/annotations")
@@ -93,6 +172,61 @@ def create_annotation():
     return jsonify({"annotation": result}), 201
 
 
+@annotations_bp.patch("/api/annotations/<uuid:annotation_id>")
+@api_or_session_required
+def update_annotation(annotation_id: UUID):
+    payload = request.get_json(silent=True) or {}
+    if "comment" not in payload:
+        return jsonify({"error": "comment_required"}), 400
+    comment = _clean_text(payload.get("comment"), 20_000, allow_empty=True)
+    row = db.fetch_one(
+        f"""
+        with updated as (
+            update annotations
+            set comment = %s,
+                status = case when status = 'seen' then 'pending' else status end,
+                updated_at = now()
+            where id = %s
+            returning *
+        )
+        select {USER_ANNOTATION_FIELDS}
+        from updated a
+        left join annotation_replies ar on ar.annotation_id = a.id
+        """,
+        (comment, annotation_id),
+    )
+    if not row:
+        return jsonify({"error": "annotation_not_found"}), 404
+    return jsonify({"annotation": _json_safe(row)})
+
+
+@annotations_bp.delete("/api/annotations/<uuid:annotation_id>")
+@api_or_session_required
+def delete_annotation(annotation_id: UUID):
+    with db.transaction() as conn:
+        existing = conn.execute(
+            """
+            select a.id, exists (
+                select 1 from annotation_replies ar where ar.annotation_id = a.id
+            ) as had_reply
+            from annotations a where a.id = %s for update
+            """,
+            (annotation_id,),
+        ).fetchone()
+        if not existing:
+            return jsonify({"error": "annotation_not_found"}), 404
+        # annotation_replies.annotation_id uses ON DELETE CASCADE. The delete
+        # therefore removes any reply atomically and cannot leave an orphan.
+        conn.execute("delete from annotations where id = %s", (annotation_id,))
+    return jsonify(
+        {
+            "deleted": True,
+            "annotation_id": str(annotation_id),
+            "deleted_reply": bool(existing["had_reply"]),
+        }
+    )
+
+
 @annotations_bp.get("/api/annotations/pending")
 @api_or_session_required
 def pending_annotations():
@@ -147,6 +281,18 @@ def mark_annotation_seen(annotation_id: UUID):
             insert into ai_reading_state (book_id, last_chapter_read, last_annotation_seen)
             values (%s, %s, %s)
             on conflict (book_id) do update set
+                last_chunk_index = case
+                    when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then null
+                    else ai_reading_state.last_chunk_index
+                end,
+                last_block_id = case
+                    when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then null
+                    else ai_reading_state.last_block_id
+                end,
+                chapter_completed = case
+                    when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then false
+                    else ai_reading_state.chapter_completed
+                end,
                 last_chapter_read = excluded.last_chapter_read,
                 last_annotation_seen = excluded.last_annotation_seen,
                 updated_at = now()
@@ -191,6 +337,18 @@ def reply_to_annotation(annotation_id: UUID):
             insert into ai_reading_state (book_id, last_chapter_read, last_annotation_seen)
             values (%s, %s, %s)
             on conflict (book_id) do update set
+                last_chunk_index = case
+                    when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then null
+                    else ai_reading_state.last_chunk_index
+                end,
+                last_block_id = case
+                    when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then null
+                    else ai_reading_state.last_block_id
+                end,
+                chapter_completed = case
+                    when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then false
+                    else ai_reading_state.chapter_completed
+                end,
                 last_chapter_read = excluded.last_chapter_read,
                 last_annotation_seen = excluded.last_annotation_seen,
                 updated_at = now()
@@ -200,6 +358,134 @@ def reply_to_annotation(annotation_id: UUID):
     result = _json_safe(reply)
     result["status"] = "replied"
     return jsonify({"reply": result})
+
+
+@annotations_bp.post("/api/xiaxia/thoughts")
+@api_or_session_required
+def create_xiaxia_thought():
+    payload = request.get_json(silent=True) or {}
+    book_id = _uuid_or_none(payload.get("book_id"))
+    chapter_id = _uuid_or_none(payload.get("chapter_id"))
+    scope = str(payload.get("scope") or "").strip().lower()
+    mark_type = _clean_mark_type(payload.get("mark_type"))
+    content = _clean_text(payload.get("content"), 50_000)
+    if not book_id or not chapter_id or scope not in {"range", "block", "chapter"}:
+        return jsonify({"error": "invalid_thought_scope"}), 400
+    if not content:
+        return jsonify({"error": "content_required"}), 400
+    if not mark_type:
+        return jsonify({"error": "invalid_mark_type"}), 400
+    chapter = db.fetch_one(
+        "select id, book_id, content_html from chapters where id = %s and book_id = %s",
+        (chapter_id, book_id),
+    )
+    if not chapter:
+        return jsonify({"error": "chapter_not_found"}), 404
+
+    try:
+        anchor = _thought_anchor(scope, payload, chapter["content_html"])
+    except ValueError as exc:
+        return jsonify({"error": "invalid_thought_anchor", "message": str(exc)}), 400
+    row = db.execute(
+        """
+        insert into xiaxia_thoughts (
+            book_id, chapter_id, scope, mark_type, content, selected_text,
+            start_block_id, start_offset, end_block_id, end_offset,
+            prefix_text, suffix_text
+        ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        returning id, book_id, chapter_id, scope, mark_type, content, selected_text,
+                  start_block_id, start_offset, end_block_id, end_offset,
+                  prefix_text, suffix_text, created_at, updated_at
+        """,
+        (
+            book_id,
+            chapter_id,
+            scope,
+            mark_type,
+            content,
+            anchor["selected_text"],
+            anchor["start_block_id"],
+            anchor["start_offset"],
+            anchor["end_block_id"],
+            anchor["end_offset"],
+            anchor["prefix_text"],
+            anchor["suffix_text"],
+        ),
+    )
+    return jsonify({"xiaxia_thought": _json_safe(row)}), 201
+
+
+def _thought_anchor(scope: str, payload: dict[str, Any], content_html: str):
+    empty = {
+        "selected_text": "",
+        "start_block_id": None,
+        "start_offset": None,
+        "end_block_id": None,
+        "end_offset": None,
+        "prefix_text": "",
+        "suffix_text": "",
+    }
+    if scope == "chapter":
+        return empty
+    blocks = _chapter_blocks(content_html)
+    block_map = {block["block_id"]: block for block in blocks}
+    if scope == "block":
+        block_id = _clean_block_id(
+            payload.get("block_id") or payload.get("start_block_id")
+        )
+        block = block_map.get(block_id)
+        if not block:
+            raise ValueError("block_id does not exist in this chapter")
+        text = block["text"]
+        return {
+            "selected_text": text,
+            "start_block_id": block_id,
+            "start_offset": 0,
+            "end_block_id": block_id,
+            "end_offset": len(text),
+            "prefix_text": "",
+            "suffix_text": "",
+        }
+
+    start_block_id = _clean_block_id(payload.get("start_block_id"))
+    end_block_id = _clean_block_id(payload.get("end_block_id"))
+    try:
+        start_offset = int(payload.get("start_offset"))
+        end_offset = int(payload.get("end_offset"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("range offsets must be integers") from exc
+    selected = _text_across_blocks(
+        blocks, start_block_id, start_offset, end_block_id, end_offset
+    )
+    if not selected.strip():
+        raise ValueError("range is empty or outside the chapter")
+    supplied = _clean_selected_text(payload.get("selected_text"), 20_000)
+    if supplied and _normalize_text(supplied) != _normalize_text(selected):
+        raise ValueError("selected_text does not match the supplied block offsets")
+    start_text = block_map[start_block_id]["text"]
+    end_text = block_map[end_block_id]["text"]
+    return {
+        "selected_text": selected,
+        "start_block_id": start_block_id,
+        "start_offset": start_offset,
+        "end_block_id": end_block_id,
+        "end_offset": end_offset,
+        "prefix_text": start_text[max(0, start_offset - 120) : start_offset],
+        "suffix_text": end_text[end_offset : end_offset + 120],
+    }
+
+
+def _latest_sync_token(*collections: list[dict[str, Any]]) -> str:
+    values = []
+    for collection in collections:
+        for row in collection:
+            for field in ("updated_at", "reply_updated_at", "created_at"):
+                value = row.get(field)
+                if value is not None:
+                    values.append(
+                        value.isoformat() if hasattr(value, "isoformat") else str(value)
+                    )
+    return max(values, default="")
 
 
 def _clean_text(value: Any, max_length: int, allow_empty: bool = False) -> str:
@@ -216,6 +502,15 @@ def _clean_selected_text(value: Any, max_length: int) -> str:
 
 def _clean_block_id(value: Any) -> str:
     text = str(value or "")
-    if len(text) > 64 or not text.startswith("b") or not text[1:].isdigit():
+    if len(text) > 64 or not re.fullmatch(r"b\d+", text):
         return ""
     return text
+
+
+def _clean_mark_type(value: Any) -> str:
+    text = str(value or "thought").strip().lower()
+    return text if re.fullmatch(r"[a-z0-9_-]{1,64}", text) else ""
+
+
+def _normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()

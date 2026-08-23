@@ -137,6 +137,7 @@ UNSAFE_TAGS = {
     "svg",
     "math",
 }
+MAX_AUTOMATIC_TITLE_LENGTH = 160
 
 
 def parse_uploaded_book(filename: str, data: bytes) -> ParsedBook:
@@ -164,12 +165,12 @@ def _parse_epub(filename: str, data: bytes) -> ParsedBook:
             "无法解析 EPUB；文件可能损坏、带 DRM 或不是标准 EPUB"
         ) from exc
 
-    title = _metadata_value(book, "title") or PurePosixPath(filename).stem
+    title = _preferred_book_title(_metadata_value(book, "title"), filename)
     author = _metadata_value(book, "creator") or "未知作者"
     toc, toc_titles = _extract_toc(book.toc)
     assets = _extract_assets(book)
     asset_paths = {asset.path for asset in assets}
-    cover_path = _find_cover_path(book, asset_paths)
+    cover_path = _find_cover_path(book, assets)
 
     chapters: list[ParsedChapter] = []
     for idref, _linear in book.spine:
@@ -207,7 +208,7 @@ def _parse_epub(filename: str, data: bytes) -> ParsedBook:
         raise BookParseError("EPUB 中没有找到可阅读的正文篇章")
 
     return ParsedBook(
-        title=_clean_metadata(title),
+        title=title,
         author=_clean_metadata(author),
         format="epub",
         source_filename=filename,
@@ -289,6 +290,15 @@ def _clean_metadata(value: str) -> str:
     ).strip()
 
 
+def _preferred_book_title(metadata_title: str | None, filename: str) -> str:
+    """Use sane metadata, otherwise the filename; never guess from body text."""
+    cleaned = _clean_metadata(metadata_title or "")
+    if cleaned and len(cleaned) <= MAX_AUTOMATIC_TITLE_LENGTH:
+        return cleaned
+    fallback = _clean_metadata(PurePosixPath(filename).stem)
+    return (fallback or "未命名书籍")[:MAX_AUTOMATIC_TITLE_LENGTH]
+
+
 def _extract_toc(raw_toc: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
     title_map: dict[str, str] = {}
 
@@ -334,24 +344,86 @@ def _extract_assets(book: epub.EpubBook) -> list[ParsedAsset]:
     return assets
 
 
-def _find_cover_path(book: epub.EpubBook, asset_paths: set[str]) -> str | None:
-    cover_meta = book.get_metadata("OPF", "cover")
-    if cover_meta:
-        cover_id = cover_meta[0][1].get("content") if len(cover_meta[0]) > 1 else None
-        if cover_id:
-            item = book.get_item_with_id(cover_id)
-            if item:
-                candidate = _normalize_asset_path(item.get_name())
-                if candidate in asset_paths:
-                    return candidate
-    for item in book.get_items_of_type(ebooklib.ITEM_COVER):
-        candidate = _normalize_asset_path(item.get_name())
-        if candidate in asset_paths:
+def _find_cover_path(book: epub.EpubBook, assets: list[ParsedAsset]) -> str | None:
+    """Resolve EPUB3, EPUB2, and common publisher cover conventions."""
+    asset_paths = {asset.path for asset in assets}
+    image_items = [
+        item
+        for item in book.get_items()
+        if item.get_type() in {ebooklib.ITEM_IMAGE, ebooklib.ITEM_COVER}
+    ]
+
+    # EPUB3: <item properties="cover-image">.
+    for item in image_items:
+        properties = {
+            str(value).strip().lower()
+            for value in (getattr(item, "properties", None) or [])
+        }
+        if "cover-image" in properties:
+            candidate = _item_asset_path(item, asset_paths)
+            if candidate:
+                return candidate
+
+    # EPUB2: <meta name="cover" content="manifest-id">. EbookLib exposes
+    # this as OPF metadata, but publisher files vary in the stored key shape.
+    for value, attributes in book.get_metadata("OPF", "cover") or []:
+        cover_id = (attributes or {}).get("content") or value
+        item = book.get_item_with_id(str(cover_id)) if cover_id else None
+        candidate = _item_asset_path(item, asset_paths)
+        if candidate:
             return candidate
-    for path in asset_paths:
-        if "cover" in path.lower():
-            return path
+    for metadata_values in (getattr(book, "metadata", {}) or {}).values():
+        for metadata_name, entries in (metadata_values or {}).items():
+            for value, attributes in entries or []:
+                attributes = attributes or {}
+                if str(attributes.get("name") or metadata_name).lower() != "cover":
+                    continue
+                cover_id = attributes.get("content") or value
+                item = book.get_item_with_id(str(cover_id)) if cover_id else None
+                candidate = _item_asset_path(item, asset_paths)
+                if candidate:
+                    return candidate
+
+    for item in book.get_items_of_type(ebooklib.ITEM_COVER):
+        candidate = _item_asset_path(item, asset_paths)
+        if candidate:
+            return candidate
+
+    # Common manifest IDs and filenames, ranked deterministically.
+    scored: list[tuple[int, int, str]] = []
+    size_by_path = {asset.path: len(asset.data) for asset in assets}
+    for item in image_items:
+        candidate = _item_asset_path(item, asset_paths)
+        if not candidate:
+            continue
+        identifier = str(getattr(item, "id", "") or "").lower()
+        stem = PurePosixPath(candidate).stem.lower()
+        compact = re.sub(r"[^a-z0-9]", "", f"{identifier} {stem}")
+        score = 0
+        if compact in {"cover", "coverimage", "frontcover", "bookcover"}:
+            score += 100
+        if any(token in compact for token in ("cover", "frontcover", "bookcover")):
+            score += 50
+        if PurePosixPath(candidate).parent == PurePosixPath("."):
+            score += 2
+        scored.append((score, size_by_path.get(candidate, 0), candidate))
+    named = [entry for entry in scored if entry[0] > 0]
+    if named:
+        return max(named)[2]
+    if len(scored) == 1:
+        return scored[0][2]
+    if scored:
+        # Last-resort manifest-image fallback: covers are commonly the largest
+        # raster. This is used only when the EPUB supplies no cover semantics.
+        return max(scored, key=lambda entry: (entry[1], entry[2]))[2]
     return None
+
+
+def _item_asset_path(item: Any, asset_paths: set[str]) -> str | None:
+    if item is None:
+        return None
+    candidate = _normalize_asset_path(item.get_name())
+    return candidate if candidate in asset_paths else None
 
 
 def _sanitize_chapter(

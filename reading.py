@@ -23,6 +23,9 @@ BOOK_FIELDS = """
     b.cover_asset_path, b.chapter_count, b.toc, b.created_at, b.updated_at
 """
 
+ACTION_CHUNK_TARGET_CHARS = 6000
+ACTION_CHUNK_MAX_CHARS = 8000
+
 
 @reading_bp.get("/api/books")
 @api_or_session_required
@@ -222,6 +225,54 @@ def get_book(book_id: UUID):
     return jsonify({"book": payload})
 
 
+@reading_bp.get("/api/books/<uuid:book_id>/chapters")
+@api_or_session_required
+def list_book_chapters(book_id: UUID):
+    rows = db.fetch_all(
+        """
+        select id as chapter_id, chapter_index, title, word_count
+        from chapters where book_id = %s order by chapter_index
+        """,
+        (book_id,),
+    )
+    if not rows and not db.fetch_one("select id from books where id = %s", (book_id,)):
+        return jsonify({"error": "book_not_found"}), 404
+    return jsonify(
+        {"book_id": str(book_id), "chapters": [_json_safe(row) for row in rows]}
+    )
+
+
+@reading_bp.patch("/api/books/<uuid:book_id>")
+@api_or_session_required
+def update_book(book_id: UUID):
+    payload = request.get_json(silent=True) or {}
+    updates = []
+    values: list[Any] = []
+    for field in ("title", "author"):
+        if field not in payload:
+            continue
+        value = _clean_book_field(payload.get(field))
+        if not value:
+            return jsonify({"error": f"{field}_required"}), 400
+        updates.append(f"{field} = %s")
+        values.append(value)
+    if not updates:
+        return jsonify({"error": "book_fields_required"}), 400
+    values.append(book_id)
+    row = db.execute(
+        f"""
+        update books set {", ".join(updates)}, updated_at = now()
+        where id = %s
+        returning id, title, author, format, source_filename,
+                  cover_asset_path, chapter_count, toc, created_at, updated_at
+        """,
+        values,
+    )
+    if not row:
+        return jsonify({"error": "book_not_found"}), 404
+    return jsonify({"book": _serialize_book(row)})
+
+
 @reading_bp.get("/api/books/<uuid:book_id>/chapters/<uuid:chapter_id>")
 @api_or_session_required
 def get_chapter(book_id: UUID, chapter_id: UUID):
@@ -284,12 +335,18 @@ def save_progress(book_id: UUID):
         return jsonify({"error": "chapter_not_found"}), 404
 
     try:
+        display_mode = str(position.get("display_mode") or "scroll")
+        if display_mode not in {"scroll", "paginated"}:
+            display_mode = "scroll"
         sanitized_position = {
             "block_id": str(position.get("block_id") or "b000001")[:64],
             "char_offset": max(0, int(position.get("char_offset") or 0)),
             "scroll_fraction": max(
                 0.0, min(1.0, float(position.get("scroll_fraction") or 0))
             ),
+            "display_mode": display_mode,
+            "page_index": max(0, int(position.get("page_index") or 0)),
+            "page_count": max(1, int(position.get("page_count") or 1)),
         }
     except (TypeError, ValueError):
         return jsonify({"error": "invalid_progress_position"}), 400
@@ -319,7 +376,8 @@ def get_reading_state():
         select {BOOK_FIELDS}, rp.chapter_id, rp.chapter_index, rp.position,
                rp.percentage, rp.updated_at as progress_updated_at,
                c.title as current_chapter,
-               ais.last_chapter_read, ais.last_annotation_seen,
+               ais.last_chapter_read, ais.last_chunk_index, ais.last_block_id,
+               ais.chapter_completed, ais.last_annotation_seen,
                ais.updated_at as ai_updated_at,
                (select count(*) from annotations a
                 where a.book_id = b.id and a.status = 'pending') as pending_count
@@ -367,8 +425,9 @@ def get_reading_context():
 
     chapter = db.fetch_one(
         """
-        select c.id, c.book_id, c.chapter_index, c.title, c.content_text,
-               c.word_count, b.title as book_title, b.author as book_author,
+        select c.id, c.book_id, c.chapter_index, c.title, c.content_html,
+               c.content_text, c.word_count,
+               b.title as book_title, b.author as book_author,
                b.chapter_count
         from chapters c join books b on b.id = c.book_id
         where c.id = %s
@@ -397,6 +456,69 @@ def get_reading_context():
         """,
         (chapter_id,),
     )
+    xiaxia_thoughts = db.fetch_all(
+        """
+        select id, book_id, chapter_id, scope, mark_type, content, selected_text,
+               start_block_id, start_offset, end_block_id, end_offset,
+               prefix_text, suffix_text, created_at, updated_at
+        from xiaxia_thoughts
+        where chapter_id = %s
+        order by created_at
+        """,
+        (chapter_id,),
+    )
+
+    blocks = _chapter_blocks(chapter["content_html"])
+    chunks = _chunk_chapter_blocks(blocks)
+    focus_chunk_index = _anchor_chunk_index(annotation, chunks) if annotation else None
+    raw_chunk_index = request.args.get("chunk_index")
+    if raw_chunk_index is None or raw_chunk_index == "":
+        chunk_index = focus_chunk_index if focus_chunk_index is not None else 0
+    else:
+        try:
+            chunk_index = int(raw_chunk_index)
+        except ValueError:
+            return jsonify({"error": "invalid_chunk_index"}), 400
+    if chunk_index < 0 or chunk_index >= len(chunks):
+        return (
+            jsonify(
+                {
+                    "error": "chunk_not_found",
+                    "chunk_count": len(chunks),
+                    "valid_chunk_index_min": 0,
+                    "valid_chunk_index_max": len(chunks) - 1,
+                }
+            ),
+            404,
+        )
+    current_chunk = chunks[chunk_index]
+    annotations_in_chunk = [
+        row
+        for row in chapter_annotations
+        if _anchor_chunk_index(row, chunks) == chunk_index
+    ]
+    thoughts_in_chunk = [
+        row
+        for row in xiaxia_thoughts
+        if _anchor_chunk_index(row, chunks) == chunk_index
+    ]
+    chapter_payload: dict[str, Any] = {
+        "id": str(chapter["id"]),
+        "chapter_index": chapter["chapter_index"],
+        "title": chapter["title"],
+        "word_count": chapter["word_count"],
+        "chunk_index": chunk_index,
+        "chunk_count": len(chunks),
+        "has_next": chunk_index < len(chunks) - 1,
+        "has_previous": chunk_index > 0,
+        "chunk_text": current_chunk["text"],
+        "chunk_character_count": len(current_chunk["text"]),
+        "blocks": current_chunk["blocks"],
+        "is_complete_chapter": len(chunks) == 1,
+    }
+    if len(chunks) == 1:
+        # Preserve the original short-chapter response field for compatibility.
+        chapter_payload["full_text"] = chapter["content_text"]
     response: dict[str, Any] = {
         "book": {
             "id": str(chapter["book_id"]),
@@ -404,16 +526,17 @@ def get_reading_context():
             "author": chapter["book_author"],
             "chapter_count": chapter["chapter_count"],
         },
-        "chapter": {
-            "id": str(chapter["id"]),
-            "chapter_index": chapter["chapter_index"],
-            "title": chapter["title"],
-            "full_text": chapter["content_text"],
-            "word_count": chapter["word_count"],
-        },
+        "chapter": chapter_payload,
         "reading_progress": _json_safe(progress) if progress else None,
-        "annotations": [_json_safe(row) for row in chapter_annotations],
+        "annotations": [_json_safe(row) for row in annotations_in_chunk],
+        "xiaxia_thoughts": [_json_safe(row) for row in thoughts_in_chunk],
         "focus_annotation": _json_safe(annotation) if annotation else None,
+        "focus_annotation_chunk_index": focus_chunk_index,
+        "reading_instruction": (
+            "This is the complete chapter."
+            if len(chunks) == 1
+            else "Read chunk_index 0 through chunk_count - 1 before claiming the chapter is complete."
+        ),
     }
     if include_adjacent:
         response["adjacent_chapters"] = _adjacent_chapters(
@@ -431,29 +554,261 @@ def save_ai_progress():
     annotation_id = _uuid_or_none(payload.get("last_annotation_seen"))
     if not book_id:
         return jsonify({"error": "book_id_required"}), 400
-    if chapter_id and not db.fetch_one(
-        "select id from chapters where id = %s and book_id = %s", (chapter_id, book_id)
-    ):
-        return jsonify({"error": "chapter_not_found"}), 404
+    checkpoint_chapter = None
+    if chapter_id:
+        checkpoint_chapter = db.fetch_one(
+            "select id, content_html from chapters where id = %s and book_id = %s",
+            (chapter_id, book_id),
+        )
+        if not checkpoint_chapter:
+            return jsonify({"error": "chapter_not_found"}), 404
     if annotation_id and not db.fetch_one(
         "select id from annotations where id = %s and book_id = %s",
         (annotation_id, book_id),
     ):
         return jsonify({"error": "annotation_not_found"}), 404
+    chapter_completed_supplied = "chapter_completed" in payload
+    if chapter_completed_supplied and not isinstance(
+        payload["chapter_completed"], bool
+    ):
+        return jsonify({"error": "invalid_chapter_completed"}), 400
+    try:
+        chunk_index = (
+            int(payload["chunk_index"])
+            if payload.get("chunk_index") is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid_chunk_index"}), 400
+    if chunk_index is not None and chunk_index < 0:
+        return jsonify({"error": "invalid_chunk_index"}), 400
+    last_block_id = str(payload.get("last_block_id") or "")[:64] or None
+    if (chunk_index is not None or last_block_id) and chapter_id is None:
+        return jsonify({"error": "chapter_checkpoint_required"}), 400
+    if last_block_id and (
+        not last_block_id.startswith("b") or not last_block_id[1:].isdigit()
+    ):
+        return jsonify({"error": "invalid_last_block_id"}), 400
+    chapter_completed = payload.get("chapter_completed", False)
+    if chapter_completed and (chapter_id is None or chunk_index is None):
+        return jsonify({"error": "completed_chapter_checkpoint_required"}), 400
+
+    if checkpoint_chapter and (chunk_index is not None or last_block_id):
+        blocks = _chapter_blocks(checkpoint_chapter["content_html"])
+        chunks = _chunk_chapter_blocks(blocks)
+        if chunk_index is not None and chunk_index >= len(chunks):
+            return jsonify(
+                {"error": "chunk_not_found", "chunk_count": len(chunks)}
+            ), 404
+        if last_block_id and last_block_id not in {
+            block["block_id"] for block in blocks
+        }:
+            return jsonify({"error": "last_block_not_in_chapter"}), 400
+        if chapter_completed and chunk_index != len(chunks) - 1:
+            return (
+                jsonify(
+                    {
+                        "error": "chapter_not_fully_read",
+                        "final_chunk_index": len(chunks) - 1,
+                    }
+                ),
+                400,
+            )
     state = db.execute(
         """
         insert into ai_reading_state (
-            book_id, last_chapter_read, last_annotation_seen
-        ) values (%s, %s, %s)
+            book_id, last_chapter_read, last_chunk_index, last_block_id,
+            chapter_completed, last_annotation_seen
+        ) values (%s, %s, %s, %s, %s, %s)
         on conflict (book_id) do update set
             last_chapter_read = coalesce(excluded.last_chapter_read, ai_reading_state.last_chapter_read),
+            last_chunk_index = case
+                when excluded.last_chapter_read is null then ai_reading_state.last_chunk_index
+                when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read
+                    then excluded.last_chunk_index
+                else coalesce(excluded.last_chunk_index, ai_reading_state.last_chunk_index)
+            end,
+            last_block_id = case
+                when excluded.last_chapter_read is null then ai_reading_state.last_block_id
+                when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read
+                    then excluded.last_block_id
+                else coalesce(excluded.last_block_id, ai_reading_state.last_block_id)
+            end,
+            chapter_completed = case
+                when excluded.last_chapter_read is null then ai_reading_state.chapter_completed
+                when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read
+                    then excluded.chapter_completed
+                when %s then excluded.chapter_completed
+                else ai_reading_state.chapter_completed
+            end,
             last_annotation_seen = coalesce(excluded.last_annotation_seen, ai_reading_state.last_annotation_seen),
             updated_at = now()
-        returning book_id, last_chapter_read, last_annotation_seen, updated_at
+        returning book_id, last_chapter_read, last_chunk_index, last_block_id,
+                  chapter_completed, last_annotation_seen, updated_at
         """,
-        (book_id, chapter_id, annotation_id),
+        (
+            book_id,
+            chapter_id,
+            chunk_index,
+            last_block_id,
+            chapter_completed,
+            annotation_id,
+            chapter_completed_supplied,
+        ),
     )
     return jsonify({"ai_reading_state": _json_safe(state)})
+
+
+def _chapter_blocks(content_html: str) -> list[dict[str, Any]]:
+    """Return the persisted block IDs and their exact DOM text order."""
+    soup = BeautifulSoup(content_html or "", "html.parser")
+    blocks = []
+    for block_order, element in enumerate(soup.select("[data-block-id]")):
+        block_id = str(element.get("data-block-id") or "")
+        text = element.get_text("", strip=False)
+        if block_id and text.strip():
+            blocks.append(
+                {"block_id": block_id, "block_order": block_order, "text": text}
+            )
+    if not blocks:
+        text = soup.get_text("", strip=False)
+        blocks.append({"block_id": "b000001", "block_order": 0, "text": text})
+    return blocks
+
+
+def _text_across_blocks(
+    blocks: list[dict[str, Any]],
+    start_block_id: str,
+    start_offset: int,
+    end_block_id: str,
+    end_offset: int,
+) -> str:
+    indexes = {block["block_id"]: index for index, block in enumerate(blocks)}
+    if start_block_id not in indexes or end_block_id not in indexes:
+        return ""
+    start_index = indexes[start_block_id]
+    end_index = indexes[end_block_id]
+    if start_index > end_index or start_offset < 0 or end_offset < 0:
+        return ""
+    start_text = blocks[start_index]["text"]
+    end_text = blocks[end_index]["text"]
+    if start_offset > len(start_text) or end_offset > len(end_text):
+        return ""
+    if start_index == end_index:
+        return start_text[start_offset:end_offset] if end_offset >= start_offset else ""
+    selected = [start_text[start_offset:]]
+    selected.extend(block["text"] for block in blocks[start_index + 1 : end_index])
+    selected.append(end_text[:end_offset])
+    return "\n".join(selected)
+
+
+def _chunk_chapter_blocks(
+    blocks: list[dict[str, Any]],
+    target_chars: int = ACTION_CHUNK_TARGET_CHARS,
+    max_chars: int = ACTION_CHUNK_MAX_CHARS,
+) -> list[dict[str, Any]]:
+    """Group stable blocks, splitting only an individually oversized block."""
+    segments = []
+    for block in blocks:
+        segments.extend(_split_block_segment(block, target_chars, max_chars))
+
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_length = 0
+    for segment in segments:
+        separator = 2 if current else 0
+        segment_length = len(segment["text"])
+        if current and current_length + separator + segment_length > target_chars:
+            chunks.append(current)
+            current = []
+            current_length = 0
+            separator = 0
+        current.append(segment)
+        current_length += separator + segment_length
+    if current or not chunks:
+        chunks.append(current)
+    return [
+        {"blocks": chunk, "text": "\n\n".join(item["text"] for item in chunk)}
+        for chunk in chunks
+    ]
+
+
+def _split_block_segment(
+    block: dict[str, Any], target_chars: int, max_chars: int
+) -> list[dict[str, Any]]:
+    text = block["text"]
+    if len(text) <= max_chars:
+        return [
+            {
+                "block_id": block["block_id"],
+                "block_order": block["block_order"],
+                "start_offset": 0,
+                "end_offset": len(text),
+                "text": text,
+            }
+        ]
+    segments = []
+    start = 0
+    sentence_endings = set("。！？!?；;.!?\n")
+    while len(text) - start > max_chars:
+        ideal = min(start + target_chars, len(text))
+        lower_bound = start + max(1, target_chars // 2)
+        cut = ideal
+        for position in range(ideal, lower_bound, -1):
+            if text[position - 1] in sentence_endings:
+                cut = position
+                break
+        if cut <= start:
+            cut = min(start + max_chars, len(text))
+        segments.append(
+            {
+                "block_id": block["block_id"],
+                "block_order": block["block_order"],
+                "start_offset": start,
+                "end_offset": cut,
+                "text": text[start:cut],
+            }
+        )
+        start = cut
+    segments.append(
+        {
+            "block_id": block["block_id"],
+            "block_order": block["block_order"],
+            "start_offset": start,
+            "end_offset": len(text),
+            "text": text[start:],
+        }
+    )
+    return segments
+
+
+def _anchor_chunk_index(
+    anchor: dict[str, Any] | None, chunks: list[dict[str, Any]]
+) -> int | None:
+    if not anchor:
+        return None
+    if anchor.get("scope") == "chapter":
+        return 0
+    block_id = anchor.get("start_block_id")
+    try:
+        offset = int(anchor.get("start_offset") or 0)
+    except (TypeError, ValueError):
+        return None
+    boundary_candidate = None
+    for chunk_index, chunk in enumerate(chunks):
+        for block in chunk["blocks"]:
+            if block["block_id"] != block_id:
+                continue
+            if block["start_offset"] <= offset < block["end_offset"]:
+                return chunk_index
+            if offset == block["end_offset"]:
+                boundary_candidate = chunk_index
+    return boundary_candidate
+
+
+def _clean_book_field(value: Any) -> str:
+    cleaned = " ".join(str(value or "").replace("\x00", "").split())
+    return cleaned[:1000]
 
 
 def _adjacent_chapters(book_id: UUID, chapter_index: int) -> list[dict[str, Any]]:
@@ -535,6 +890,9 @@ def _serialize_reading_state(row: dict[str, Any]) -> dict[str, Any]:
             "last_chapter_read": str(row["last_chapter_read"])
             if row.get("last_chapter_read")
             else None,
+            "last_chunk_index": row.get("last_chunk_index"),
+            "last_block_id": row.get("last_block_id"),
+            "chapter_completed": bool(row.get("chapter_completed", False)),
             "last_annotation_seen": str(row["last_annotation_seen"])
             if row.get("last_annotation_seen")
             else None,

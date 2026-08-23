@@ -1,6 +1,7 @@
 (() => {
   "use strict";
 
+  const utils = window.XiaxiaReaderUtils;
   const body = document.body;
   const bookId = body.dataset.bookId;
   const content = document.querySelector("#chapter-content");
@@ -9,19 +10,28 @@
   const chapterPosition = document.querySelector("#chapter-position");
   const previousButton = document.querySelector("#previous-chapter");
   const nextButton = document.querySelector("#next-chapter");
+  const pagePrevious = document.querySelector("#page-previous");
+  const pageNext = document.querySelector("#page-next");
+  const pageStatus = document.querySelector("#page-status");
   const progressBar = document.querySelector("#reader-progress span");
   const tocButton = document.querySelector("#toc-button");
   const tocDrawer = document.querySelector("#toc-drawer");
   const tocClose = document.querySelector("#toc-close");
   const tocList = document.querySelector("#toc-list");
   const scrim = document.querySelector("#drawer-scrim");
+  const modeButton = document.querySelector("#reading-mode");
+  const chapterThoughts = document.querySelector("#chapter-thoughts");
   const selectionMenu = document.querySelector("#selection-menu");
   const noteDialog = document.querySelector("#note-dialog");
   const noteForm = document.querySelector("#note-form");
+  const noteTitle = document.querySelector("#note-dialog-title");
   const noteText = document.querySelector("#note-text");
   const selectedQuote = document.querySelector("#selected-quote");
   const annotationDialog = document.querySelector("#annotation-dialog");
+  const editAnnotationButton = document.querySelector("#edit-annotation");
+  const deleteAnnotationButton = document.querySelector("#delete-annotation");
   const toast = document.querySelector("#reader-toast");
+  const query = new URLSearchParams(location.search);
 
   const state = {
     book: null,
@@ -29,10 +39,25 @@
     currentIndex: 0,
     pristineHtml: "",
     annotations: [],
+    thoughts: [],
+    syncSignature: "",
     savedSelection: null,
+    editingAnnotationId: null,
+    openRecord: null,
     progress: null,
     loaded: false,
     fontSize: Number(localStorage.getItem("xiaxia-reader-font-size")) || 19,
+    mode: localStorage.getItem("xiaxia-reader-mode") === "paginated" ? "paginated" : "scroll",
+    pageIndex: 0,
+    pageCount: 1,
+    menuInteracting: false,
+    selectionTimers: [],
+    touchStart: null,
+    target: {
+      chapterId: query.get("chapter_id"),
+      annotationId: query.get("annotation_id"),
+      thoughtId: query.get("thought_id"),
+    },
   };
 
   async function api(url, options = {}) {
@@ -46,18 +71,28 @@
 
   async function initialize() {
     setFontSize(state.fontSize);
+    applyModeUi();
     try {
       const { book } = await api(`/api/books/${bookId}`);
       state.book = book;
       state.chapters = book.chapters || [];
       state.progress = book.progress;
+      if (!localStorage.getItem("xiaxia-reader-mode") && book.progress?.position?.display_mode) {
+        state.mode = book.progress.position.display_mode === "paginated" ? "paginated" : "scroll";
+        applyModeUi();
+      }
       bookTitle.textContent = book.title;
       document.title = `${book.title} · 共读小屋`;
       renderToc();
       if (!state.chapters.length) throw new Error("这本书没有可阅读章节");
+      const targetIndex = state.target.chapterId
+        ? state.chapters.findIndex((chapter) => chapter.id === state.target.chapterId)
+        : -1;
       const savedIndex = state.chapters.findIndex((chapter) => chapter.id === state.progress?.chapter_id);
-      const initialIndex = savedIndex >= 0 ? savedIndex : 0;
-      await loadChapter(initialIndex, savedIndex >= 0 ? state.progress?.position : null);
+      const initialIndex = targetIndex >= 0 ? targetIndex : (savedIndex >= 0 ? savedIndex : 0);
+      const restore = targetIndex < 0 && savedIndex >= 0 ? state.progress?.position : null;
+      await loadChapter(initialIndex, restore);
+      window.setInterval(syncChapterAnnotations, 12000);
     } catch (error) {
       content.innerHTML = `<p class="form-error">无法打开这本书：${escapeHtml(error.message)}</p>`;
     }
@@ -68,10 +103,12 @@
     await saveProgress(true);
     state.loaded = false;
     state.currentIndex = index;
+    state.pageIndex = 0;
     const chapter = state.chapters[index];
     content.innerHTML = '<p class="reader-loading">正在翻页…</p>';
+    chapterThoughts.hidden = true;
     closeToc();
-    window.scrollTo({ top: 0, behavior: "auto" });
+    if (state.mode === "scroll") window.scrollTo({ top: 0, behavior: "auto" });
     try {
       const [chapterResult, annotationResult] = await Promise.all([
         api(`/api/books/${bookId}/chapters/${chapter.id}`),
@@ -79,12 +116,23 @@
       ]);
       state.pristineHtml = chapterResult.chapter.content_html;
       state.annotations = annotationResult.annotations || [];
+      state.thoughts = annotationResult.xiaxia_thoughts || [];
+      state.syncSignature = utils.syncSignature(state.annotations, state.thoughts);
       chapterTitle.textContent = chapterResult.chapter.title;
       renderChapter();
       updateControls();
       state.loaded = true;
-      if (restorePosition) restoreReadingPosition(restorePosition);
-      else window.scrollTo({ top: 0, behavior: "auto" });
+      await nextFrame(2);
+      await recalculatePages();
+      if (hasTargetForChapter(chapter.id)) {
+        jumpToRequestedTarget();
+      } else if (restorePosition) {
+        restoreReadingPosition(restorePosition);
+      } else if (state.mode === "scroll") {
+        window.scrollTo({ top: 0, behavior: "auto" });
+      } else {
+        goToPage(0, "auto");
+      }
       updateProgressIndicator();
     } catch (error) {
       content.innerHTML = `<p class="form-error">章节加载失败：${escapeHtml(error.message)}</p>`;
@@ -94,6 +142,11 @@
   function renderChapter() {
     content.innerHTML = state.pristineHtml;
     applyAnnotations();
+    applyXiaxiaThoughts();
+    renderChapterThoughts();
+    for (const image of content.querySelectorAll("img")) {
+      if (!image.complete) image.addEventListener("load", () => recalculatePages(captureViewportAnchor()), { once: true });
+    }
   }
 
   function renderToc() {
@@ -115,35 +168,40 @@
     for (const [index, button] of [...tocList.querySelectorAll("button")].entries()) {
       button.classList.toggle("current", index === state.currentIndex);
     }
+    updatePageControls();
   }
 
   function applyAnnotations() {
-    const ordered = [...state.annotations].sort((a, b) => {
-      const blockOrder = String(b.start_block_id).localeCompare(String(a.start_block_id));
-      return blockOrder || Number(b.start_offset) - Number(a.start_offset);
-    });
+    const ordered = [...state.annotations].sort(reverseAnchorOrder);
     for (const annotation of ordered) {
-      let location = annotation;
-      if (!coordinatesMatch(annotation)) location = findFallbackLocation(annotation);
-      if (location) wrapAnnotation(location, annotation.id);
+      const location = coordinatesMatch(annotation) ? annotation : findFallbackLocation(annotation);
+      if (location) wrapAnnotation(location, annotation.id, "user");
     }
   }
 
-  function coordinatesMatch(annotation) {
-    const start = content.querySelector(`#${cssEscape(annotation.start_block_id)}`);
-    const end = content.querySelector(`#${cssEscape(annotation.end_block_id)}`);
-    if (!start || !end) return false;
-    const selected = textAcrossBlocks(
-      start,
-      Number(annotation.start_offset),
-      end,
-      Number(annotation.end_offset),
-    );
-    return normalizeText(selected) === normalizeText(annotation.selected_text);
+  function applyXiaxiaThoughts() {
+    const ordered = state.thoughts.filter((item) => item.scope !== "chapter").sort(reverseAnchorOrder);
+    for (const thought of ordered) {
+      const location = coordinatesMatch(thought) ? thought : findFallbackLocation(thought);
+      if (location) wrapAnnotation(location, thought.id, "xiaxia");
+    }
   }
 
-  function findFallbackLocation(annotation) {
-    const needle = String(annotation.selected_text || "");
+  function reverseAnchorOrder(a, b) {
+    const blockOrder = String(b.start_block_id).localeCompare(String(a.start_block_id));
+    return blockOrder || Number(b.start_offset) - Number(a.start_offset);
+  }
+
+  function coordinatesMatch(record) {
+    const start = content.querySelector(`#${cssEscape(record.start_block_id)}`);
+    const end = content.querySelector(`#${cssEscape(record.end_block_id)}`);
+    if (!start || !end) return false;
+    const selected = textAcrossBlocks(start, Number(record.start_offset), end, Number(record.end_offset));
+    return normalizeText(selected) === normalizeText(record.selected_text);
+  }
+
+  function findFallbackLocation(record) {
+    const needle = String(record.selected_text || "");
     if (!needle) return null;
     const blocks = [...content.querySelectorAll("[data-block-id]")];
     let best = null;
@@ -155,17 +213,11 @@
         const index = haystack.indexOf(needle, from);
         if (index < 0) break;
         let score = 1;
-        if (annotation.prefix_text && haystack.slice(Math.max(0, index - annotation.prefix_text.length), index).endsWith(annotation.prefix_text)) score += 2;
-        if (annotation.suffix_text && haystack.slice(index + needle.length).startsWith(annotation.suffix_text)) score += 2;
+        if (record.prefix_text && haystack.slice(Math.max(0, index - record.prefix_text.length), index).endsWith(record.prefix_text)) score += 2;
+        if (record.suffix_text && haystack.slice(index + needle.length).startsWith(record.suffix_text)) score += 2;
         if (score > bestScore) {
           bestScore = score;
-          best = {
-            ...annotation,
-            start_block_id: block.dataset.blockId,
-            end_block_id: block.dataset.blockId,
-            start_offset: index,
-            end_offset: index + needle.length,
-          };
+          best = { ...record, start_block_id: block.dataset.blockId, end_block_id: block.dataset.blockId, start_offset: index, end_offset: index + needle.length };
         }
         from = index + Math.max(needle.length, 1);
       }
@@ -173,7 +225,7 @@
     return best;
   }
 
-  function wrapAnnotation(location, annotationId) {
+  function wrapAnnotation(location, recordId, kind) {
     const blocks = [...content.querySelectorAll("[data-block-id]")];
     const startIndex = blocks.findIndex((block) => block.dataset.blockId === location.start_block_id);
     const endIndex = blocks.findIndex((block) => block.dataset.blockId === location.end_block_id);
@@ -182,11 +234,11 @@
       const block = blocks[index];
       const start = index === startIndex ? Number(location.start_offset) : 0;
       const end = index === endIndex ? Number(location.end_offset) : (block.textContent || "").length;
-      wrapTextRange(block, start, end, annotationId);
+      wrapTextRange(block, start, end, recordId, kind);
     }
   }
 
-  function wrapTextRange(block, startOffset, endOffset, annotationId) {
+  function wrapTextRange(block, startOffset, endOffset, recordId, kind) {
     if (endOffset <= startOffset) return;
     const points = textPoints(block);
     const start = pointAt(points, startOffset);
@@ -198,8 +250,13 @@
       range.setEnd(end.node, end.offset);
       if (range.collapsed) return;
       const mark = document.createElement("mark");
-      mark.className = "reader-highlight";
-      mark.dataset.annotationId = annotationId;
+      if (kind === "xiaxia") {
+        mark.className = "xiaxia-thought-highlight";
+        mark.dataset.thoughtId = recordId;
+      } else {
+        mark.className = "reader-highlight";
+        mark.dataset.annotationId = recordId;
+      }
       mark.append(range.extractContents());
       range.insertNode(mark);
     } catch (_error) {
@@ -223,7 +280,7 @@
   function pointAt(points, absoluteOffset) {
     if (!points.length) return null;
     const max = points[points.length - 1].end;
-    const offset = clamp(Number(absoluteOffset), 0, max);
+    const offset = utils.clamp(Number(absoluteOffset), 0, max);
     for (const point of points) {
       if (offset <= point.end) return { node: point.node, offset: offset - point.start };
     }
@@ -245,16 +302,21 @@
     }).join("\n");
   }
 
+  function scheduleSelectionCapture(delays = [120, 320, 620]) {
+    for (const timer of state.selectionTimers) clearTimeout(timer);
+    state.selectionTimers = delays.map((delay) => setTimeout(captureSelection, delay));
+  }
+
   function captureSelection() {
     const selection = window.getSelection();
-    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return hideSelectionMenu();
-    const range = selection.getRangeAt(0);
-    if (!content.contains(range.commonAncestorContainer)) return hideSelectionMenu();
+    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return;
+    const range = selection.getRangeAt(0).cloneRange();
+    if (!content.contains(range.commonAncestorContainer)) return;
     const startBlock = closestBlock(range.startContainer);
     const endBlock = closestBlock(range.endContainer);
-    if (!startBlock || !endBlock) return hideSelectionMenu();
+    if (!startBlock || !endBlock) return;
     const selectedText = range.toString();
-    if (!selectedText.trim() || selectedText.length > 20000) return hideSelectionMenu();
+    if (!selectedText.trim() || selectedText.length > 20000) return;
     const startOffset = offsetWithin(startBlock, range.startContainer, range.startOffset);
     const endOffset = offsetWithin(endBlock, range.endContainer, range.endOffset);
     const startText = startBlock.textContent || "";
@@ -270,11 +332,27 @@
       prefix_text: startText.slice(Math.max(0, startOffset - 120), startOffset),
       suffix_text: endText.slice(endOffset, endOffset + 120),
     };
-    const rect = range.getBoundingClientRect();
-    if (!rect.width && !rect.height) return hideSelectionMenu();
+    const rects = [...range.getClientRects()].filter((rect) => rect.width || rect.height);
+    if (!rects.length) return;
+    positionSelectionMenu(rects[rects.length - 1]);
+  }
+
+  function positionSelectionMenu(rect) {
+    const visual = window.visualViewport;
+    const viewport = {
+      offsetLeft: visual?.offsetLeft || 0,
+      offsetTop: visual?.offsetTop || 0,
+      width: visual?.width || window.innerWidth,
+      height: visual?.height || window.innerHeight,
+      bottomInset: 12,
+    };
+    const mobile = matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
+    const position = utils.selectionMenuPosition({ rect, viewport, mobile });
     selectionMenu.hidden = false;
-    selectionMenu.style.left = `${clamp(rect.left + rect.width / 2, 86, window.innerWidth - 86)}px`;
-    selectionMenu.style.top = `${Math.max(76, rect.top)}px`;
+    selectionMenu.dataset.placement = position.placement;
+    selectionMenu.style.left = `${position.left}px`;
+    selectionMenu.style.top = position.top == null ? "auto" : `${position.top}px`;
+    selectionMenu.style.bottom = position.bottom == null ? "auto" : `${position.bottom}px`;
   }
 
   function closestBlock(node) {
@@ -293,8 +371,9 @@
     }
   }
 
-  function hideSelectionMenu() {
+  function hideSelectionMenu(clearSaved = false) {
     selectionMenu.hidden = true;
+    if (clearSaved) state.savedSelection = null;
   }
 
   async function saveAnnotation(comment = "") {
@@ -306,17 +385,19 @@
         body: JSON.stringify({ ...state.savedSelection, comment }),
       });
       state.annotations.push(annotation);
-      renderChapter();
       window.getSelection()?.removeAllRanges();
       state.savedSelection = null;
-      showToast(comment ? "批注已经留在书页旁。" : "划线已经保存。 ");
+      await refreshAnnotationMarks();
+      showToast(comment ? "批注已经留在书页旁。" : "划线已经保存。");
     } catch (error) {
       showToast(`保存失败：${error.message}`);
     }
   }
 
-  function openNoteDialog() {
+  function openNewNoteDialog() {
     if (!state.savedSelection) return;
+    state.editingAnnotationId = null;
+    noteTitle.textContent = "写在书页旁";
     selectedQuote.textContent = state.savedSelection.selected_text;
     noteText.value = "";
     hideSelectionMenu();
@@ -324,23 +405,249 @@
     setTimeout(() => noteText.focus(), 0);
   }
 
+  function openEditAnnotation(annotationId) {
+    const annotation = state.annotations.find((item) => item.id === annotationId);
+    if (!annotation) return;
+    state.editingAnnotationId = annotation.id;
+    noteTitle.textContent = annotation.comment ? "编辑我的想法" : "给这条划线添加想法";
+    selectedQuote.textContent = annotation.selected_text;
+    noteText.value = annotation.comment || "";
+    if (annotationDialog.open) annotationDialog.close();
+    noteDialog.showModal();
+    setTimeout(() => noteText.focus(), 0);
+  }
+
+  async function saveEditedAnnotation(comment) {
+    const annotationId = state.editingAnnotationId;
+    if (!annotationId) return;
+    try {
+      const { annotation } = await api(`/api/annotations/${annotationId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ comment }),
+      });
+      const index = state.annotations.findIndex((item) => item.id === annotationId);
+      if (index >= 0) state.annotations[index] = annotation;
+      state.syncSignature = utils.syncSignature(state.annotations, state.thoughts);
+      showToast(comment ? "批注已经更新。" : "已保留为纯划线。");
+    } catch (error) {
+      showToast(`更新失败：${error.message}`);
+    }
+  }
+
   function openAnnotation(annotationId) {
     const annotation = state.annotations.find((item) => item.id === annotationId);
     if (!annotation) return;
+    state.openRecord = { kind: "user", id: annotationId };
+    document.querySelector("#annotation-kind").textContent = "我的划线 / 批注";
     document.querySelector("#annotation-quote").textContent = annotation.selected_text;
+    document.querySelector("#user-note-section").hidden = false;
     document.querySelector("#annotation-user-note").textContent = annotation.comment || "（只留下了划线）";
     const replySection = document.querySelector("#xiaxia-reply-section");
     replySection.hidden = !annotation.xiaxia_response;
     document.querySelector("#annotation-xiaxia-reply").textContent = annotation.xiaxia_response || "";
-    annotationDialog.showModal();
+    document.querySelector("#xiaxia-thought-section").hidden = true;
+    document.querySelector("#annotation-actions").hidden = false;
+    editAnnotationButton.textContent = annotation.comment ? "编辑" : "添加想法";
+    if (!annotationDialog.open) annotationDialog.showModal();
+  }
+
+  function openThought(thoughtId) {
+    const thought = state.thoughts.find((item) => item.id === thoughtId);
+    if (!thought) return;
+    state.openRecord = { kind: "xiaxia", id: thoughtId };
+    document.querySelector("#annotation-kind").textContent = "林知夏的独立想法";
+    document.querySelector("#annotation-quote").textContent = thought.selected_text || "（本章）";
+    document.querySelector("#user-note-section").hidden = true;
+    document.querySelector("#xiaxia-reply-section").hidden = true;
+    document.querySelector("#xiaxia-thought-section").hidden = false;
+    document.querySelector("#annotation-xiaxia-thought").textContent = thought.content;
+    document.querySelector("#annotation-actions").hidden = true;
+    if (!annotationDialog.open) annotationDialog.showModal();
+  }
+
+  async function deleteCurrentAnnotation() {
+    if (state.openRecord?.kind !== "user") return;
+    const annotation = state.annotations.find((item) => item.id === state.openRecord.id);
+    if (!annotation) return;
+    const message = annotation.xiaxia_response
+      ? "这条批注已有林知夏的回复。删除会同时永久删除该回复，确定继续吗？"
+      : "确定删除这条划线 / 批注吗？";
+    if (!window.confirm(message)) return;
+    try {
+      await api(`/api/annotations/${annotation.id}`, { method: "DELETE" });
+      state.annotations = state.annotations.filter((item) => item.id !== annotation.id);
+      state.openRecord = null;
+      annotationDialog.close();
+      await refreshAnnotationMarks();
+      showToast("划线与批注已删除。");
+    } catch (error) {
+      showToast(`删除失败：${error.message}`);
+    }
+  }
+
+  function renderChapterThoughts() {
+    const chapterLevel = state.thoughts.filter((item) => item.scope === "chapter");
+    chapterThoughts.replaceChildren();
+    chapterThoughts.hidden = chapterLevel.length === 0;
+    for (const thought of chapterLevel) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "chapter-thought";
+      button.innerHTML = `<strong>林知夏的本章想法</strong><span>${escapeHtml(thought.content)}</span>`;
+      button.addEventListener("click", () => openThought(thought.id));
+      chapterThoughts.append(button);
+    }
+  }
+
+  async function refreshAnnotationMarks() {
+    const snapshot = captureViewportAnchor();
+    unwrapMarks();
+    applyAnnotations();
+    applyXiaxiaThoughts();
+    renderChapterThoughts();
+    state.syncSignature = utils.syncSignature(state.annotations, state.thoughts);
+    await nextFrame(1);
+    await recalculatePages(snapshot);
+    restoreViewportAnchor(snapshot);
+  }
+
+  function unwrapMarks() {
+    for (const mark of [...content.querySelectorAll("mark.reader-highlight, mark.xiaxia-thought-highlight")].reverse()) {
+      mark.replaceWith(...mark.childNodes);
+    }
+    content.normalize();
+  }
+
+  function applyModeUi() {
+    const paginated = state.mode === "paginated";
+    body.classList.toggle("reader-paginated", paginated);
+    if (paginated) window.scrollTo({ top: 0, behavior: "auto" });
+    modeButton.textContent = paginated ? "滚动" : "分页";
+    modeButton.setAttribute("aria-label", paginated ? "切换到滚动阅读" : "切换到分页阅读");
+    pageStatus.hidden = !paginated;
+    updatePageControls();
+  }
+
+  async function toggleReadingMode() {
+    if (!state.loaded) return;
+    const snapshot = captureViewportAnchor();
+    await saveProgress(true);
+    state.mode = state.mode === "paginated" ? "scroll" : "paginated";
+    localStorage.setItem("xiaxia-reader-mode", state.mode);
+    applyModeUi();
+    await nextFrame(2);
+    await recalculatePages(snapshot);
+    restoreViewportAnchor(snapshot);
+    updateProgressIndicator();
+  }
+
+  async function recalculatePages(anchor = null) {
+    if (state.mode !== "paginated" || !state.loaded) {
+      content.style.removeProperty("--reader-column-width");
+      content.style.removeProperty("--pagination-height");
+      state.pageCount = 1;
+      state.pageIndex = 0;
+      content.scrollLeft = 0;
+      updatePageControls();
+      return;
+    }
+    const visual = window.visualViewport;
+    const viewportHeight = visual?.height || window.innerHeight;
+    const viewportTop = visual?.offsetTop || 0;
+    const top = content.getBoundingClientRect().top - viewportTop;
+    const availableHeight = Math.max(240, viewportHeight - top - 60);
+    content.style.setProperty("--pagination-height", `${availableHeight}px`);
+    content.style.setProperty("--reader-column-width", `${content.clientWidth}px`);
+    await nextFrame(2);
+    const gap = pageGap();
+    state.pageCount = utils.calculatePageCount(content.scrollWidth, content.clientWidth, gap);
+    if (anchor?.blockId) jumpToBlock(anchor.blockId, false);
+    else goToPage(state.pageIndex, "auto");
+    updatePageControls();
+  }
+
+  function pageGap() {
+    return Number.parseFloat(getComputedStyle(content).columnGap) || 32;
+  }
+
+  function goToPage(index, behavior = "smooth") {
+    if (state.mode !== "paginated") return;
+    state.pageIndex = utils.clamp(index, 0, state.pageCount - 1);
+    content.scrollTo({ left: state.pageIndex * (content.clientWidth + pageGap()), top: 0, behavior });
+    updatePageControls();
+    updateProgressIndicator();
+  }
+
+  async function turnPage(direction) {
+    if (state.mode !== "paginated" || !state.loaded) return;
+    if (direction === "next" && state.pageIndex < state.pageCount - 1) {
+      goToPage(state.pageIndex + 1);
+    } else if (direction === "previous" && state.pageIndex > 0) {
+      goToPage(state.pageIndex - 1);
+    } else if (direction === "next" && state.currentIndex < state.chapters.length - 1) {
+      await loadChapter(state.currentIndex + 1);
+      goToPage(0, "auto");
+    } else if (direction === "previous" && state.currentIndex > 0) {
+      await loadChapter(state.currentIndex - 1);
+      goToPage(state.pageCount - 1, "auto");
+    }
+    delayedProgressSave();
+  }
+
+  function updatePageControls() {
+    const paginated = state.mode === "paginated";
+    pagePrevious.hidden = !paginated;
+    pageNext.hidden = !paginated;
+    pageStatus.hidden = !paginated;
+    if (!paginated) return;
+    pagePrevious.disabled = state.pageIndex === 0 && state.currentIndex === 0;
+    pageNext.disabled = state.pageIndex >= state.pageCount - 1 && state.currentIndex >= state.chapters.length - 1;
+    pageStatus.textContent = `${state.pageIndex + 1} / ${state.pageCount}`;
+  }
+
+  function pageForElement(element) {
+    const rect = [...element.getClientRects()].find((item) => item.width || item.height);
+    if (!rect) return 0;
+    const containerRect = content.getBoundingClientRect();
+    const absoluteLeft = rect.left - containerRect.left + content.scrollLeft;
+    return utils.clamp(Math.floor((absoluteLeft + 1) / (content.clientWidth + pageGap())), 0, state.pageCount - 1);
+  }
+
+  function captureViewportAnchor() {
+    const block = firstVisibleBlock();
+    return {
+      blockId: block?.dataset.blockId || "b000001",
+      scrollY: window.scrollY,
+      pageIndex: state.pageIndex,
+      mode: state.mode,
+    };
+  }
+
+  function restoreViewportAnchor(snapshot) {
+    if (!snapshot) return;
+    if (state.mode === "paginated") jumpToBlock(snapshot.blockId, false);
+    else jumpToBlock(snapshot.blockId, false, snapshot.scrollY);
+  }
+
+  function jumpToBlock(blockId, flash = false, fallbackScrollY = 0) {
+    const block = blockId ? content.querySelector(`#${cssEscape(blockId)}`) : null;
+    if (!block) {
+      if (state.mode === "paginated") goToPage(0, "auto");
+      else window.scrollTo({ top: fallbackScrollY, behavior: "auto" });
+      return;
+    }
+    if (state.mode === "paginated") goToPage(pageForElement(block), "auto");
+    else window.scrollTo({ top: Math.max(0, block.getBoundingClientRect().top + window.scrollY - 78), behavior: "auto" });
+    if (flash) flashTargets([block]);
   }
 
   function restoreReadingPosition(position) {
     requestAnimationFrame(() => {
-      const block = position?.block_id ? content.querySelector(`#${cssEscape(position.block_id)}`) : null;
-      if (block) {
-        const toolbarHeight = 78;
-        window.scrollTo({ top: Math.max(0, block.getBoundingClientRect().top + window.scrollY - toolbarHeight), behavior: "auto" });
+      const blockId = position?.block_id;
+      if (blockId && content.querySelector(`#${cssEscape(blockId)}`)) {
+        jumpToBlock(blockId, false);
+      } else if (state.mode === "paginated") {
+        goToPage(Number(position?.page_index) || 0, "auto");
       } else if (Number.isFinite(Number(position?.scroll_fraction))) {
         const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
         window.scrollTo({ top: maxScroll * Number(position.scroll_fraction), behavior: "auto" });
@@ -350,48 +657,133 @@
 
   async function saveProgress(keepalive = false) {
     if (!state.loaded || !state.chapters.length) return;
-    const maxScroll = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
-    const scrollFraction = clamp(window.scrollY / maxScroll, 0, 1);
+    const fraction = state.mode === "paginated"
+      ? (state.pageCount > 1 ? state.pageIndex / (state.pageCount - 1) : 0)
+      : utils.clamp(window.scrollY / Math.max(1, document.documentElement.scrollHeight - window.innerHeight), 0, 1);
     const block = firstVisibleBlock();
-    const percentage = clamp(((state.currentIndex + scrollFraction) / state.chapters.length) * 100, 0, 100);
+    const percentage = utils.clamp(((state.currentIndex + fraction) / state.chapters.length) * 100, 0, 100);
     const payload = {
       chapter_id: state.chapters[state.currentIndex].id,
       chapter_index: state.currentIndex,
       position: {
         block_id: block?.dataset.blockId || "b000001",
         char_offset: 0,
-        scroll_fraction: scrollFraction,
+        scroll_fraction: fraction,
+        display_mode: state.mode,
+        page_index: state.pageIndex,
+        page_count: state.pageCount,
       },
       percentage,
     };
     try {
-      await api(`/api/books/${bookId}/progress`, {
-        method: "PUT",
-        body: JSON.stringify(payload),
-        keepalive,
-      });
+      await api(`/api/books/${bookId}/progress`, { method: "PUT", body: JSON.stringify(payload), keepalive });
     } catch (_error) {
-      // Autosave retries on the next scroll/visibility event.
+      // Autosave retries on the next scroll, page turn, or visibility event.
     }
   }
 
   function firstVisibleBlock() {
-    const toolbarBottom = 76;
-    return [...content.querySelectorAll("[data-block-id]")].find((block) => block.getBoundingClientRect().bottom > toolbarBottom) || null;
+    const blocks = [...content.querySelectorAll("[data-block-id]")];
+    if (state.mode !== "paginated") {
+      return blocks.find((block) => block.getBoundingClientRect().bottom > 76) || null;
+    }
+    const visible = content.getBoundingClientRect();
+    return blocks.find((block) => [...block.getClientRects()].some((rect) => rect.right > visible.left + 1 && rect.left < visible.right - 1 && rect.bottom > visible.top && rect.top < visible.bottom)) || null;
   }
 
   function updateProgressIndicator() {
     if (!state.chapters.length) return;
-    const maxScroll = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
-    const fraction = clamp(window.scrollY / maxScroll, 0, 1);
+    const fraction = state.mode === "paginated"
+      ? (state.pageCount > 1 ? state.pageIndex / (state.pageCount - 1) : 0)
+      : utils.clamp(window.scrollY / Math.max(1, document.documentElement.scrollHeight - window.innerHeight), 0, 1);
     const percentage = ((state.currentIndex + fraction) / state.chapters.length) * 100;
-    progressBar.style.width = `${clamp(percentage, 0, 100)}%`;
+    progressBar.style.width = `${utils.clamp(percentage, 0, 100)}%`;
   }
 
   function setFontSize(size) {
-    state.fontSize = clamp(size, 15, 28);
+    state.fontSize = utils.clamp(size, 15, 28);
     document.documentElement.style.setProperty("--reader-size", `${state.fontSize}px`);
     localStorage.setItem("xiaxia-reader-font-size", String(state.fontSize));
+  }
+
+  async function changeFontSize(delta) {
+    const anchor = captureViewportAnchor();
+    setFontSize(state.fontSize + delta);
+    await recalculatePages(anchor);
+    restoreViewportAnchor(anchor);
+  }
+
+  async function syncChapterAnnotations() {
+    if (!state.loaded || selectionIsActive() || noteDialog.open || state.menuInteracting) return;
+    const chapter = state.chapters[state.currentIndex];
+    try {
+      const data = await api(`/api/books/${bookId}/chapters/${chapter.id}/annotations`);
+      const annotations = data.annotations || [];
+      const thoughts = data.xiaxia_thoughts || [];
+      const signature = utils.syncSignature(annotations, thoughts);
+      if (signature === state.syncSignature) return;
+      const oldAnchorSignature = anchorSignature(state.annotations, state.thoughts);
+      const oldExternalCount = externalContentCount(state.annotations, state.thoughts);
+      state.annotations = annotations;
+      state.thoughts = thoughts;
+      state.syncSignature = signature;
+      if (oldAnchorSignature !== anchorSignature(annotations, thoughts)) {
+        await refreshAnnotationMarks();
+      } else {
+        renderChapterThoughts();
+      }
+      refreshOpenDialog();
+      if (externalContentCount(annotations, thoughts) > oldExternalCount) showToast("书页旁有林知夏留下的新内容。");
+    } catch (_error) {
+      // A later poll retries without disturbing reading.
+    }
+  }
+
+  function anchorSignature(annotations, thoughts) {
+    const anchors = [...annotations, ...thoughts.filter((item) => item.scope !== "chapter")]
+      .map((item) => [item.id, item.start_block_id, item.start_offset, item.end_block_id, item.end_offset]);
+    return JSON.stringify(anchors);
+  }
+
+  function externalContentCount(annotations, thoughts) {
+    return annotations.filter((item) => item.xiaxia_response).length + thoughts.length;
+  }
+
+  function refreshOpenDialog() {
+    if (!annotationDialog.open || !state.openRecord) return;
+    if (state.openRecord.kind === "user") openAnnotation(state.openRecord.id);
+    else openThought(state.openRecord.id);
+  }
+
+  function selectionIsActive() {
+    const selection = window.getSelection();
+    return Boolean(selection && !selection.isCollapsed && selection.rangeCount && content.contains(selection.getRangeAt(0).commonAncestorContainer));
+  }
+
+  function hasTargetForChapter(chapterId) {
+    return state.target.chapterId === chapterId && (state.target.annotationId || state.target.thoughtId);
+  }
+
+  function jumpToRequestedTarget() {
+    let elements = [];
+    if (state.target.annotationId) elements = [...content.querySelectorAll(`mark[data-annotation-id="${cssEscape(state.target.annotationId)}"]`)];
+    if (state.target.thoughtId) elements = [...content.querySelectorAll(`mark[data-thought-id="${cssEscape(state.target.thoughtId)}"]`)];
+    if (elements.length) {
+      const target = elements[0];
+      if (state.mode === "paginated") goToPage(pageForElement(target), "auto");
+      else window.scrollTo({ top: Math.max(0, target.getBoundingClientRect().top + window.scrollY - 96), behavior: "auto" });
+      flashTargets(elements);
+    } else if (state.target.thoughtId) {
+      const thought = state.thoughts.find((item) => item.id === state.target.thoughtId);
+      const button = [...chapterThoughts.querySelectorAll("button")][state.thoughts.filter((item) => item.scope === "chapter").indexOf(thought)];
+      if (button) flashTargets([button]);
+    }
+    state.target = { chapterId: null, annotationId: null, thoughtId: null };
+  }
+
+  function flashTargets(elements) {
+    for (const element of elements) element.classList.add("target-flash");
+    setTimeout(() => elements.forEach((element) => element.classList.remove("target-flash")), 2400);
   }
 
   function openToc() {
@@ -413,7 +805,7 @@
     toast.textContent = message;
     toast.hidden = false;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { toast.hidden = true; }, 2600);
+    toastTimer = setTimeout(() => { toast.hidden = true; }, 2800);
   }
 
   function debounce(fn, delay) {
@@ -424,45 +816,106 @@
     };
   }
 
+  function nextFrame(count = 1) {
+    return new Promise((resolve) => {
+      const step = (remaining) => requestAnimationFrame(() => remaining > 1 ? step(remaining - 1) : resolve());
+      step(count);
+    });
+  }
+
   function normalizeText(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
-  function clamp(value, min, max) { return Math.max(min, Math.min(max, Number.isFinite(Number(value)) ? Number(value) : min)); }
   function cssEscape(value) { return window.CSS?.escape ? CSS.escape(String(value)) : String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&"); }
   function escapeHtml(value) { const span = document.createElement("span"); span.textContent = value; return span.innerHTML; }
 
-  const delayedSelectionCapture = debounce(captureSelection, 220);
   const delayedProgressSave = debounce(() => saveProgress(false), 900);
+  const delayedResize = debounce(async () => {
+    const anchor = captureViewportAnchor();
+    await recalculatePages(anchor);
+    restoreViewportAnchor(anchor);
+  }, 180);
 
-  content.addEventListener("mouseup", delayedSelectionCapture);
-  content.addEventListener("touchend", delayedSelectionCapture, { passive: true });
-  document.addEventListener("selectionchange", () => {
-    if (window.getSelection()?.isCollapsed) hideSelectionMenu();
+  content.addEventListener("mouseup", () => scheduleSelectionCapture([40, 180]));
+  content.addEventListener("pointerup", (event) => {
+    if (event.pointerType === "touch" || event.pointerType === "pen") scheduleSelectionCapture();
   });
+  content.addEventListener("touchend", () => scheduleSelectionCapture(), { passive: true });
+  content.addEventListener("contextmenu", () => scheduleSelectionCapture([100, 350, 700]));
+  document.addEventListener("selectionchange", () => {
+    if (selectionIsActive()) {
+      scheduleSelectionCapture([180, 420]);
+    } else if (!state.menuInteracting) {
+      setTimeout(() => { if (!selectionIsActive() && !state.menuInteracting) hideSelectionMenu(); }, 260);
+    }
+  });
+  selectionMenu.addEventListener("pointerdown", (event) => {
+    state.menuInteracting = true;
+    event.preventDefault();
+    setTimeout(() => { state.menuInteracting = false; }, 500);
+  });
+  window.visualViewport?.addEventListener("resize", () => {
+    if (!selectionMenu.hidden) scheduleSelectionCapture([80]);
+  });
+  window.visualViewport?.addEventListener("scroll", () => {
+    if (!selectionMenu.hidden) scheduleSelectionCapture([80]);
+  });
+
   content.addEventListener("click", (event) => {
-    const mark = event.target.closest("mark[data-annotation-id]");
-    if (mark) openAnnotation(mark.dataset.annotationId);
+    const mark = event.target.closest(
+      "mark[data-annotation-id], mark[data-thought-id]",
+    );
+    if (mark?.dataset.annotationId) openAnnotation(mark.dataset.annotationId);
+    else if (mark?.dataset.thoughtId) openThought(mark.dataset.thoughtId);
   });
   document.querySelector("#highlight-selection").addEventListener("click", () => saveAnnotation(""));
-  document.querySelector("#note-selection").addEventListener("click", openNoteDialog);
+  document.querySelector("#note-selection").addEventListener("click", openNewNoteDialog);
   noteForm.addEventListener("submit", async (event) => {
     event.preventDefault();
-    await saveAnnotation(noteText.value.trim());
+    if (state.editingAnnotationId) await saveEditedAnnotation(noteText.value.trim());
+    else await saveAnnotation(noteText.value.trim());
     noteDialog.close();
   });
-  for (const button of document.querySelectorAll("[data-close-note]")) {
-    button.addEventListener("click", () => noteDialog.close());
-  }
+  noteDialog.addEventListener("close", () => { state.editingAnnotationId = null; });
+  annotationDialog.addEventListener("close", () => { state.openRecord = null; });
+  for (const button of document.querySelectorAll("[data-close-note]")) button.addEventListener("click", () => noteDialog.close());
+  editAnnotationButton.addEventListener("click", () => state.openRecord?.kind === "user" && openEditAnnotation(state.openRecord.id));
+  deleteAnnotationButton.addEventListener("click", deleteCurrentAnnotation);
   previousButton.addEventListener("click", () => loadChapter(state.currentIndex - 1));
   nextButton.addEventListener("click", () => loadChapter(state.currentIndex + 1));
-  document.querySelector("#font-down").addEventListener("click", () => setFontSize(state.fontSize - 1));
-  document.querySelector("#font-up").addEventListener("click", () => setFontSize(state.fontSize + 1));
+  pagePrevious.addEventListener("click", () => turnPage("previous"));
+  pageNext.addEventListener("click", () => turnPage("next"));
+  modeButton.addEventListener("click", toggleReadingMode);
+  document.querySelector("#font-down").addEventListener("click", () => changeFontSize(-1));
+  document.querySelector("#font-up").addEventListener("click", () => changeFontSize(1));
   tocButton.addEventListener("click", openToc);
   tocClose.addEventListener("click", closeToc);
   scrim.addEventListener("click", closeToc);
+
+  content.addEventListener("touchstart", (event) => {
+    const touch = event.changedTouches[0];
+    state.touchStart = touch ? { x: touch.clientX, y: touch.clientY } : null;
+  }, { passive: true });
+  content.addEventListener("touchend", (event) => {
+    if (state.mode !== "paginated") return;
+    const touch = event.changedTouches[0];
+    const direction = utils.swipeDirection(state.touchStart, touch ? { x: touch.clientX, y: touch.clientY } : null, selectionIsActive());
+    state.touchStart = null;
+    if (direction) turnPage(direction);
+  }, { passive: true });
+  document.addEventListener("keydown", (event) => {
+    if (state.mode !== "paginated" || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    if (event.target.closest("input, textarea, dialog") || selectionIsActive()) return;
+    if (event.key === "ArrowRight") { event.preventDefault(); turnPage("next"); }
+    if (event.key === "ArrowLeft") { event.preventDefault(); turnPage("previous"); }
+  });
+
   window.addEventListener("scroll", () => {
+    if (state.mode !== "scroll") return;
     updateProgressIndicator();
     delayedProgressSave();
-    hideSelectionMenu();
+    if (!selectionIsActive()) hideSelectionMenu();
   }, { passive: true });
+  window.addEventListener("resize", delayedResize, { passive: true });
+  window.visualViewport?.addEventListener("resize", delayedResize, { passive: true });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") saveProgress(true);
   });

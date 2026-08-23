@@ -127,6 +127,11 @@ def create_app(test_config: dict | None = None) -> Flask:
     def reader_page(book_id):
         return render_template("reader.html", book_id=str(book_id))
 
+    @app.get("/reader/<uuid:book_id>/annotations")
+    @web_required
+    def annotations_overview_page(book_id):
+        return render_template("annotations_overview.html", book_id=str(book_id))
+
     @app.errorhandler(RequestEntityTooLarge)
     def too_large(_error):
         return (

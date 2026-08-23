@@ -7,9 +7,16 @@
   const fileInput = document.querySelector("#book-file");
   const uploadStatus = document.querySelector("#upload-status");
   const template = document.querySelector("#book-card-template");
+  const editDialog = document.querySelector("#book-edit-dialog");
+  const editForm = document.querySelector("#book-edit-form");
+  const editId = document.querySelector("#edit-book-id");
+  const editTitle = document.querySelector("#edit-book-title");
+  const editAuthor = document.querySelector("#edit-book-author");
 
   async function api(url, options = {}) {
-    const response = await fetch(url, { credentials: "same-origin", ...options });
+    const headers = { ...(options.headers || {}) };
+    if (options.body && !(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
+    const response = await fetch(url, { credentials: "same-origin", ...options, headers });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
       const error = new Error(data.message || data.error || `请求失败 (${response.status})`);
@@ -56,6 +63,7 @@
       track.querySelector("span").style.width = `${percentage}%`;
       const chapter = book.current_chapter ? ` · ${book.current_chapter}` : "";
       fragment.querySelector(".book-progress").textContent = `${percentage.toFixed(1)}%${chapter}`;
+      fragment.querySelector(".edit-book-button").addEventListener("click", () => openBookEditor(book));
       card.dataset.bookId = book.id;
       shelf.append(fragment);
     }
@@ -86,6 +94,40 @@
     }
   });
 
+  function openBookEditor(book) {
+    editId.value = book.id;
+    editTitle.value = book.title || "";
+    editAuthor.value = book.author || "未知作者";
+    editDialog.showModal();
+    setTimeout(() => editTitle.focus(), 0);
+  }
+
+  editForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const title = editTitle.value.trim();
+    const author = editAuthor.value.trim();
+    if (!title || !author) return;
+    const submit = editForm.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+      await api(`/api/books/${editId.value}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title, author }),
+      });
+      editDialog.close();
+      await loadBooks();
+    } catch (error) {
+      uploadStatus.classList.add("error");
+      uploadStatus.textContent = `书籍信息保存失败：${error.message}`;
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  for (const button of document.querySelectorAll("[data-close-book-edit]")) {
+    button.addEventListener("click", () => editDialog.close());
+  }
+
   function clamp(value, min, max) {
     return Math.max(min, Math.min(max, Number.isFinite(value) ? value : min));
   }
@@ -98,4 +140,3 @@
 
   loadBooks();
 })();
-

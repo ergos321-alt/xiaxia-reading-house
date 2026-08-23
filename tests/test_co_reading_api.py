@@ -43,6 +43,10 @@ def test_action_context_contains_complete_chapter_progress_and_annotations(monke
                 "book_id": BOOK_ID,
                 "chapter_index": 2,
                 "title": "第三章",
+                "content_html": (
+                    '<p id="b000003" data-block-id="b000003">这是完整章节。</p>'
+                    '<p id="b000004" data-block-id="b000004">第二段也在这里。</p>'
+                ),
                 "content_text": "这是完整章节。第二段也在这里。",
                 "word_count": 16,
                 "book_title": "测试之书",
@@ -60,10 +64,13 @@ def test_action_context_contains_complete_chapter_progress_and_annotations(monke
         raise AssertionError(f"Unexpected query: {query}")
 
     monkeypatch.setattr(reading.db, "fetch_one", fake_fetch_one)
-    monkeypatch.setattr(
-        reading.db,
-        "fetch_all",
-        lambda *_args, **_kwargs: [
+
+    def fake_fetch_all(query, _params=()):
+        if "from xiaxia_thoughts" in query:
+            return []
+        if "from annotations" not in query:
+            raise AssertionError(f"Unexpected query: {query}")
+        return [
             {
                 "id": ANNOTATION_ID,
                 "selected_text": "第二段",
@@ -79,8 +86,9 @@ def test_action_context_contains_complete_chapter_progress_and_annotations(monke
                 "updated_at": NOW,
                 "xiaxia_response": None,
             }
-        ],
-    )
+        ]
+
+    monkeypatch.setattr(reading.db, "fetch_all", fake_fetch_all)
 
     response = make_client().get(
         f"/api/reading/context?chapter_id={CHAPTER_ID}", headers=auth_headers()

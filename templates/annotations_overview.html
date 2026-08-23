@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f7f2e9">
+  <title>划线与批注 · 共读小屋</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="annotations-page" data-book-id="{{ book_id }}">
+  <header class="site-header annotations-header">
+    <div>
+      <a class="back-link" href="{{ url_for('reader_page', book_id=book_id) }}">← 返回阅读</a>
+      <p class="eyebrow">Xiaxia Reading House</p>
+      <h1 id="overview-book-title">划线与批注</h1>
+    </div>
+  </header>
+
+  <main class="annotations-main">
+    <nav id="annotation-filters" class="filter-tabs" aria-label="批注筛选">
+      <button class="active" type="button" data-filter="all">全部</button>
+      <button type="button" data-filter="highlights">仅划线</button>
+      <button type="button" data-filter="comments">有用户批注</button>
+      <button type="button" data-filter="replies">有林知夏回复</button>
+    </nav>
+    <p id="overview-count" class="muted"></p>
+    <section id="annotation-overview-list" class="annotation-overview-list" aria-live="polite"></section>
+    <div id="overview-empty" class="empty-state" hidden>
+      <h2>这里还没有符合筛选条件的内容</h2>
+    </div>
+  </main>
+
+  <template id="annotation-overview-template">
+    <article class="overview-card">
+      <button class="overview-jump" type="button">
+        <span class="overview-kind"></span>
+        <span class="overview-chapter"></span>
+        <blockquote class="overview-quote"></blockquote>
+        <span class="overview-user"></span>
+        <span class="overview-reply"></span>
+        <span class="overview-thought"></span>
+        <span class="overview-time"></span>
+      </button>
+    </article>
+  </template>
+
+  <script src="{{ url_for('static', filename='js/annotations-overview.js') }}" defer></script>
+</body>
+</html>

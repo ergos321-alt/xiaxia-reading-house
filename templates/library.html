@@ -58,12 +58,32 @@
           <span></span>
         </div>
         <p class="book-progress"></p>
-        <a class="continue-link" href="#">继续阅读 <span aria-hidden="true">→</span></a>
+        <div class="book-card-actions">
+          <a class="continue-link" href="#">继续阅读 <span aria-hidden="true">→</span></a>
+          <button class="edit-book-button text-button" type="button">编辑信息</button>
+        </div>
       </div>
     </article>
   </template>
 
+  <dialog id="book-edit-dialog" class="book-edit-dialog">
+    <form id="book-edit-form">
+      <div class="dialog-heading">
+        <h2>编辑书籍信息</h2>
+        <button class="icon-button" type="button" data-close-book-edit aria-label="关闭">×</button>
+      </div>
+      <input id="edit-book-id" type="hidden">
+      <label for="edit-book-title">书名</label>
+      <input id="edit-book-title" maxlength="1000" required>
+      <label for="edit-book-author">作者</label>
+      <input id="edit-book-author" maxlength="1000" required>
+      <div class="dialog-actions">
+        <button class="secondary-button" type="button" data-close-book-edit>取消</button>
+        <button class="primary-button" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="{{ url_for('static', filename='js/library.js') }}" defer></script>
 </body>
 </html>
-
