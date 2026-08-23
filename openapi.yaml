@@ -1,0 +1,266 @@
+openapi: 3.1.0
+info:
+  title: Xiaxia Reading House V1
+  version: 1.0.0
+  description: >-
+    Private co-reading API. The server supplies books, full chapter text,
+    reading state, annotations, and durable Xiaxia replies. It does not generate persona text.
+servers:
+  - url: https://replace-with-your-render-host.example.com
+    description: Replace with the deployed Render HTTPS origin before importing this Action.
+security:
+  - bearerAuth: []
+paths:
+  /api/reading/state:
+    get:
+      operationId: getCurrentReadingState
+      summary: Get the current shared reading state
+      description: Returns the most recently active book, user progress, Xiaxia progress, and pending annotation count.
+      responses:
+        "200":
+          description: Current state, or current null when no book has been opened.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/books:
+    get:
+      operationId: listReadingHouseBooks
+      summary: List books on the private bookshelf
+      responses:
+        "200":
+          description: Books with their latest progress.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  books:
+                    type: array
+                    items: { $ref: "#/components/schemas/Book" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/books/{book_id}/chapters/{chapter_id}:
+    get:
+      operationId: getReadingHouseChapter
+      summary: Get one complete chapter
+      parameters:
+        - $ref: "#/components/parameters/BookId"
+        - $ref: "#/components/parameters/ChapterId"
+      responses:
+        "200":
+          description: Chapter HTML and complete plain text.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  chapter: { $ref: "#/components/schemas/Chapter" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/reading/context:
+    get:
+      operationId: getCoReadingContext
+      summary: Get the full chapter context for reading or replying
+      description: >-
+        Pass annotation_id to focus one annotation, chapter_id to choose a chapter,
+        or neither to use current reading progress. Adjacent chapters are excluded by default.
+      parameters:
+        - name: annotation_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+          description: Annotation to focus. Its chapter becomes the context chapter.
+        - name: chapter_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+          description: Explicit chapter. Ignored when annotation_id is supplied.
+        - name: include_adjacent
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Also return complete previous and next chapter text when needed.
+      responses:
+        "200":
+          description: Book facts, complete chapter text, annotations, focus annotation, and user progress.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/annotations/pending:
+    get:
+      operationId: listPendingReadingAnnotations
+      summary: List annotations Xiaxia has not processed
+      parameters:
+        - name: book_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: Oldest pending annotations first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  annotations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Annotation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/annotations/{annotation_id}/seen:
+    post:
+      operationId: markReadingAnnotationSeen
+      summary: Mark an annotation as seen without replying
+      parameters:
+        - $ref: "#/components/parameters/AnnotationId"
+      responses:
+        "200":
+          description: Updated annotation state.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/annotations/{annotation_id}/reply:
+    post:
+      operationId: replyToReadingAnnotation
+      summary: Permanently write Xiaxia's reply beside an annotation
+      parameters:
+        - $ref: "#/components/parameters/AnnotationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [response]
+              properties:
+                response:
+                  type: string
+                  minLength: 1
+                  maxLength: 50000
+                  description: Xiaxia's own reply text. The server does not generate it.
+      responses:
+        "200":
+          description: Durable reply and replied status.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/ai/progress:
+    post:
+      operationId: updateXiaxiaReadingProgress
+      summary: Persist Xiaxia's co-reading checkpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [book_id]
+              properties:
+                book_id: { type: string, format: uuid }
+                chapter_id: { type: string, format: uuid }
+                last_annotation_seen: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Updated AI reading state.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-token
+  parameters:
+    BookId:
+      name: book_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ChapterId:
+      name: chapter_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    AnnotationId:
+      name: annotation_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    BadRequest:
+      description: Invalid request.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or invalid Bearer token.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Requested private reading resource does not exist.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        message: { type: string }
+    Book:
+      type: object
+      required: [id, title, author, format, chapter_count]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        author: { type: string }
+        format: { type: string, enum: [epub, txt] }
+        chapter_count: { type: integer }
+        progress_percentage: { type: number }
+        current_chapter: { type: string }
+    Chapter:
+      type: object
+      required: [id, book_id, chapter_index, title, content_text]
+      properties:
+        id: { type: string, format: uuid }
+        book_id: { type: string, format: uuid }
+        chapter_index: { type: integer }
+        title: { type: string }
+        content_html: { type: string }
+        content_text: { type: string, description: Complete normalized chapter text. }
+        word_count: { type: integer }
+    Annotation:
+      type: object
+      required: [id, book_id, chapter_id, selected_text, status]
+      properties:
+        id: { type: string, format: uuid }
+        book_id: { type: string, format: uuid }
+        chapter_id: { type: string, format: uuid }
+        selected_text: { type: string }
+        comment: { type: string }
+        prefix_text: { type: string }
+        suffix_text: { type: string }
+        status: { type: string, enum: [pending, seen, replied] }
+        book_title: { type: string }
+        chapter_title: { type: string }
