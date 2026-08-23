@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>进入共读小屋</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <div class="house-mark" aria-hidden="true">⌂</div>
+    <p class="eyebrow">Xiaxia Reading House</p>
+    <h1>回到共读小屋</h1>
+    <p class="muted">这里保存我们的书、阅读位置与书页旁的话。</p>
+    <form method="post" class="login-form">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <label for="password">私人访问密码</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+      {% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
+      <button class="primary-button" type="submit">进入小屋</button>
+    </form>
+  </main>
+</body>
+</html>
+

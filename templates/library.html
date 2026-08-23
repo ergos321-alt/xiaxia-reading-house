@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f5f0e7">
+  <title>共读小屋 · 书架</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="library-page">
+  <header class="site-header">
+    <div>
+      <p class="eyebrow">Xiaxia Reading House</p>
+      <h1>我们的书架</h1>
+    </div>
+    <form method="post" action="{{ url_for('logout') }}">
+      <button class="text-button" type="submit">离开小屋</button>
+    </form>
+  </header>
+
+  <main class="library-main">
+    <section class="upload-panel" aria-labelledby="upload-title">
+      <div>
+        <h2 id="upload-title">把一本书带回家</h2>
+        <p>支持普通 EPUB2 / EPUB3 与 TXT，单本不超过 {{ max_upload_mb }} MB。</p>
+      </div>
+      <label class="upload-button" for="book-file">选择书籍</label>
+      <input id="book-file" type="file" accept=".epub,.txt,application/epub+zip,text/plain" hidden>
+      <div id="upload-status" class="upload-status" aria-live="polite"></div>
+    </section>
+
+    <section aria-labelledby="shelf-title">
+      <div class="section-heading">
+        <h2 id="shelf-title">书架</h2>
+        <span id="book-count" class="muted"></span>
+      </div>
+      <div id="bookshelf" class="bookshelf" aria-live="polite"></div>
+      <div id="empty-shelf" class="empty-state" hidden>
+        <div class="empty-book" aria-hidden="true"></div>
+        <h3>书架还是空的</h3>
+        <p>上传第一本书，我们从这里开始一起读。</p>
+      </div>
+    </section>
+  </main>
+
+  <template id="book-card-template">
+    <article class="book-card">
+      <a class="book-cover-link" href="#">
+        <div class="book-cover">
+          <img alt="" loading="lazy">
+          <span class="cover-placeholder" aria-hidden="true">书</span>
+        </div>
+      </a>
+      <div class="book-info">
+        <a class="book-title" href="#"></a>
+        <p class="book-author"></p>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+          <span></span>
+        </div>
+        <p class="book-progress"></p>
+        <a class="continue-link" href="#">继续阅读 <span aria-hidden="true">→</span></a>
+      </div>
+    </article>
+  </template>
+
+  <script src="{{ url_for('static', filename='js/library.js') }}" defer></script>
+</body>
+</html>
+

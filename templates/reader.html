@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover">
+  <meta name="theme-color" content="#f7f2e9">
+  <title>共读小屋 · 阅读</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="reader-page" data-book-id="{{ book_id }}">
+  <header class="reader-toolbar">
+    <a class="icon-button" href="{{ url_for('library_page') }}" aria-label="返回书架">←</a>
+    <button id="toc-button" class="icon-button" type="button" aria-label="打开目录" aria-expanded="false">☰</button>
+    <div class="reader-heading">
+      <strong id="reader-book-title">正在打开书籍…</strong>
+      <span id="reader-chapter-title"></span>
+    </div>
+    <button id="font-down" class="font-button" type="button" aria-label="缩小字号">A−</button>
+    <button id="font-up" class="font-button" type="button" aria-label="放大字号">A＋</button>
+  </header>
+
+  <div id="reader-progress" class="reader-progress" aria-hidden="true"><span></span></div>
+
+  <aside id="toc-drawer" class="toc-drawer" aria-hidden="true">
+    <div class="toc-header">
+      <h2>目录</h2>
+      <button id="toc-close" class="icon-button" type="button" aria-label="关闭目录">×</button>
+    </div>
+    <nav id="toc-list" aria-label="书籍目录"></nav>
+  </aside>
+  <div id="drawer-scrim" class="drawer-scrim" hidden></div>
+
+  <main class="reader-shell">
+    <article id="chapter-content" class="chapter-content" tabindex="-1" aria-live="polite">
+      <p class="reader-loading">正在翻到上次读过的地方…</p>
+    </article>
+    <nav class="chapter-navigation" aria-label="章节导航">
+      <button id="previous-chapter" type="button">← 上一章</button>
+      <span id="chapter-position"></span>
+      <button id="next-chapter" type="button">下一章 →</button>
+    </nav>
+  </main>
+
+  <div id="selection-menu" class="selection-menu" hidden>
+    <button id="highlight-selection" type="button">划线</button>
+    <button id="note-selection" type="button">写想法</button>
+  </div>
+
+  <dialog id="note-dialog" class="note-dialog">
+    <form method="dialog" id="note-form">
+      <div class="dialog-heading">
+        <h2>写在书页旁</h2>
+        <button class="icon-button" type="button" data-close-note aria-label="关闭">×</button>
+      </div>
+      <blockquote id="selected-quote"></blockquote>
+      <label for="note-text">我的想法</label>
+      <textarea id="note-text" rows="5" maxlength="20000" placeholder="也可以暂时留空，只保存划线。"></textarea>
+      <div class="dialog-actions">
+        <button class="secondary-button" type="button" data-close-note>取消</button>
+        <button id="save-note" class="primary-button" type="submit" value="default">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="annotation-dialog" class="annotation-dialog">
+    <form method="dialog">
+      <div class="dialog-heading">
+        <p class="eyebrow">书页旁</p>
+        <button class="icon-button" value="close" aria-label="关闭">×</button>
+      </div>
+      <blockquote id="annotation-quote"></blockquote>
+      <section id="user-note-section">
+        <h3>我</h3>
+        <p id="annotation-user-note"></p>
+      </section>
+      <section id="xiaxia-reply-section">
+        <h3>林知夏</h3>
+        <p id="annotation-xiaxia-reply"></p>
+      </section>
+    </form>
+  </dialog>
+
+  <div id="reader-toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="{{ url_for('static', filename='js/reader.js') }}" defer></script>
+</body>
+</html>
