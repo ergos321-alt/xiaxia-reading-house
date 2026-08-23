@@ -30,6 +30,10 @@
   const annotationDialog = document.querySelector("#annotation-dialog");
   const editAnnotationButton = document.querySelector("#edit-annotation");
   const deleteAnnotationButton = document.querySelector("#delete-annotation");
+  const thoughtReplySection = document.querySelector("#thought-user-reply-section");
+  const thoughtReplyText = document.querySelector("#thought-user-reply");
+  const thoughtReplyButton = document.querySelector("#thought-reply-edit");
+  const thoughtReplyDelete = document.querySelector("#thought-reply-delete");
   const toast = document.querySelector("#reader-toast");
   const query = new URLSearchParams(location.search);
 
@@ -253,9 +257,16 @@
       if (kind === "xiaxia") {
         mark.className = "xiaxia-thought-highlight";
         mark.dataset.thoughtId = recordId;
+        mark.setAttribute("role", "button");
+        mark.setAttribute("tabindex", "0");
+        mark.setAttribute("aria-label", "打开林知夏留在这里的想法");
+        mark.setAttribute("title", "林知夏来过这里");
       } else {
         mark.className = "reader-highlight";
         mark.dataset.annotationId = recordId;
+        mark.setAttribute("role", "button");
+        mark.setAttribute("tabindex", "0");
+        mark.setAttribute("aria-label", "打开我的划线或批注");
       }
       mark.append(range.extractContents());
       range.insertNode(mark);
@@ -446,6 +457,7 @@
     replySection.hidden = !annotation.xiaxia_response;
     document.querySelector("#annotation-xiaxia-reply").textContent = annotation.xiaxia_response || "";
     document.querySelector("#xiaxia-thought-section").hidden = true;
+    thoughtReplySection.hidden = true;
     document.querySelector("#annotation-actions").hidden = false;
     editAnnotationButton.textContent = annotation.comment ? "编辑" : "添加想法";
     if (!annotationDialog.open) annotationDialog.showModal();
@@ -461,8 +473,55 @@
     document.querySelector("#xiaxia-reply-section").hidden = true;
     document.querySelector("#xiaxia-thought-section").hidden = false;
     document.querySelector("#annotation-xiaxia-thought").textContent = thought.content;
+    thoughtReplySection.hidden = false;
+    thoughtReplyText.textContent = thought.user_response || "（我还没有回复）";
+    thoughtReplyButton.textContent = thought.user_response ? "编辑我的回复" : "回复林知夏";
+    thoughtReplyDelete.hidden = !thought.user_response;
     document.querySelector("#annotation-actions").hidden = true;
     if (!annotationDialog.open) annotationDialog.showModal();
+  }
+
+  async function editThoughtReply() {
+    if (state.openRecord?.kind !== "xiaxia") return;
+    const thought = state.thoughts.find((item) => item.id === state.openRecord.id);
+    if (!thought) return;
+    const response = window.prompt("回复林知夏的这条想法", thought.user_response || "");
+    if (response === null || !response.trim()) return;
+    try {
+      const method = thought.user_response ? "PATCH" : "POST";
+      const data = await api(`/api/xiaxia/thoughts/${thought.id}/reply`, {
+        method,
+        body: JSON.stringify({ response: response.trim() }),
+      });
+      const reply = data.user_reply;
+      thought.user_reply_id = reply.id;
+      thought.user_response = reply.response;
+      thought.user_reply_created_at = reply.created_at;
+      thought.user_reply_updated_at = reply.updated_at;
+      state.syncSignature = utils.syncSignature(state.annotations, state.thoughts);
+      openThought(thought.id);
+      showToast("回复已经留在这条想法旁。");
+    } catch (error) {
+      showToast(`回复失败：${error.message}`);
+    }
+  }
+
+  async function deleteThoughtReply() {
+    if (state.openRecord?.kind !== "xiaxia") return;
+    const thought = state.thoughts.find((item) => item.id === state.openRecord.id);
+    if (!thought?.user_response || !window.confirm("确定删除我对这条想法的回复吗？")) return;
+    try {
+      await api(`/api/xiaxia/thoughts/${thought.id}/reply`, { method: "DELETE" });
+      thought.user_reply_id = null;
+      thought.user_response = null;
+      thought.user_reply_created_at = null;
+      thought.user_reply_updated_at = null;
+      state.syncSignature = utils.syncSignature(state.annotations, state.thoughts);
+      openThought(thought.id);
+      showToast("我的回复已删除。");
+    } catch (error) {
+      showToast(`删除失败：${error.message}`);
+    }
   }
 
   async function deleteCurrentAnnotation() {
@@ -493,7 +552,8 @@
       const button = document.createElement("button");
       button.type = "button";
       button.className = "chapter-thought";
-      button.innerHTML = `<strong>林知夏的本章想法</strong><span>${escapeHtml(thought.content)}</span>`;
+      button.setAttribute("aria-label", "打开林知夏留在本章的想法");
+      button.innerHTML = `<span class="thought-paw" aria-hidden="true">🐾</span><span><strong>林知夏在这一章停留过</strong><small>点开页边留下的话</small></span>`;
       button.addEventListener("click", () => openThought(thought.id));
       chapterThoughts.append(button);
     }
@@ -848,6 +908,7 @@
     }
   });
   selectionMenu.addEventListener("pointerdown", (event) => {
+    captureSelection();
     state.menuInteracting = true;
     event.preventDefault();
     setTimeout(() => { state.menuInteracting = false; }, 500);
@@ -866,6 +927,14 @@
     if (mark?.dataset.annotationId) openAnnotation(mark.dataset.annotationId);
     else if (mark?.dataset.thoughtId) openThought(mark.dataset.thoughtId);
   });
+  content.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const mark = event.target.closest("mark[data-annotation-id], mark[data-thought-id]");
+    if (!mark) return;
+    event.preventDefault();
+    if (mark.dataset.annotationId) openAnnotation(mark.dataset.annotationId);
+    else if (mark.dataset.thoughtId) openThought(mark.dataset.thoughtId);
+  });
   document.querySelector("#highlight-selection").addEventListener("click", () => saveAnnotation(""));
   document.querySelector("#note-selection").addEventListener("click", openNewNoteDialog);
   noteForm.addEventListener("submit", async (event) => {
@@ -879,6 +948,8 @@
   for (const button of document.querySelectorAll("[data-close-note]")) button.addEventListener("click", () => noteDialog.close());
   editAnnotationButton.addEventListener("click", () => state.openRecord?.kind === "user" && openEditAnnotation(state.openRecord.id));
   deleteAnnotationButton.addEventListener("click", deleteCurrentAnnotation);
+  thoughtReplyButton.addEventListener("click", editThoughtReply);
+  thoughtReplyDelete.addEventListener("click", deleteThoughtReply);
   previousButton.addEventListener("click", () => loadChapter(state.currentIndex - 1));
   nextButton.addEventListener("click", () => loadChapter(state.currentIndex + 1));
   pagePrevious.addEventListener("click", () => turnPage("previous"));

@@ -26,8 +26,8 @@ const mobile = utils.selectionMenuPosition({{
   viewport: {{offsetLeft: 0, offsetTop: 200, width: 412, height: 380, bottomInset: 12}},
   mobile: true,
 }});
-assert.strictEqual(mobile.placement, 'bottom');
-assert.strictEqual(mobile.left, 206);
+assert.strictEqual(mobile.placement, 'mobile-below');
+assert.ok(mobile.left >= 90 && mobile.left <= 206);
 assert.ok(mobile.top >= 200 && mobile.top < 580);
 const first = utils.syncSignature([{{id: 'a', updated_at: '1'}}], []);
 const changed = utils.syncSignature([{{id: 'a', updated_at: '2', xiaxia_response: 'new'}}], []);
@@ -55,6 +55,8 @@ def test_android_selection_strategy_is_wired_without_disabling_native_selection(
     assert "cloneRange()" in source
     assert "visualViewport" in source
     assert "state.savedSelection" in source
+    assert "captureSelection();" in source
+    assert 'placement: "mobile-below"' in (ROOT / "static/js/reader-utils.js").read_text(encoding="utf-8")
     assert "user-select: none" not in style
     assert "-webkit-user-select: none" not in style
 

@@ -11,7 +11,7 @@ from psycopg.types.json import Jsonb
 
 import database as db
 import storage as object_storage
-from auth import api_or_session_required
+from auth import action_required, api_or_session_required, web_api_required
 from epub_parser import BookParseError, parse_uploaded_book
 
 
@@ -47,7 +47,7 @@ def list_books():
 
 
 @reading_bp.post("/api/books")
-@api_or_session_required
+@web_api_required
 def upload_book():
     upload = request.files.get("file")
     if upload is None or not upload.filename:
@@ -243,7 +243,7 @@ def list_book_chapters(book_id: UUID):
 
 
 @reading_bp.patch("/api/books/<uuid:book_id>")
-@api_or_session_required
+@web_api_required
 def update_book(book_id: UUID):
     payload = request.get_json(silent=True) or {}
     updates = []
@@ -271,6 +271,40 @@ def update_book(book_id: UUID):
     if not row:
         return jsonify({"error": "book_not_found"}), 404
     return jsonify({"book": _serialize_book(row)})
+
+
+@reading_bp.delete("/api/books/<uuid:book_id>")
+@web_api_required
+def delete_book(book_id: UUID):
+    """Delete one private book after removing every persisted Storage object."""
+    book = db.fetch_one(
+        "select id, title, source_object_path from books where id = %s", (book_id,)
+    )
+    if not book:
+        return jsonify({"error": "book_not_found"}), 404
+    assets = db.fetch_all(
+        "select object_path from book_assets where book_id = %s order by object_path",
+        (book_id,),
+    )
+    object_paths = [book["source_object_path"]] + [row["object_path"] for row in assets]
+    try:
+        object_storage.delete_objects(object_paths)
+    except object_storage.ObjectStorageError:
+        # Keep the relational records when Storage cleanup cannot be confirmed.
+        return jsonify({"error": "private_storage_cleanup_failed"}), 502
+    deleted = db.execute(
+        "delete from books where id = %s returning id, title", (book_id,)
+    )
+    if not deleted:
+        return jsonify({"error": "book_delete_conflict"}), 409
+    return jsonify(
+        {
+            "deleted": True,
+            "book_id": str(book_id),
+            "title": deleted["title"],
+            "storage_objects_deleted": len(object_paths),
+        }
+    )
 
 
 @reading_bp.get("/api/books/<uuid:book_id>/chapters/<uuid:chapter_id>")
@@ -315,7 +349,7 @@ def get_asset(book_id: UUID, asset_path: str):
 
 
 @reading_bp.put("/api/books/<uuid:book_id>/progress")
-@api_or_session_required
+@web_api_required
 def save_progress(book_id: UUID):
     payload = request.get_json(silent=True) or {}
     chapter_id = _uuid_or_none(payload.get("chapter_id"))
@@ -376,7 +410,8 @@ def get_reading_state():
         select {BOOK_FIELDS}, rp.chapter_id, rp.chapter_index, rp.position,
                rp.percentage, rp.updated_at as progress_updated_at,
                c.title as current_chapter,
-               ais.last_chapter_read, ais.last_chunk_index, ais.last_block_id,
+               ais.last_chapter_read, ais.last_chunk_index, ais.last_chunk_id,
+               ais.last_block_id,
                ais.chapter_completed, ais.last_annotation_seen,
                ais.updated_at as ai_updated_at,
                (select count(*) from annotations a
@@ -447,8 +482,10 @@ def get_reading_context():
         """
         select a.id, a.selected_text, a.start_block_id, a.start_offset,
                a.end_block_id, a.end_offset, a.prefix_text, a.suffix_text,
-               a.comment, a.status, a.created_at, a.updated_at,
-               ar.response as xiaxia_response
+               a.comment, a.status, a.owner, a.content_type,
+               a.created_at, a.updated_at,
+               ar.response as xiaxia_response,
+               ar.owner as reply_owner, ar.content_type as reply_content_type
         from annotations a
         left join annotation_replies ar on ar.annotation_id = a.id
         where a.chapter_id = %s
@@ -458,12 +495,19 @@ def get_reading_context():
     )
     xiaxia_thoughts = db.fetch_all(
         """
-        select id, book_id, chapter_id, scope, mark_type, content, selected_text,
-               start_block_id, start_offset, end_block_id, end_offset,
-               prefix_text, suffix_text, created_at, updated_at
-        from xiaxia_thoughts
-        where chapter_id = %s
-        order by created_at
+        select xt.id, xt.book_id, xt.chapter_id, xt.scope, xt.mark_type,
+               xt.content, xt.selected_text, xt.start_block_id, xt.start_offset,
+               xt.end_block_id, xt.end_offset, xt.prefix_text, xt.suffix_text,
+               xt.owner, xt.content_type, xt.created_at, xt.updated_at,
+               tur.id as user_reply_id, tur.response as user_response,
+               tur.owner as user_reply_owner,
+               tur.content_type as user_reply_content_type,
+               tur.created_at as user_reply_created_at,
+               tur.updated_at as user_reply_updated_at
+        from xiaxia_thoughts xt
+        left join thought_user_replies tur on tur.thought_id = xt.id
+        where xt.chapter_id = %s
+        order by xt.created_at
         """,
         (chapter_id,),
     )
@@ -508,6 +552,7 @@ def get_reading_context():
         "title": chapter["title"],
         "word_count": chapter["word_count"],
         "chunk_index": chunk_index,
+        "chunk_id": _chunk_id(chapter["id"], chunk_index),
         "chunk_count": len(chunks),
         "has_next": chunk_index < len(chunks) - 1,
         "has_previous": chunk_index > 0,
@@ -546,7 +591,7 @@ def get_reading_context():
 
 
 @reading_bp.post("/api/ai/progress")
-@api_or_session_required
+@action_required
 def save_ai_progress():
     payload = request.get_json(silent=True) or {}
     book_id = _uuid_or_none(payload.get("book_id"))
@@ -582,28 +627,29 @@ def save_ai_progress():
         return jsonify({"error": "invalid_chunk_index"}), 400
     if chunk_index is not None and chunk_index < 0:
         return jsonify({"error": "invalid_chunk_index"}), 400
+    supplied_chunk_id = str(payload.get("chunk_id") or "").strip()[:160] or None
     last_block_id = str(payload.get("last_block_id") or "")[:64] or None
-    if (chunk_index is not None or last_block_id) and chapter_id is None:
+    if (chunk_index is not None or supplied_chunk_id or last_block_id) and chapter_id is None:
         return jsonify({"error": "chapter_checkpoint_required"}), 400
-    if last_block_id and (
+    chapter_completed = payload.get("chapter_completed", False)
+    if last_block_id and not chapter_completed and (
         not last_block_id.startswith("b") or not last_block_id[1:].isdigit()
     ):
         return jsonify({"error": "invalid_last_block_id"}), 400
-    chapter_completed = payload.get("chapter_completed", False)
     if chapter_completed and (chapter_id is None or chunk_index is None):
         return jsonify({"error": "completed_chapter_checkpoint_required"}), 400
+    if (supplied_chunk_id or last_block_id) and chunk_index is None:
+        return jsonify({"error": "chunk_index_required"}), 400
 
-    if checkpoint_chapter and (chunk_index is not None or last_block_id):
+    resolved_chunk_id = None
+    normalized_last_block = False
+    if checkpoint_chapter and (chunk_index is not None or supplied_chunk_id or last_block_id):
         blocks = _chapter_blocks(checkpoint_chapter["content_html"])
         chunks = _chunk_chapter_blocks(blocks)
         if chunk_index is not None and chunk_index >= len(chunks):
             return jsonify(
                 {"error": "chunk_not_found", "chunk_count": len(chunks)}
             ), 404
-        if last_block_id and last_block_id not in {
-            block["block_id"] for block in blocks
-        }:
-            return jsonify({"error": "last_block_not_in_chapter"}), 400
         if chapter_completed and chunk_index != len(chunks) - 1:
             return (
                 jsonify(
@@ -614,12 +660,30 @@ def save_ai_progress():
                 ),
                 400,
             )
+        if chunk_index is not None:
+            resolved_chunk_id = _chunk_id(chapter_id, chunk_index)
+            if supplied_chunk_id and supplied_chunk_id != resolved_chunk_id:
+                return jsonify({"error": "chunk_chapter_mismatch"}), 400
+            chunk_block_ids = {
+                block["block_id"] for block in chunks[chunk_index]["blocks"]
+            }
+            if chapter_completed:
+                # Completion is authoritative only at the final chunk. Normalize
+                # a missing/stale last block to that chunk's final stable block.
+                final_block_id = chunks[-1]["blocks"][-1]["block_id"]
+                if last_block_id not in chunk_block_ids:
+                    last_block_id = final_block_id
+                    normalized_last_block = True
+            elif last_block_id and last_block_id not in chunk_block_ids:
+                return jsonify({"error": "last_block_not_in_chunk"}), 400
+    elif supplied_chunk_id:
+        return jsonify({"error": "chunk_checkpoint_required"}), 400
     state = db.execute(
         """
         insert into ai_reading_state (
-            book_id, last_chapter_read, last_chunk_index, last_block_id,
+            book_id, last_chapter_read, last_chunk_index, last_chunk_id, last_block_id,
             chapter_completed, last_annotation_seen
-        ) values (%s, %s, %s, %s, %s, %s)
+        ) values (%s, %s, %s, %s, %s, %s, %s)
         on conflict (book_id) do update set
             last_chapter_read = coalesce(excluded.last_chapter_read, ai_reading_state.last_chapter_read),
             last_chunk_index = case
@@ -627,6 +691,12 @@ def save_ai_progress():
                 when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read
                     then excluded.last_chunk_index
                 else coalesce(excluded.last_chunk_index, ai_reading_state.last_chunk_index)
+            end,
+            last_chunk_id = case
+                when excluded.last_chapter_read is null then ai_reading_state.last_chunk_id
+                when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read
+                    then excluded.last_chunk_id
+                else coalesce(excluded.last_chunk_id, ai_reading_state.last_chunk_id)
             end,
             last_block_id = case
                 when excluded.last_chapter_read is null then ai_reading_state.last_block_id
@@ -643,20 +713,31 @@ def save_ai_progress():
             end,
             last_annotation_seen = coalesce(excluded.last_annotation_seen, ai_reading_state.last_annotation_seen),
             updated_at = now()
-        returning book_id, last_chapter_read, last_chunk_index, last_block_id,
+        returning book_id, last_chapter_read, last_chunk_index, last_chunk_id, last_block_id,
                   chapter_completed, last_annotation_seen, updated_at
         """,
         (
             book_id,
             chapter_id,
             chunk_index,
+            resolved_chunk_id,
             last_block_id,
             chapter_completed,
             annotation_id,
             chapter_completed_supplied,
         ),
     )
-    return jsonify({"ai_reading_state": _json_safe(state)})
+    return jsonify(
+        {
+            "ai_reading_state": _json_safe(state),
+            "last_block_normalized": normalized_last_block,
+        }
+    )
+
+
+def _chunk_id(chapter_id: UUID | str, chunk_index: int) -> str:
+    """Return a deterministic ID tied to the same chapter/block chunk source."""
+    return f"{chapter_id}:{chunk_index}"
 
 
 def _chapter_blocks(content_html: str) -> list[dict[str, Any]]:
@@ -891,6 +972,7 @@ def _serialize_reading_state(row: dict[str, Any]) -> dict[str, Any]:
             if row.get("last_chapter_read")
             else None,
             "last_chunk_index": row.get("last_chunk_index"),
+            "last_chunk_id": row.get("last_chunk_id"),
             "last_block_id": row.get("last_block_id"),
             "chapter_completed": bool(row.get("chapter_completed", False)),
             "last_annotation_seen": str(row["last_annotation_seen"])

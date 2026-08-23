@@ -1,8 +1,8 @@
-# Xiaxia Reading House V1
+# Xiaxia Reading House V1.1
 
 一间私人双人 AI 共读空间。Supabase PostgreSQL 只保存结构化数据、正文文本和稳定锚点；原始 EPUB/TXT、封面及 EPUB 正文图片保存在私有 Supabase Storage。服务器只提供书籍事实、文本、状态与持久化能力，不生成林知夏人格内容。
 
-本次 V1 集中返修保留了既有 EPUB/TXT 解析、章节顺序、用户阅读进度及 `block ID + character offsets` 批注定位模型，并补齐：EPUB2/EPUB3 封面兼容、异常标题回退与书籍信息编辑、滚动/分页双模式、Android Chrome Selection 入口、批注编辑/删除/总览/精确跳转、林知夏独立想法、长章节分块 Action 阅读、AI chunk checkpoint 和 12 秒轻量自动同步。
+V1.1 保留既有 EPUB/TXT 解析、章节顺序、双阅读进度、Storage 与 `block ID + character offsets` 定位模型；本轮只补齐长期管理能力：AI checkpoint 同源校验、Thought/双方 Reply 管理、Preview → Commit、批量操作、服务端 Undo、全局管理中心、安全删书与 Android Chrome 选区菜单定位。
 
 ## 项目目录
 
@@ -15,6 +15,8 @@ xiaxia-reading-house/
 ├── epub_parser.py
 ├── reading.py
 ├── annotations.py
+├── management.py
+├── operations.py
 ├── schema.sql
 ├── openapi.yaml
 ├── requirements.txt
@@ -23,7 +25,8 @@ xiaxia-reading-house/
 ├── migrations/
 │   ├── 001_prepare_storage_refactor.sql
 │   ├── 002_finalize_storage_refactor.sql
-│   └── 003_v1_experience_refactor.sql
+│   ├── 003_v1_experience_refactor.sql
+│   └── 004_v1_1_management.sql
 ├── scripts/
 │   └── migrate_legacy_bytea_to_storage.py
 ├── templates/
@@ -31,6 +34,7 @@ xiaxia-reading-house/
 │   ├── library.html
 │   ├── reader.html
 │   ├── annotations_overview.html
+│   ├── annotations_management.html
 │   └── error.html
 ├── static/
 │   ├── css/style.css
@@ -38,12 +42,14 @@ xiaxia-reading-house/
 │       ├── library.js
 │       ├── reader-utils.js
 │       ├── reader.js
-│       └── annotations-overview.js
+│       ├── annotations-overview.js
+│       └── annotations-management.js
 └── tests/
     ├── test_epub_parser.py
     ├── test_api_auth.py
     ├── test_co_reading_api.py
     ├── test_v1_experience_api.py
+    ├── test_v1_1_management.py
     ├── test_reader_js.py
     ├── test_storage.py
     └── test_consistency.py
@@ -52,13 +58,13 @@ xiaxia-reading-house/
 ## 架构与持久化边界
 
 - Flask 是唯一数据入口。浏览器使用私人密码 Session；Custom GPT Action 使用 `Authorization: Bearer <ACTION_API_TOKEN>`。
-- `books`、`chapters`、`reading_progress`、用户 `annotations`、`annotation_replies`、独立 `xiaxia_thoughts` 与 `ai_reading_state` 存在 PostgreSQL。
+- `books`、`chapters`、`reading_progress`、用户 `annotations`、`annotation_replies`、独立 `xiaxia_thoughts`、`thought_user_replies`、候选记录、操作日志与 `ai_reading_state` 存在 PostgreSQL。
 - `books.source_object_path` 与 `book_assets.object_path` 只保存 Storage object path；`book_assets` 另存 MIME type 和 byte size，不存在长期 `bytea`。
 - 私有 bucket `xiaxia-reading-house-private` 保存原始上传文件、封面与 EPUB 图片。所有对象保持 `public=false`，且不向 `anon`/`authenticated` 提供对象 policy。
 - 浏览器通过鉴权后的 Flask 资源代理读取封面和正文图片，不接触 service role/Secret key，也不获得永久公开 URL。
 - Render 临时磁盘只由 EbookLib 在上传解析期间短暂使用；解析结束即释放，绝不承担持久化。
 - 用户批注保存 `chapter_id + start/end block_id + start/end offset`。正常定位只使用这些稳定坐标；`selected_text + prefix/suffix` 仅在出版方 DOM 异常时作为恢复 fallback。
-- 林知夏对用户批注的 reply 与林知夏独立 `xiaxia_thoughts` 是两种数据模型。独立想法支持 `range`、`block`、`chapter` 三种 scope，并保留可选 `mark_type`，本轮没有扩展复杂颜色 UI。
+- 四类阅读痕迹在数据层明确分开：`owner=user/content_type=user_annotation`、`owner=xiaxia/content_type=xiaxia_thought`、`owner=xiaxia/content_type=xiaxia_reply`、`owner=user/content_type=user_reply`。独立想法支持 `range`、`block`、`chapter` 与可扩展 `mark_type`，没有扩展复杂颜色 UI。
 
 ## EPUB 元数据规则
 
@@ -82,17 +88,17 @@ xiaxia-reading-house/
 
 完成后到 Storage 页面再次确认 bucket 显示为 **Private**，且没有为浏览器角色添加读、写、更新或删除 policy。
 
-### 已部署上一轮 Storage 版 V1
+### 已部署并已有真实数据的 V1
 
 不需要清库，也不需要重新导入书籍。执行顺序：
 
 1. 备份 Supabase PostgreSQL。
-2. 在 SQL Editor 运行 `migrations/003_v1_experience_refactor.sql`。
-3. 确认事务成功提交。
-4. 部署本项目新代码。
+2. 若尚未运行过，先运行 `migrations/003_v1_experience_refactor.sql`。
+3. 运行 `migrations/004_v1_1_management.sql`。
+4. 确认事务成功提交，再部署本项目新代码。
 5. 运行下文网页、Action 与 Android 手工验收。
 
-`003` 是可重复执行的增量事务：新增 `xiaxia_thoughts`，并给 `ai_reading_state` 增加 `last_chunk_index`、`last_block_id`、`chapter_completed`；不删除或改写现有 books、chapters、progress、annotations、replies 或 Storage metadata。
+`004` 是可重复执行的增量事务：补齐所有权字段、`last_chunk_id`、用户回复、候选预览和操作日志；不删除或改写现有 books、chapters、progress、annotations、Thought、Reply 或 Storage metadata。不要重新运行 `schema.sql` 代替 migration。
 
 ### 仍是最早的 bytea 版
 
@@ -101,7 +107,7 @@ xiaxia-reading-house/
 3. 配置全部 Supabase/Storage 环境变量。
 4. 运行 `python scripts/migrate_legacy_bytea_to_storage.py`。
 5. 成功后运行 `migrations/002_finalize_storage_refactor.sql`。
-6. 再运行 `migrations/003_v1_experience_refactor.sql`。
+6. 再按顺序运行 `003_v1_experience_refactor.sql` 与 `004_v1_1_management.sql`。
 7. 部署新代码。
 
 `002` 只有在每条旧资产都已有 `object_path` 后才删除旧 `data` 列；未迁移记录会使脚本中止，不会静默丢失图片。旧架构没有原始文件可迁移；新上传书籍会正常保留原始 EPUB/TXT。
@@ -162,12 +168,14 @@ Schema 采用 Actions 兼容的保守写法：路径参数在每个 operation �
 3. 对任意章调用 `getReadingContext(chapter_id, chunk_index=0)`。
 4. 读取响应中的 `blocks[]`；每个 block 都有与网页批注同源的 `block_id`、`block_order`、segment start/end offset 和 text。
 5. 若 `chunk_count > 1`，按 `chunk_index=1, 2, ... chunk_count-1` 连续读取。未读完所有 chunk 前不得声称已读完整章。
-6. 每读完一个 chunk 调用 `saveAiProgress` 保存 chapter、chunk_index 和可选 last_block_id；只有最后一个 chunk 才传 `chapter_completed=true`，后端会验证。
-7. 若要留下独立想法，调用 `createXiaxiaThought`：
+6. 每读完一个 chunk 调用 `saveAiProgress`，回传 context 给出的 `chapter_id + chunk_index + chunk_id` 和可选 `last_block_id`；只有最后一个 chunk 才传 `chapter_completed=true`。完成状态会把缺失或陈旧 block 归一到本章最后一个合法 block，跨章 block 在中途 checkpoint 仍会被拒绝。
+7. 一章有多条候选时，优先使用 `previewXiaxiaThoughts` 精确验证，再以 `commitXiaxiaThoughts` 一次提交；Preview 只写 24 小时候选记录，不生成正式 Thought。
+8. 单条可用 `createXiaxiaThought`：
    - `scope=range`：使用实际读到的 start/end block ID 与字符 offsets；
    - `scope=block`：传 block_id；
    - `scope=chapter`：不传文本 range。
-8. 处理用户批注时可使用 `listPendingAnnotations`，再调用 `markAnnotationSeen` 或 `replyToAnnotation`。
+9. 可通过 `listXiaxiaThoughts`、`updateXiaxiaThought`、`deleteXiaxiaThought` 管理自己的 Thought，通过 Reply CRUD 管理自己对用户批注的回复；`undoLastReadingAction` 只撤销 Xiaxia 最近一次且无后续冲突的操作。
+10. 处理用户批注时可使用 `listPendingAnnotations`，再调用 `markAnnotationSeen` 或 `replyToAnnotation`。
 
 传 `annotation_id` 给 `getReadingContext` 时，响应的 `focus_annotation_chunk_index` 明确标出该批注所属 chunk。默认不会把整本书或完整长章节塞进单次 Action。
 
@@ -179,23 +187,42 @@ Schema 采用 Actions 兼容的保守写法：路径参数在每个 operation �
 | 上传 EPUB/TXT | `POST /api/books` | 网页 |
 | 书籍、网页目录与进度 | `GET /api/books/{book_id}` | 网页 |
 | 编辑书名/作者 | `PATCH /api/books/{book_id}` | 网页 |
+| 删除书籍及 Storage 对象 | `DELETE /api/books/{book_id}` | 网页 |
 | AI 章节目录 | `GET /api/books/{book_id}/chapters` | Action |
 | 网页完整章节 HTML | `GET /api/books/{book_id}/chapters/{chapter_id}` | 网页 |
 | 章节批注与 12 秒同步数据 | `GET /api/books/{book_id}/chapters/{chapter_id}/annotations` | 网页 |
 | 本书批注总览/筛选 | `GET /api/books/{book_id}/annotations` | 网页 / Action |
 | 用户阅读进度 | `PUT /api/books/{book_id}/progress` | 网页 |
 | 新建用户划线/批注 | `POST /api/annotations` | 网页 |
-| 编辑/补写用户批注 | `PATCH /api/annotations/{annotation_id}` | 网页 / Action |
-| 删除批注及关联 reply | `DELETE /api/annotations/{annotation_id}` | 网页 / Action |
+| 编辑/补写用户批注 | `PATCH /api/annotations/{annotation_id}` | 网页 |
+| 删除批注及关联 reply | `DELETE /api/annotations/{annotation_id}` | 网页 |
+| 全局痕迹筛选 | `GET /api/management/traces` | 网页 |
+| 批量删除用户痕迹 / Undo | `POST /api/management/traces/batch-delete`、`POST /api/management/undo` | 网页 |
 | 当前双方阅读状态 | `GET /api/reading/state` | Action |
 | 分块章节上下文 | `GET /api/reading/context` | Action |
 | 待处理用户批注 | `GET /api/annotations/pending` | Action |
 | 标记用户批注已读 | `POST /api/annotations/{annotation_id}/seen` | Action |
 | 写入林知夏 reply | `POST /api/annotations/{annotation_id}/reply` | Action |
+| 修改/删除林知夏 reply | `PATCH` / `DELETE /api/annotations/{annotation_id}/reply` | Action |
 | 林知夏独立想法 | `POST /api/xiaxia/thoughts` | Action |
+| Thought 列表/修改/删除 | `GET /api/xiaxia/thoughts`、`PATCH` / `DELETE /api/xiaxia/thoughts/{thought_id}` | Action |
+| Thought 批量删除 | `POST /api/xiaxia/thoughts/batch-delete` | Action |
+| Thought Preview/Commit | `POST /api/xiaxia/thoughts/preview`、`POST /api/xiaxia/thoughts/commit` | Action |
+| 用户回复 Xiaxia Thought | `POST` / `PATCH` / `DELETE /api/xiaxia/thoughts/{thought_id}/reply` | 网页 |
 | 林知夏 chunk checkpoint | `POST /api/ai/progress` | Action |
+| 撤销 Xiaxia 最近操作 | `POST /api/actions/undo` | Action |
 
 既有 endpoint 没有改名。新增接口的 Flask route、数据库字段、前端 fetch、OpenAPI path/operationId、测试和本文档使用同一套字段名。
+
+### Preview → Commit 与 Undo
+
+- `previewXiaxiaThoughts` 对每个候选独立验证 book/chapter、稳定 block、offset 与 selected_text，并返回 `candidate_id + matched_text + anchor + validation_status`。候选保存在 `xiaxia_thought_candidates`，24 小时后失效，不会出现在阅读器或正式总览。
+- `commitXiaxiaThoughts` 只接受仍有效且未提交的候选；每个 ID 返回 `committed` 或带具体 error 的 `failed`，成功项一次记录为 `batch_create` 操作。
+- `reading_operation_log` 保存 actor、operation_type、target、前后快照与时间。Undo 只处理对应 actor 最近一条尚未撤销的 create/update/delete/batch；若目标版本变化、ID 被复用，或新 Reply 已依赖被撤销对象，会返回 `undo_conflict`，不会覆盖后续数据。
+
+### 删除书籍流程
+
+书架删除仅接受已登录 Web Session，不在 Action Schema 中。后端先读取该书的原始文件及全部 `book_assets.object_path`，分批确认删除私有 Storage 对象；Storage 删除失败时保留 PostgreSQL 数据并返回错误。Storage 成功后删除 `books` 行，既有 `ON DELETE CASCADE` 在同一数据库操作中清理章节、双方进度、批注、Thought、Reply、候选与该书操作日志。操作严格按目标 `book_id` 收集路径，不会扫整个 bucket。
 
 ## 阅读器与定位
 
@@ -213,8 +240,9 @@ Schema 采用 Actions 兼容的保守写法：路径参数在每个 operation �
 1. 同时监听 `selectionchange`、`pointerup`、`touchend` 和 `contextmenu`，并在 120/320/620 ms 等延时多次读取 Selection，适应 Android Chrome 长按手柄与原生菜单的异步更新。
 2. 一旦得到有效选择，立即 `cloneRange()`，换算并保存同一章节 DOM 的 block ID 与字符 offsets；原生菜单随后清空 Selection 时仍能继续“划线/写想法”。
 3. 自定义菜单不拦截正文长按，不设置 `user-select:none`；只在用户点击自定义菜单时短暂阻止 pointerdown 导致的 Selection 丢失。
-4. 粗指针设备把菜单放在 `visualViewport.offsetTop + height` 内的底部安全区域；键盘、浏览器工具栏或选择控件改变 visual viewport 时重新定位，避免入口被遮挡。
-5. 有活动 Selection、批注编辑窗口或菜单交互时，12 秒轮询不更新 marks，避免后台同步破坏选择。
+4. 粗指针设备不再固定在底部：优先放到 Selection Range 下方并留出原生手柄间距；空间不足时移到选区上方，最后才在 `visualViewport` 内夹取安全位置。软键盘、工具栏、滚动或横竖屏改变 viewport 时重新定位。
+5. 自定义按钮 `pointerdown` 发生时再次冻结 selection snapshot，然后阻止焦点切换清空原生 Selection；真正写入仍使用已冻结的稳定 block/offset，而不是临时 selected text 搜索。
+6. 有活动 Selection、批注编辑窗口或菜单交互时，12 秒轮询不更新 marks，避免后台同步破坏选择。
 
 这部分包含可自动测试的定位、滑动、分页和同步 helper 测试，但仓库交付环境不等同真实 Android 设备；必须按下文执行实机验收。
 
@@ -243,14 +271,24 @@ flask --app app run
 
 ```bash
 pytest
-python -m py_compile app.py annotations.py auth.py database.py epub_parser.py reading.py storage.py
+python -m py_compile app.py annotations.py auth.py database.py epub_parser.py reading.py management.py operations.py storage.py
 node --check static/js/reader-utils.js
 node --check static/js/reader.js
 node --check static/js/library.js
 node --check static/js/annotations-overview.js
+node --check static/js/annotations-management.js
 ```
 
-测试覆盖 EPUB2/EPUB3 cover、异常 title fallback、书籍信息编辑、批注编辑/删除/cascade/补写、总览筛选与跳转字段、独立 AI thought、精确 range、长短章节 chunk、annotation 所属 chunk、书籍目录导航、AI checkpoint 与完成状态、原有用户进度、12 秒同步 API 数据、私有 Storage、Bearer auth，以及 OpenAPI/Flask/SQL/JS/README 跨文件一致性。
+测试覆盖 EPUB2/EPUB3 cover、异常 title fallback、书籍信息编辑、批注 CRUD/cascade/补写、四类 owner/content_type、Thought 与双方 Reply CRUD、Preview 不落正式表、批量 Commit/Delete、anchor validation、Undo/冲突、全局筛选与跳转字段、长短章节 chunk、annotation 所属 chunk、Thought 后 checkpoint、中途/最终/完成/跨章进度、删书与 Storage 清理、多书路径隔离、原有用户进度、自动同步、私有 Storage、身份边界，以及 OpenAPI/Flask/SQL/JS/README 一致性。
+
+## V1.1 UI / UX Refresh
+
+- 全站固定为一套暖白旧书页主题，不增加多主题系统或大型 UI 框架。边界和阴影降低对比，阅读正文使用墨灰而非纯黑。
+- 书架首页从既有 `/api/books` 排序结果中找到最近有阅读进度的书，以纸条形式显示书名、当前章节和进度；没有新增 API 或数据库字段。上传入口改为轻量“把一本书带回家”，无封面书籍按书架顺序使用五种克制的浅灰棕封面。
+- 用户划线 / 批注使用低饱和暖棕墨；林知夏 Thought / Reply 使用灰蓝墨。两者仍对应原有四类 `owner/content_type`，没有合并状态。
+- range / block Thought 仍由原有 `block_id + character offsets` 创建 mark，只在 CSS 层附着极小灰化猫爪；点击整段 Thought mark 打开既有弹窗。chapter Thought 默认只显示“来过”页边入口，不直接展开内容。
+- 阅读器正文宽度收窄、行距和段落间距增加，工具栏降低高度与对比。滚动 / 分页、字号、目录、跳转、自动保存和 12 秒同步逻辑没有改变。
+- 移动端继续使用 Selection Range 动态定位操作栏及冻结 selection snapshot；UI Refresh 未恢复固定底栏，也未禁用系统文本选择。
 
 ## 实机验收
 
@@ -267,7 +305,7 @@ node --check static/js/annotations-overview.js
 
 1. 使用真实 Android Chrome 登录并打开一章，分别在滚动和分页模式操作。
 2. 长按正文、拖动选择手柄；确认系统“复制/分享/全选/网页搜索”等菜单仍可使用。
-3. 保持选择，确认 Reading House 的“划线/写想法”入口稳定显示在可见 viewport 底部。
+3. 保持选择，确认 Reading House 的“划线/写想法”入口显示在选区附近，并会在空间不足时切换到另一侧，而不是固定在底部。
 4. 分别保存纯划线和带批注；打开软键盘后重复测试，确认入口与对话框不被遮挡。
 5. 点击纯划线补写 comment、编辑、删除；刷新后检查精确位置。
 6. 左右滑动和点击翻页，跨页选择可选文本，并检查保存/恢复位置。

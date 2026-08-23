@@ -39,6 +39,13 @@ def auth_headers():
     return {"Authorization": "Bearer action-test-token"}
 
 
+def make_web_client():
+    client = make_client()
+    response = client.post("/login", data={"password": "private-test-password"})
+    assert response.status_code == 302
+    return client
+
+
 def book_row(title="旧书名", author="旧作者"):
     return {
         "id": BOOK_ID,
@@ -105,9 +112,8 @@ def test_manual_book_title_and_author_edit_is_persisted(monkeypatch):
         return book_row("手动书名", "手动作者")
 
     monkeypatch.setattr(reading.db, "execute", fake_execute)
-    response = make_client().patch(
+    response = make_web_client().patch(
         f"/api/books/{BOOK_ID}",
-        headers=auth_headers(),
         json={"title": "手动书名", "author": "手动作者"},
     )
     assert response.status_code == 200
@@ -156,15 +162,25 @@ def test_annotation_edit_keeps_anchor_and_updates_comment(monkeypatch):
     original = annotation_row(comment="补写后的想法")
     captured = {}
 
-    def fake_fetch_one(query, params=()):
-        captured["query"] = query
-        captured["params"] = params
-        return original
+    class Connection:
+        def execute(self, query, params=()):
+            captured.setdefault("queries", []).append(query)
+            captured.setdefault("params", []).append(params)
+            if "select * from annotations" in query:
+                return DeleteCursor({**original, "owner": "user", "content_type": "user_annotation"})
+            if "select " in query and "from annotations a" in query:
+                return DeleteCursor(original)
+            if "insert into reading_operation_log" in query:
+                return DeleteCursor({"id": THOUGHT_ID})
+            return DeleteCursor()
 
-    monkeypatch.setattr(annotations_api.db, "fetch_one", fake_fetch_one)
-    response = make_client().patch(
+    @contextmanager
+    def fake_transaction():
+        yield Connection()
+
+    monkeypatch.setattr(annotations_api.db, "transaction", fake_transaction)
+    response = make_web_client().patch(
         f"/api/annotations/{ANNOTATION_ID}",
-        headers=auth_headers(),
         json={"comment": "补写后的想法"},
     )
     assert response.status_code == 200
@@ -172,9 +188,10 @@ def test_annotation_edit_keeps_anchor_and_updates_comment(monkeypatch):
     assert item["comment"] == "补写后的想法"
     assert item["start_block_id"] == "b000001"
     assert item["start_offset"] == 0
-    assert "set comment = %s" in captured["query"]
-    assert "start_block_id =" not in captured["query"]
-    assert "updated_at = now()" in captured["query"]
+    update_query = next(query for query in captured["queries"] if "update annotations set comment" in query)
+    assert "set comment = %s" in update_query
+    assert "start_block_id =" not in update_query
+    assert "updated_at = now()" in update_query
 
 
 class DeleteCursor:
@@ -192,8 +209,22 @@ class DeleteConnection:
 
     def execute(self, query, _params=()):
         self.queries.append(query)
-        if "select a.id" in query:
-            return DeleteCursor({"id": ANNOTATION_ID, "had_reply": self.had_reply})
+        if "select * from annotations" in query:
+            return DeleteCursor({
+                **annotation_row(), "owner": "user", "content_type": "user_annotation"
+            })
+        if "select * from annotation_replies" in query:
+            return DeleteCursor(
+                {
+                    "id": THOUGHT_ID, "annotation_id": ANNOTATION_ID,
+                    "response": "回复", "owner": "xiaxia",
+                    "content_type": "xiaxia_reply", "created_at": NOW,
+                    "updated_at": NOW,
+                }
+                if self.had_reply else None
+            )
+        if "insert into reading_operation_log" in query:
+            return DeleteCursor({"id": THOUGHT_ID})
         return DeleteCursor()
 
 
@@ -206,9 +237,7 @@ def test_annotation_delete_atomically_handles_reply(monkeypatch, had_reply):
         yield connection
 
     monkeypatch.setattr(annotations_api.db, "transaction", fake_transaction)
-    response = make_client().delete(
-        f"/api/annotations/{ANNOTATION_ID}", headers=auth_headers()
-    )
+    response = make_web_client().delete(f"/api/annotations/{ANNOTATION_ID}")
     assert response.status_code == 200
     assert response.get_json()["deleted_reply"] is had_reply
     assert any("delete from annotations" in query for query in connection.queries)
@@ -283,12 +312,19 @@ def test_ai_creates_precise_independent_range_thought_from_read_block(monkeypatc
         },
     )
 
-    def fake_execute(query, params=()):
-        captured["query"] = query
-        captured["params"] = params
-        return thought_row()
+    class ThoughtConnection:
+        def execute(self, query, params=()):
+            if "insert into xiaxia_thoughts" in query:
+                captured["query"] = query
+                captured["params"] = params
+                return DeleteCursor({**thought_row(), "owner": "xiaxia", "content_type": "xiaxia_thought"})
+            return DeleteCursor({"id": THOUGHT_ID})
 
-    monkeypatch.setattr(annotations_api.db, "execute", fake_execute)
+    @contextmanager
+    def thought_transaction():
+        yield ThoughtConnection()
+
+    monkeypatch.setattr(annotations_api.db, "transaction", thought_transaction)
     response = make_client().post(
         "/api/xiaxia/thoughts",
         headers=auth_headers(),
@@ -328,11 +364,18 @@ def test_ai_chapter_thought_has_no_fake_text_anchor(monkeypatch):
     )
     captured = {}
 
-    def fake_execute(_query, params=()):
-        captured["params"] = params
-        return thought_row(scope="chapter")
+    class ChapterThoughtConnection:
+        def execute(self, query, params=()):
+            if "insert into xiaxia_thoughts" in query:
+                captured["params"] = params
+                return DeleteCursor({**thought_row(scope="chapter"), "owner": "xiaxia", "content_type": "xiaxia_thought"})
+            return DeleteCursor({"id": THOUGHT_ID})
 
-    monkeypatch.setattr(annotations_api.db, "execute", fake_execute)
+    @contextmanager
+    def chapter_thought_transaction():
+        yield ChapterThoughtConnection()
+
+    monkeypatch.setattr(annotations_api.db, "transaction", chapter_thought_transaction)
     response = make_client().post(
         "/api/xiaxia/thoughts",
         headers=auth_headers(),
@@ -406,6 +449,7 @@ def test_custom_gpt_can_choose_arbitrary_chapter_and_read_chunk_zero(monkeypatch
     chapter = response.get_json()["chapter"]
     assert chapter["id"] == str(OTHER_CHAPTER_ID)
     assert chapter["chunk_index"] == 0
+    assert chapter["chunk_id"] == f"{OTHER_CHAPTER_ID}:0"
     assert chapter["chunk_count"] > 1
     assert chapter["has_next"] is True
     assert chapter["blocks"][0]["block_id"] == "b000001"
@@ -502,9 +546,8 @@ def test_original_reading_progress_persists_paginated_display_state(monkeypatch)
         }
 
     monkeypatch.setattr(reading.db, "execute", fake_execute)
-    response = make_client().put(
+    response = make_web_client().put(
         f"/api/books/{BOOK_ID}/progress",
-        headers=auth_headers(),
         json={
             "chapter_id": str(CHAPTER_ID),
             "chapter_index": 0,
@@ -546,8 +589,9 @@ def test_ai_chunk_checkpoint_persists_and_completed_requires_final_chunk(monkeyp
             "book_id": BOOK_ID,
             "last_chapter_read": OTHER_CHAPTER_ID,
             "last_chunk_index": params[2],
-            "last_block_id": params[3],
-            "chapter_completed": params[4],
+            "last_chunk_id": params[3],
+            "last_block_id": params[4],
+            "chapter_completed": params[5],
             "last_annotation_seen": None,
             "updated_at": NOW,
         }
@@ -567,6 +611,48 @@ def test_ai_chunk_checkpoint_persists_and_completed_requires_final_chunk(monkeyp
     assert nonfinal.status_code == 400
     assert nonfinal.get_json()["error"] == "chapter_not_fully_read"
 
+    middle = make_client().post(
+        "/api/ai/progress",
+        headers=auth_headers(),
+        json={
+            "book_id": str(BOOK_ID),
+            "chapter_id": str(OTHER_CHAPTER_ID),
+            "chunk_index": 0,
+            "chunk_id": f"{OTHER_CHAPTER_ID}:0",
+            "last_block_id": chunks[0]["blocks"][-1]["block_id"],
+            "chapter_completed": False,
+        },
+    )
+    assert middle.status_code == 200
+    assert middle.get_json()["ai_reading_state"]["chapter_completed"] is False
+
+    wrong_block = make_client().post(
+        "/api/ai/progress",
+        headers=auth_headers(),
+        json={
+            "book_id": str(BOOK_ID),
+            "chapter_id": str(OTHER_CHAPTER_ID),
+            "chunk_index": 0,
+            "last_block_id": "b999999",
+            "chapter_completed": False,
+        },
+    )
+    assert wrong_block.status_code == 400
+    assert wrong_block.get_json()["error"] == "last_block_not_in_chunk"
+
+    wrong_chunk_id = make_client().post(
+        "/api/ai/progress",
+        headers=auth_headers(),
+        json={
+            "book_id": str(BOOK_ID),
+            "chapter_id": str(OTHER_CHAPTER_ID),
+            "chunk_index": 0,
+            "chunk_id": f"{CHAPTER_ID}:0",
+        },
+    )
+    assert wrong_chunk_id.status_code == 400
+    assert wrong_chunk_id.get_json()["error"] == "chunk_chapter_mismatch"
+
     final_index = len(chunks) - 1
     final_block = chunks[-1]["blocks"][-1]["block_id"]
     completed = make_client().post(
@@ -585,7 +671,24 @@ def test_ai_chunk_checkpoint_persists_and_completed_requires_final_chunk(monkeyp
     assert state["last_chunk_index"] == final_index
     assert state["last_block_id"] == final_block
     assert state["chapter_completed"] is True
-    assert captured["params"][2:5] == (final_index, final_block, True)
+    assert captured["params"][2:6] == (
+        final_index, f"{OTHER_CHAPTER_ID}:{final_index}", final_block, True
+    )
+
+    normalized = make_client().post(
+        "/api/ai/progress",
+        headers=auth_headers(),
+        json={
+            "book_id": str(BOOK_ID),
+            "chapter_id": str(OTHER_CHAPTER_ID),
+            "chunk_index": final_index,
+            "last_block_id": str(CHAPTER_ID),
+            "chapter_completed": True,
+        },
+    )
+    assert normalized.status_code == 200
+    assert normalized.get_json()["last_block_normalized"] is True
+    assert normalized.get_json()["ai_reading_state"]["last_block_id"] == final_block
 
 
 def test_ai_chunk_checkpoint_is_recoverable_from_reading_state(monkeypatch):
@@ -599,6 +702,7 @@ def test_ai_chunk_checkpoint_is_recoverable_from_reading_state(monkeypatch):
         "current_chapter": "第一章",
         "last_chapter_read": OTHER_CHAPTER_ID,
         "last_chunk_index": 2,
+        "last_chunk_id": f"{OTHER_CHAPTER_ID}:2",
         "last_block_id": "b000011",
         "chapter_completed": False,
         "last_annotation_seen": ANNOTATION_ID,

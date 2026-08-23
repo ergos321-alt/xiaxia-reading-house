@@ -95,6 +95,9 @@ create table if not exists annotations (
     suffix_text varchar(500) not null default '',
     comment text not null default '',
     status text not null default 'pending' check (status in ('pending', 'seen', 'replied')),
+    owner text not null default 'user' check (owner = 'user'),
+    content_type text not null default 'user_annotation'
+        check (content_type = 'user_annotation'),
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -103,6 +106,9 @@ create table if not exists annotation_replies (
     id uuid primary key default gen_random_uuid(),
     annotation_id uuid not null unique references annotations(id) on delete cascade,
     response text not null check (char_length(response) > 0),
+    owner text not null default 'xiaxia' check (owner = 'xiaxia'),
+    content_type text not null default 'xiaxia_reply'
+        check (content_type = 'xiaxia_reply'),
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -125,6 +131,9 @@ create table if not exists xiaxia_thoughts (
     end_offset integer check (end_offset is null or end_offset >= 0),
     prefix_text varchar(500) not null default '',
     suffix_text varchar(500) not null default '',
+    owner text not null default 'xiaxia' check (owner = 'xiaxia'),
+    content_type text not null default 'xiaxia_thought'
+        check (content_type = 'xiaxia_thought'),
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     check (
@@ -137,10 +146,51 @@ create table if not exists xiaxia_thoughts (
     )
 );
 
+create table if not exists thought_user_replies (
+    id uuid primary key default gen_random_uuid(),
+    thought_id uuid not null unique references xiaxia_thoughts(id) on delete cascade,
+    response text not null check (char_length(response) between 1 and 50000),
+    owner text not null default 'user' check (owner = 'user'),
+    content_type text not null default 'user_reply' check (content_type = 'user_reply'),
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+-- Preview candidates are validation records, never formal reading traces.
+create table if not exists xiaxia_thought_candidates (
+    id uuid primary key default gen_random_uuid(),
+    batch_id uuid not null,
+    book_id uuid references books(id) on delete cascade,
+    chapter_id uuid references chapters(id) on delete cascade,
+    request_payload jsonb not null default '{}'::jsonb,
+    validation_status text not null check (validation_status in ('valid', 'invalid')),
+    validation_error text,
+    matched_text text not null default '',
+    validated_anchor jsonb not null default '{}'::jsonb,
+    committed_thought_id uuid references xiaxia_thoughts(id) on delete set null,
+    created_at timestamptz not null default now(),
+    expires_at timestamptz not null default (now() + interval '24 hours')
+);
+
+create table if not exists reading_operation_log (
+    id uuid primary key default gen_random_uuid(),
+    actor text not null check (actor in ('user', 'xiaxia')),
+    operation_type text not null,
+    target_type text not null,
+    target_id uuid,
+    book_id uuid references books(id) on delete cascade,
+    chapter_id uuid references chapters(id) on delete set null,
+    previous_state jsonb not null default '{"records":[]}'::jsonb,
+    new_state jsonb not null default '{"records":[]}'::jsonb,
+    undone_at timestamptz,
+    created_at timestamptz not null default now()
+);
+
 create table if not exists ai_reading_state (
     book_id uuid primary key references books(id) on delete cascade,
     last_chapter_read uuid references chapters(id) on delete set null,
     last_chunk_index integer check (last_chunk_index is null or last_chunk_index >= 0),
+    last_chunk_id text,
     last_block_id varchar(64),
     chapter_completed boolean not null default false,
     last_annotation_seen uuid references annotations(id) on delete set null,
@@ -159,6 +209,12 @@ create index if not exists idx_xiaxia_thoughts_chapter_created
     on xiaxia_thoughts (chapter_id, created_at);
 create index if not exists idx_xiaxia_thoughts_book_created
     on xiaxia_thoughts (book_id, created_at);
+create index if not exists idx_thought_user_replies_thought
+    on thought_user_replies (thought_id);
+create index if not exists idx_thought_candidates_batch
+    on xiaxia_thought_candidates (batch_id, created_at);
+create index if not exists idx_operation_log_actor_created
+    on reading_operation_log (actor, created_at desc) where undone_at is null;
 create index if not exists idx_book_assets_book
     on book_assets (book_id);
 create index if not exists idx_reading_progress_updated
@@ -194,6 +250,10 @@ drop trigger if exists trg_xiaxia_thoughts_updated_at on xiaxia_thoughts;
 create trigger trg_xiaxia_thoughts_updated_at before update on xiaxia_thoughts
 for each row execute function set_reading_house_updated_at();
 
+drop trigger if exists trg_thought_user_replies_updated_at on thought_user_replies;
+create trigger trg_thought_user_replies_updated_at before update on thought_user_replies
+for each row execute function set_reading_house_updated_at();
+
 drop trigger if exists trg_ai_reading_state_updated_at on ai_reading_state;
 create trigger trg_ai_reading_state_updated_at before update on ai_reading_state
 for each row execute function set_reading_house_updated_at();
@@ -201,7 +261,8 @@ for each row execute function set_reading_house_updated_at();
 -- Supabase API roles receive no direct table access. The Flask service connects
 -- with the private PostgreSQL connection string and is the only data boundary.
 revoke all on table books, book_assets, chapters, reading_progress,
-    annotations, annotation_replies, xiaxia_thoughts, ai_reading_state
+    annotations, annotation_replies, xiaxia_thoughts, thought_user_replies,
+    xiaxia_thought_candidates, reading_operation_log, ai_reading_state
     from anon, authenticated;
 
 alter table books enable row level security;
@@ -211,6 +272,9 @@ alter table reading_progress enable row level security;
 alter table annotations enable row level security;
 alter table annotation_replies enable row level security;
 alter table xiaxia_thoughts enable row level security;
+alter table thought_user_replies enable row level security;
+alter table xiaxia_thought_candidates enable row level security;
+alter table reading_operation_log enable row level security;
 alter table ai_reading_state enable row level security;
 
 commit;

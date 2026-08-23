@@ -40,6 +40,30 @@ def api_or_session_required(view: F) -> F:
     return wrapped  # type: ignore[return-value]
 
 
+def action_required(view: F) -> F:
+    """Require the server-side Action bearer identity."""
+
+    @wraps(view)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        if bearer_is_valid():
+            return view(*args, **kwargs)
+        return jsonify({"error": "action_unauthorized"}), 401
+
+    return wrapped  # type: ignore[return-value]
+
+
+def web_api_required(view: F) -> F:
+    """Require the private browser session for a JSON API route."""
+
+    @wraps(view)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        if browser_is_authenticated():
+            return view(*args, **kwargs)
+        return jsonify({"error": "web_session_required"}), 401
+
+    return wrapped  # type: ignore[return-value]
+
+
 def web_required(view: F) -> F:
     @wraps(view)
     def wrapped(*args: Any, **kwargs: Any) -> Any:

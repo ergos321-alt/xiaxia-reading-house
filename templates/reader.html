@@ -3,22 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover">
-  <meta name="theme-color" content="#f7f2e9">
+  <meta name="theme-color" content="#f3ecdf">
   <title>共读小屋 · 阅读</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body class="reader-page" data-book-id="{{ book_id }}">
   <header class="reader-toolbar">
-    <a class="icon-button" href="{{ url_for('library_page') }}" aria-label="返回书架">←</a>
-    <button id="toc-button" class="icon-button" type="button" aria-label="打开目录" aria-expanded="false">☰</button>
+    <div class="reader-nav-tools">
+      <a class="icon-button" href="{{ url_for('library_page') }}" aria-label="返回书架">←</a>
+      <button id="toc-button" class="icon-button" type="button" aria-label="打开目录" aria-expanded="false">☰</button>
+    </div>
     <div class="reader-heading">
       <strong id="reader-book-title">正在打开书籍…</strong>
       <span id="reader-chapter-title"></span>
     </div>
-    <button id="reading-mode" class="font-button" type="button" aria-label="切换分页或滚动模式">分页</button>
-    <a id="annotations-overview-link" class="font-button" href="{{ url_for('annotations_overview_page', book_id=book_id) }}" aria-label="划线与批注总览">批注</a>
-    <button id="font-down" class="font-button" type="button" aria-label="缩小字号">A−</button>
-    <button id="font-up" class="font-button" type="button" aria-label="放大字号">A＋</button>
+    <div class="reader-utility-tools">
+      <button id="reading-mode" class="font-button" type="button" aria-label="切换分页或滚动模式">分页</button>
+      <a id="annotations-overview-link" class="font-button" href="{{ url_for('annotations_overview_page', book_id=book_id) }}" aria-label="划线与批注总览">批注</a>
+      <button id="font-down" class="font-button" type="button" aria-label="缩小字号">A−</button>
+      <button id="font-up" class="font-button" type="button" aria-label="放大字号">A＋</button>
+    </div>
   </header>
 
   <div id="reader-progress" class="reader-progress" aria-hidden="true"><span></span></div>
@@ -86,6 +90,14 @@
       <section id="xiaxia-thought-section">
         <h3>林知夏的独立想法</h3>
         <p id="annotation-xiaxia-thought"></p>
+      </section>
+      <section id="thought-user-reply-section" hidden>
+        <h3>我的回复</h3>
+        <p id="thought-user-reply"></p>
+        <div class="dialog-actions">
+          <button id="thought-reply-delete" class="danger-button" type="button">删除回复</button>
+          <button id="thought-reply-edit" class="secondary-button" type="button">回复林知夏</button>
+        </div>
       </section>
       <div id="annotation-actions" class="dialog-actions">
         <button id="delete-annotation" class="danger-button" type="button">删除</button>

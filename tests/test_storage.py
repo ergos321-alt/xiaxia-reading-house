@@ -199,9 +199,10 @@ def test_upload_persists_binaries_in_storage_and_only_metadata_in_postgres(monke
             "SESSION_COOKIE_SECURE": False,
         }
     )
-    response = app.test_client().post(
+    client = app.test_client()
+    client.post("/login", data={"password": "private-test-password"})
+    response = client.post(
         "/api/books",
-        headers={"Authorization": "Bearer action-test-token"},
         data={"file": (BytesIO(b"RAW-EPUB"), "book.epub")},
         content_type="multipart/form-data",
     )

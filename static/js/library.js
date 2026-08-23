@@ -12,6 +12,12 @@
   const editId = document.querySelector("#edit-book-id");
   const editTitle = document.querySelector("#edit-book-title");
   const editAuthor = document.querySelector("#edit-book-author");
+  const sharedNote = document.querySelector("#shared-reading-note");
+  const sharedLink = document.querySelector("#shared-reading-link");
+  const sharedBook = document.querySelector("#shared-reading-book");
+  const sharedChapter = document.querySelector("#shared-reading-chapter");
+  const sharedProgress = document.querySelector("#shared-reading-progress");
+  const sharedPercentage = document.querySelector("#shared-reading-percentage");
 
   async function api(url, options = {}) {
     const headers = { ...(options.headers || {}) };
@@ -42,7 +48,8 @@
     shelf.replaceChildren();
     count.textContent = books.length ? `${books.length} 本` : "";
     empty.hidden = books.length !== 0;
-    for (const book of books) {
+    renderSharedReadingNote(books);
+    books.forEach((book, index) => {
       const fragment = template.content.cloneNode(true);
       const card = fragment.querySelector(".book-card");
       const href = `/reader/${book.id}`;
@@ -54,6 +61,9 @@
         image.src = book.cover_url;
         image.alt = `${book.title}封面`;
         image.addEventListener("load", () => cover.classList.add("has-image"), { once: true });
+      } else {
+        cover.dataset.coverTone = String((index % 5) + 1);
+        fragment.querySelector(".cover-placeholder").textContent = firstBookCharacter(book.title);
       }
       fragment.querySelector(".book-title").textContent = book.title;
       fragment.querySelector(".book-author").textContent = book.author || "未知作者";
@@ -64,9 +74,27 @@
       const chapter = book.current_chapter ? ` · ${book.current_chapter}` : "";
       fragment.querySelector(".book-progress").textContent = `${percentage.toFixed(1)}%${chapter}`;
       fragment.querySelector(".edit-book-button").addEventListener("click", () => openBookEditor(book));
+      fragment.querySelector(".delete-book-button").addEventListener("click", () => deleteBook(book));
       card.dataset.bookId = book.id;
       shelf.append(fragment);
-    }
+    });
+  }
+
+  function renderSharedReadingNote(books) {
+    const recent = books.find((book) => book.progress_chapter_id) || null;
+    sharedNote.hidden = !recent;
+    if (!recent) return;
+    const percentage = clamp(Number(recent.progress_percentage || 0), 0, 100);
+    sharedLink.href = `/reader/${recent.id}`;
+    sharedBook.textContent = `《${recent.title}》`;
+    sharedChapter.textContent = recent.current_chapter || "从上次停下的书页继续";
+    sharedProgress.style.width = `${percentage}%`;
+    sharedPercentage.textContent = `我们读了 ${percentage.toFixed(1)}%`;
+  }
+
+  function firstBookCharacter(title) {
+    const normalized = String(title || "书").trim();
+    return Array.from(normalized)[0] || "书";
   }
 
   fileInput.addEventListener("change", async () => {
@@ -100,6 +128,21 @@
     editAuthor.value = book.author || "未知作者";
     editDialog.showModal();
     setTimeout(() => editTitle.focus(), 0);
+  }
+
+  async function deleteBook(book) {
+    const warning = `确定永久删除《${book.title}》吗？\n\n这会删除章节、双方阅读进度、所有批注、Thought、回复，以及私有 Storage 中的原书、封面和正文图片。此操作不提供书籍级撤销。`;
+    if (!window.confirm(warning)) return;
+    uploadStatus.classList.remove("error");
+    uploadStatus.textContent = `正在删除《${book.title}》及其私有资源…`;
+    try {
+      await api(`/api/books/${book.id}`, { method: "DELETE" });
+      uploadStatus.textContent = `《${book.title}》已从书架与私有存储中删除。`;
+      await loadBooks();
+    } catch (error) {
+      uploadStatus.classList.add("error");
+      uploadStatus.textContent = `删除失败：${error.message}`;
+    }
   }
 
   editForm.addEventListener("submit", async (event) => {

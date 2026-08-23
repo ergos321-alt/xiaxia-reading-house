@@ -9,7 +9,8 @@ from uuid import UUID
 from flask import Blueprint, jsonify, request
 
 import database as db
-from auth import api_or_session_required
+import operations
+from auth import action_required, api_or_session_required, web_api_required
 from reading import _chapter_blocks, _json_safe, _text_across_blocks, _uuid_or_none
 
 
@@ -20,8 +21,10 @@ USER_ANNOTATION_FIELDS = """
     a.id, a.book_id, a.chapter_id, a.selected_text,
     a.start_block_id, a.start_offset, a.end_block_id, a.end_offset,
     a.prefix_text, a.suffix_text, a.comment, a.status,
+    a.owner, a.content_type,
     a.created_at, a.updated_at,
-    ar.response as xiaxia_response, ar.created_at as reply_created_at,
+    ar.response as xiaxia_response, ar.owner as reply_owner,
+    ar.content_type as reply_content_type, ar.created_at as reply_created_at,
     ar.updated_at as reply_updated_at
 """
 
@@ -29,7 +32,10 @@ XIA_THOUGHT_FIELDS = """
     xt.id, xt.book_id, xt.chapter_id, xt.scope, xt.mark_type, xt.content,
     xt.selected_text, xt.start_block_id, xt.start_offset,
     xt.end_block_id, xt.end_offset, xt.prefix_text, xt.suffix_text,
-    xt.created_at, xt.updated_at
+    xt.owner, xt.content_type, xt.created_at, xt.updated_at,
+    tur.id as user_reply_id, tur.response as user_response,
+    tur.owner as user_reply_owner, tur.content_type as user_reply_content_type,
+    tur.created_at as user_reply_created_at, tur.updated_at as user_reply_updated_at
 """
 
 
@@ -50,6 +56,7 @@ def list_chapter_annotations(book_id: UUID, chapter_id: UUID):
         f"""
         select {XIA_THOUGHT_FIELDS}
         from xiaxia_thoughts xt
+        left join thought_user_replies tur on tur.thought_id = xt.id
         where xt.book_id = %s and xt.chapter_id = %s
         order by xt.created_at
         """,
@@ -97,6 +104,7 @@ def list_book_annotations(book_id: UUID):
                    c.title as chapter_title, c.chapter_index
             from xiaxia_thoughts xt
             join chapters c on c.id = xt.chapter_id
+            left join thought_user_replies tur on tur.thought_id = xt.id
             where xt.book_id = %s
             order by c.chapter_index, xt.created_at
             """,
@@ -116,7 +124,7 @@ def list_book_annotations(book_id: UUID):
 
 
 @annotations_bp.post("/api/annotations")
-@api_or_session_required
+@web_api_required
 def create_annotation():
     payload = request.get_json(silent=True) or {}
     book_id = _uuid_or_none(payload.get("book_id"))
@@ -143,92 +151,107 @@ def create_annotation():
     if not chapter:
         return jsonify({"error": "chapter_not_found"}), 404
 
-    row = db.execute(
-        """
-        insert into annotations (
-            book_id, chapter_id, selected_text,
-            start_block_id, start_offset, end_block_id, end_offset,
-            prefix_text, suffix_text, comment, status
-        ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
-        returning id, book_id, chapter_id, selected_text,
-                  start_block_id, start_offset, end_block_id, end_offset,
-                  prefix_text, suffix_text, comment, status, created_at, updated_at
-        """,
-        (
-            book_id,
-            chapter_id,
-            selected_text,
-            start_block_id,
-            start_offset,
-            end_block_id,
-            end_offset,
-            prefix_text,
-            suffix_text,
-            comment,
-        ),
-    )
+    with db.transaction() as conn:
+        row = conn.execute(
+            """
+            insert into annotations (
+                book_id, chapter_id, selected_text,
+                start_block_id, start_offset, end_block_id, end_offset,
+                prefix_text, suffix_text, comment, status
+            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
+            returning *
+            """,
+            (
+                book_id, chapter_id, selected_text, start_block_id, start_offset,
+                end_block_id, end_offset, prefix_text, suffix_text, comment,
+            ),
+        ).fetchone()
+        operations.record(
+            conn, actor="user", operation_type="create_annotation",
+            target_type="user_annotation", target_id=row["id"],
+            book_id=book_id, chapter_id=chapter_id,
+            new_records=[operations.snapshot(row, "user_annotation")],
+        )
     result = _json_safe(row)
     result["xiaxia_response"] = None
     return jsonify({"annotation": result}), 201
 
 
 @annotations_bp.patch("/api/annotations/<uuid:annotation_id>")
-@api_or_session_required
+@web_api_required
 def update_annotation(annotation_id: UUID):
     payload = request.get_json(silent=True) or {}
     if "comment" not in payload:
         return jsonify({"error": "comment_required"}), 400
     comment = _clean_text(payload.get("comment"), 20_000, allow_empty=True)
-    row = db.fetch_one(
-        f"""
-        with updated as (
-            update annotations
-            set comment = %s,
+    with db.transaction() as conn:
+        existing = conn.execute(
+            "select * from annotations where id = %s for update", (annotation_id,)
+        ).fetchone()
+        if not existing:
+            return jsonify({"error": "annotation_not_found"}), 404
+        conn.execute(
+            """
+            update annotations set comment = %s,
                 status = case when status = 'seen' then 'pending' else status end,
-                updated_at = now()
-            where id = %s
-            returning *
+                updated_at = now() where id = %s
+            """,
+            (comment, annotation_id),
         )
-        select {USER_ANNOTATION_FIELDS}
-        from updated a
-        left join annotation_replies ar on ar.annotation_id = a.id
-        """,
-        (comment, annotation_id),
-    )
-    if not row:
-        return jsonify({"error": "annotation_not_found"}), 404
+        row = conn.execute(
+            f"""
+            select {USER_ANNOTATION_FIELDS} from annotations a
+            left join annotation_replies ar on ar.annotation_id = a.id
+            where a.id = %s
+            """,
+            (annotation_id,),
+        ).fetchone()
+        operations.record(
+            conn, actor="user", operation_type="update_annotation",
+            target_type="user_annotation", target_id=annotation_id,
+            book_id=existing["book_id"], chapter_id=existing["chapter_id"],
+            previous_records=[operations.snapshot(existing, "user_annotation")],
+            new_records=[operations.snapshot(row, "user_annotation")],
+        )
     return jsonify({"annotation": _json_safe(row)})
 
 
 @annotations_bp.delete("/api/annotations/<uuid:annotation_id>")
-@api_or_session_required
+@web_api_required
 def delete_annotation(annotation_id: UUID):
     with db.transaction() as conn:
         existing = conn.execute(
-            """
-            select a.id, exists (
-                select 1 from annotation_replies ar where ar.annotation_id = a.id
-            ) as had_reply
-            from annotations a where a.id = %s for update
-            """,
-            (annotation_id,),
+            "select * from annotations where id = %s for update", (annotation_id,)
         ).fetchone()
         if not existing:
             return jsonify({"error": "annotation_not_found"}), 404
+        reply = conn.execute(
+            "select * from annotation_replies where annotation_id = %s",
+            (annotation_id,),
+        ).fetchone()
         # annotation_replies.annotation_id uses ON DELETE CASCADE. The delete
         # therefore removes any reply atomically and cannot leave an orphan.
         conn.execute("delete from annotations where id = %s", (annotation_id,))
+        snapshots = [operations.snapshot(existing, "user_annotation")]
+        if reply:
+            snapshots.append(operations.snapshot(reply, "xiaxia_reply"))
+        operations.record(
+            conn, actor="user", operation_type="delete_annotation",
+            target_type="user_annotation", target_id=annotation_id,
+            book_id=existing["book_id"], chapter_id=existing["chapter_id"],
+            previous_records=snapshots,
+        )
     return jsonify(
         {
             "deleted": True,
             "annotation_id": str(annotation_id),
-            "deleted_reply": bool(existing["had_reply"]),
+            "deleted_reply": bool(reply),
         }
     )
 
 
 @annotations_bp.get("/api/annotations/pending")
-@api_or_session_required
+@action_required
 def pending_annotations():
     requested_book = _uuid_or_none(request.args.get("book_id"))
     try:
@@ -261,7 +284,7 @@ def pending_annotations():
 
 
 @annotations_bp.post("/api/annotations/<uuid:annotation_id>/seen")
-@api_or_session_required
+@action_required
 def mark_annotation_seen(annotation_id: UUID):
     with db.transaction() as conn:
         row = conn.execute(
@@ -285,6 +308,10 @@ def mark_annotation_seen(annotation_id: UUID):
                     when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then null
                     else ai_reading_state.last_chunk_index
                 end,
+                last_chunk_id = case
+                    when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then null
+                    else ai_reading_state.last_chunk_id
+                end,
                 last_block_id = case
                     when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then null
                     else ai_reading_state.last_block_id
@@ -303,7 +330,7 @@ def mark_annotation_seen(annotation_id: UUID):
 
 
 @annotations_bp.post("/api/annotations/<uuid:annotation_id>/reply")
-@api_or_session_required
+@action_required
 def reply_to_annotation(annotation_id: UUID):
     payload = request.get_json(silent=True) or {}
     response_text = _clean_text(payload.get("response"), 50_000)
@@ -317,6 +344,10 @@ def reply_to_annotation(annotation_id: UUID):
         ).fetchone()
         if not annotation:
             return jsonify({"error": "annotation_not_found"}), 404
+        previous_reply = conn.execute(
+            "select * from annotation_replies where annotation_id = %s for update",
+            (annotation_id,),
+        ).fetchone()
         reply = conn.execute(
             """
             insert into annotation_replies (annotation_id, response)
@@ -341,6 +372,10 @@ def reply_to_annotation(annotation_id: UUID):
                     when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then null
                     else ai_reading_state.last_chunk_index
                 end,
+                last_chunk_id = case
+                    when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then null
+                    else ai_reading_state.last_chunk_id
+                end,
                 last_block_id = case
                     when ai_reading_state.last_chapter_read is distinct from excluded.last_chapter_read then null
                     else ai_reading_state.last_block_id
@@ -355,13 +390,21 @@ def reply_to_annotation(annotation_id: UUID):
             """,
             (annotation["book_id"], annotation["chapter_id"], annotation_id),
         )
+        operations.record(
+            conn, actor="xiaxia",
+            operation_type="update_reply" if previous_reply else "create_reply",
+            target_type="xiaxia_reply", target_id=reply["id"],
+            book_id=annotation["book_id"], chapter_id=annotation["chapter_id"],
+            previous_records=[operations.snapshot(previous_reply, "xiaxia_reply")] if previous_reply else [],
+            new_records=[operations.snapshot(reply, "xiaxia_reply")],
+        )
     result = _json_safe(reply)
     result["status"] = "replied"
     return jsonify({"reply": result})
 
 
 @annotations_bp.post("/api/xiaxia/thoughts")
-@api_or_session_required
+@action_required
 def create_xiaxia_thought():
     payload = request.get_json(silent=True) or {}
     book_id = _uuid_or_none(payload.get("book_id"))
@@ -386,32 +429,29 @@ def create_xiaxia_thought():
         anchor = _thought_anchor(scope, payload, chapter["content_html"])
     except ValueError as exc:
         return jsonify({"error": "invalid_thought_anchor", "message": str(exc)}), 400
-    row = db.execute(
-        """
-        insert into xiaxia_thoughts (
-            book_id, chapter_id, scope, mark_type, content, selected_text,
-            start_block_id, start_offset, end_block_id, end_offset,
-            prefix_text, suffix_text
-        ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        returning id, book_id, chapter_id, scope, mark_type, content, selected_text,
-                  start_block_id, start_offset, end_block_id, end_offset,
-                  prefix_text, suffix_text, created_at, updated_at
-        """,
-        (
-            book_id,
-            chapter_id,
-            scope,
-            mark_type,
-            content,
-            anchor["selected_text"],
-            anchor["start_block_id"],
-            anchor["start_offset"],
-            anchor["end_block_id"],
-            anchor["end_offset"],
-            anchor["prefix_text"],
-            anchor["suffix_text"],
-        ),
-    )
+    with db.transaction() as conn:
+        row = conn.execute(
+            """
+            insert into xiaxia_thoughts (
+                book_id, chapter_id, scope, mark_type, content, selected_text,
+                start_block_id, start_offset, end_block_id, end_offset,
+                prefix_text, suffix_text
+            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            returning *
+            """,
+            (
+                book_id, chapter_id, scope, mark_type, content,
+                anchor["selected_text"], anchor["start_block_id"],
+                anchor["start_offset"], anchor["end_block_id"],
+                anchor["end_offset"], anchor["prefix_text"], anchor["suffix_text"],
+            ),
+        ).fetchone()
+        operations.record(
+            conn, actor="xiaxia", operation_type="create_thought",
+            target_type="xiaxia_thought", target_id=row["id"],
+            book_id=book_id, chapter_id=chapter_id,
+            new_records=[operations.snapshot(row, "xiaxia_thought")],
+        )
     return jsonify({"xiaxia_thought": _json_safe(row)}), 201
 
 
@@ -479,7 +519,9 @@ def _latest_sync_token(*collections: list[dict[str, Any]]) -> str:
     values = []
     for collection in collections:
         for row in collection:
-            for field in ("updated_at", "reply_updated_at", "created_at"):
+            for field in (
+                "updated_at", "reply_updated_at", "user_reply_updated_at", "created_at"
+            ):
                 value = row.get(field)
                 if value is not None:
                     values.append(

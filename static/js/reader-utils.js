@@ -15,25 +15,32 @@
     return Math.max(1, Math.ceil((Number(scrollWidth) + Number(gap || 0)) / pageSpan));
   }
 
-  function selectionMenuPosition({ rect, viewport, mobile, menuWidth = 180, toolbarBottom = 76, margin = 12 }) {
+  function selectionMenuPosition({ rect, viewport, mobile, menuWidth = 180, menuHeight = 50, toolbarBottom = 76, margin = 12 }) {
     const viewportLeft = Number(viewport.offsetLeft || 0);
     const viewportTop = Number(viewport.offsetTop || 0);
     const viewportWidth = Number(viewport.width);
     const viewportHeight = Number(viewport.height);
-    if (mobile) {
-      return {
-        left: viewportLeft + viewportWidth / 2,
-        top: Math.max(
-          viewportTop + margin,
-          viewportTop + viewportHeight - 60 - Number(viewport.bottomInset || margin),
-        ),
-        bottom: null,
-        placement: "bottom",
-      };
-    }
     const center = Number(rect.left) + Number(rect.width) / 2;
     const half = menuWidth / 2;
     const left = clamp(center, viewportLeft + half + margin, viewportLeft + viewportWidth - half - margin);
+    if (mobile) {
+      const viewportBottom = viewportTop + viewportHeight - Number(viewport.bottomInset || margin);
+      const clearance = 28;
+      const belowTop = Number(rect.bottom) + clearance;
+      if (belowTop + menuHeight <= viewportBottom) {
+        return { left, top: belowTop, bottom: null, placement: "mobile-below" };
+      }
+      const aboveBottom = Number(rect.top) - clearance;
+      if (aboveBottom - menuHeight >= viewportTop + margin) {
+        return { left, top: aboveBottom, bottom: null, placement: "mobile-above" };
+      }
+      return {
+        left,
+        top: clamp(Number(rect.bottom) + margin, viewportTop + margin, viewportBottom - menuHeight),
+        bottom: null,
+        placement: "mobile-clamped",
+      };
+    }
     const roomAbove = Number(rect.top) - Math.max(toolbarBottom, viewportTop);
     if (roomAbove >= 54) {
       return { left, top: Number(rect.top), bottom: null, placement: "above" };
@@ -62,6 +69,7 @@
     const xiaxia = (thoughts || []).map((item) => [
       item.id, item.updated_at, item.scope, item.start_block_id,
       item.start_offset, item.end_block_id, item.end_offset,
+      item.user_reply_updated_at, item.user_response,
     ]);
     return JSON.stringify([user, xiaxia]);
   }

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f3ecdf">
+  <title>批注管理中心 · 共读小屋</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="annotations-page">
+  <header class="site-header annotations-header">
+    <div>
+      <a class="back-link" href="{{ url_for('library_page') }}">← 返回书架</a>
+      <p class="eyebrow">Xiaxia Reading House</p>
+      <h1>批注管理中心</h1>
+    </div>
+  </header>
+  <main class="annotations-main">
+    <section class="management-filters" aria-label="阅读痕迹筛选">
+      <label>书籍<select id="manage-book"><option value="">全部书籍</option></select></label>
+      <label>章节<select id="manage-chapter"><option value="">全部章节</option></select></label>
+      <label>作者<select id="manage-owner"><option value="all">全部</option><option value="user">我</option><option value="xiaxia">林知夏</option></select></label>
+      <label>类型<select id="manage-type"><option value="all">全部</option><option value="user_annotation">我的划线 / 批注</option><option value="xiaxia_thought">林知夏的想法</option><option value="xiaxia_reply">林知夏的回复</option><option value="user_reply">我的回复</option></select></label>
+    </section>
+    <div class="management-actions">
+      <span id="management-count" class="muted"></span>
+      <button id="undo-user-action" class="secondary-button" type="button">撤销我最近一次操作</button>
+      <button id="delete-selected-traces" class="danger-button" type="button" disabled>删除所选</button>
+    </div>
+    <section id="management-list" class="annotation-overview-list" aria-live="polite"></section>
+    <div id="management-empty" class="empty-state" hidden><h2>没有符合条件的阅读痕迹</h2></div>
+  </main>
+  <script src="{{ url_for('static', filename='js/annotations-management.js') }}" defer></script>
+</body>
+</html>

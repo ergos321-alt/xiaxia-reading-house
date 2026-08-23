@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
-  title: Xiaxia Reading House V1 Actions
+  title: Xiaxia Reading House V1.1 Actions
   version: 1.1.0
-  description: Private reading facts and durable co-reading state. The server never generates Xiaxia persona text.
+  description: Private reading facts and durable Xiaxia-owned reading traces. The server never generates persona text.
 servers:
   - url: https://xiaxia-reading-house.onrender.com
 security:
@@ -11,11 +11,11 @@ paths:
   /api/reading/state:
     get:
       operationId: getReadingState
-      summary: Get the current shared reading state
-      description: Restore the active book, user position, Xiaxia chunk checkpoint, and pending count.
+      summary: Get shared reading state
+      description: Restore the active book, user position, Xiaxia chunk checkpoint, completion flag, and pending count.
       responses:
         "200":
-          description: Current reading state. The current property is absent or null when the shelf has no progress.
+          description: Current reading state.
           content:
             application/json:
               schema:
@@ -30,11 +30,11 @@ paths:
   /api/books:
     get:
       operationId: listBooks
-      summary: List books on the private shelf
-      description: Return book IDs and reading summaries. Use a book ID to list its ordered chapters.
+      summary: List private books
+      description: Return book IDs and reading summaries. Use a book ID to list chapters.
       responses:
         "200":
-          description: Ordered bookshelf entries.
+          description: Books on the private shelf.
           content:
             application/json:
               schema:
@@ -49,8 +49,8 @@ paths:
   /api/books/{book_id}/chapters:
     get:
       operationId: listBookChapters
-      summary: List a book's chapters in reading order
-      description: Get stable chapter IDs before choosing any chapter. This does not depend on user progress or annotations.
+      summary: List chapters in reading order
+      description: Get stable chapter IDs for any book without relying on user progress or annotations.
       parameters:
         - name: book_id
           in: path
@@ -81,8 +81,8 @@ paths:
   /api/books/{book_id}/annotations:
     get:
       operationId: listBookAnnotations
-      summary: List a book's annotation overview
-      description: Return user annotations and, for the all filter, independent Xiaxia thoughts with exact source anchors.
+      summary: List a book's reading traces
+      description: Return user annotations and, with the all filter, Xiaxia Thoughts with exact source anchors.
       parameters:
         - name: book_id
           in: path
@@ -94,14 +94,14 @@ paths:
         - name: filter
           in: query
           required: false
-          description: Filter user annotations. Independent thoughts are included only with all.
+          description: Filter user annotations. Thoughts are included with all.
           schema:
             type: string
             enum: [all, highlights, comments, replies]
             default: all
       responses:
         "200":
-          description: Filtered annotations and independent thoughts.
+          description: Filtered reading traces.
           content:
             application/json:
               schema:
@@ -132,7 +132,7 @@ paths:
     get:
       operationId: getReadingContext
       summary: Read one stable chapter chunk
-      description: Read chunk 0 first unless focusing an annotation. If chunk_count is above 1, read every chunk through chunk_count minus 1 before claiming the chapter is complete.
+      description: Read chunk 0 first. If chunk_count is above 1, read every chunk through chunk_count minus 1 before claiming the chapter is complete.
       parameters:
         - name: chapter_id
           in: query
@@ -144,56 +144,31 @@ paths:
         - name: annotation_id
           in: query
           required: false
-          description: Focus a user annotation and use its chapter. The response identifies its chunk.
+          description: Focus one user annotation and return the chunk containing it.
           schema:
             type: string
             format: uuid
         - name: chunk_index
           in: query
           required: false
-          description: Zero-based chunk to read. Omit for chunk 0 or the focused annotation's chunk.
+          description: Zero-based chunk index.
           schema:
             type: integer
             minimum: 0
         - name: include_adjacent
           in: query
           required: false
-          description: Include previous and next chapter facts only when needed.
+          description: Include adjacent chapter facts when needed.
           schema:
             type: boolean
             default: false
       responses:
         "200":
-          description: One chapter chunk with the exact stable blocks used by web annotations.
+          description: One chunk with stable blocks used by web anchors.
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  book:
-                    $ref: "#/components/schemas/ContextBook"
-                  chapter:
-                    $ref: "#/components/schemas/ChapterChunk"
-                  reading_progress:
-                    $ref: "#/components/schemas/UserProgress"
-                  annotations:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Annotation"
-                  xiaxia_thoughts:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/XiaxiaThought"
-                  focus_annotation:
-                    $ref: "#/components/schemas/Annotation"
-                  focus_annotation_chunk_index:
-                    type: integer
-                  reading_instruction:
-                    type: string
-                  adjacent_chapters:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/AdjacentChapter"
+                $ref: "#/components/schemas/ReadingContext"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -203,8 +178,8 @@ paths:
   /api/annotations/pending:
     get:
       operationId: listPendingAnnotations
-      summary: List unprocessed user annotations
-      description: Return the oldest pending user annotations, optionally for one book.
+      summary: List pending user annotations
+      description: Return oldest pending user annotations, optionally limited to one book.
       parameters:
         - name: book_id
           in: query
@@ -216,7 +191,7 @@ paths:
         - name: limit
           in: query
           required: false
-          description: Maximum results.
+          description: Maximum result count from 1 to 100.
           schema:
             type: integer
             minimum: 1
@@ -224,27 +199,52 @@ paths:
             default: 20
       responses:
         "200":
-          description: Oldest pending annotations first.
+          description: Pending annotations.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  count:
-                    type: integer
                   annotations:
                     type: array
                     items:
                       $ref: "#/components/schemas/Annotation"
-        "400":
-          $ref: "#/components/responses/BadRequest"
+                  count:
+                    type: integer
         "401":
           $ref: "#/components/responses/Unauthorized"
-  /api/annotations/{annotation_id}:
-    patch:
-      operationId: updateAnnotation
-      summary: Edit a user's annotation comment
-      description: Update only the comment. Existing block IDs, offsets, selected text, and reply remain unchanged.
+  /api/annotations/{annotation_id}/seen:
+    post:
+      operationId: markAnnotationSeen
+      summary: Mark a user annotation seen
+      description: Move a pending user annotation to seen and persist Xiaxia's last annotation checkpoint.
+      parameters:
+        - name: annotation_id
+          in: path
+          required: true
+          description: User annotation UUID.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Updated annotation state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  annotation:
+                    $ref: "#/components/schemas/Annotation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/annotations/{annotation_id}/reply:
+    post:
+      operationId: replyToAnnotation
+      summary: Create or replace Xiaxia Reply
+      description: Save Xiaxia's reply to one user annotation and set its status to replied.
       parameters:
         - name: annotation_id
           in: path
@@ -258,22 +258,51 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [comment]
-              properties:
-                comment:
-                  type: string
-                  maxLength: 20000
+              $ref: "#/components/schemas/AnnotationReplyInput"
       responses:
         "200":
-          description: Updated annotation with the original anchor.
+          description: Durable Xiaxia Reply.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  annotation:
-                    $ref: "#/components/schemas/Annotation"
+                  reply:
+                    $ref: "#/components/schemas/XiaxiaReply"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      operationId: updateAnnotationReply
+      summary: Update Xiaxia Reply
+      description: Modify only Xiaxia's reply while preserving the user annotation and its anchor.
+      parameters:
+        - name: annotation_id
+          in: path
+          required: true
+          description: User annotation UUID.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AnnotationReplyInput"
+      responses:
+        "200":
+          description: Updated Xiaxia Reply.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reply:
+                    $ref: "#/components/schemas/XiaxiaReply"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -281,9 +310,9 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
     delete:
-      operationId: deleteAnnotation
-      summary: Delete a user annotation and its reply
-      description: Delete atomically. If xiaxia_response exists, obtain explicit user confirmation first; the attached reply is cascade-deleted.
+      operationId: deleteAnnotationReply
+      summary: Delete Xiaxia Reply
+      description: Delete only Xiaxia's reply, keep the user annotation, and return its status to seen.
       parameters:
         - name: annotation_id
           in: path
@@ -294,7 +323,7 @@ paths:
             format: uuid
       responses:
         "200":
-          description: Deletion result and whether a reply was also removed.
+          description: Deletion result.
           content:
             application/json:
               schema:
@@ -305,132 +334,80 @@ paths:
                   annotation_id:
                     type: string
                     format: uuid
-                  deleted_reply:
-                    type: boolean
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "404":
-          $ref: "#/components/responses/NotFound"
-  /api/annotations/{annotation_id}/seen:
-    post:
-      operationId: markAnnotationSeen
-      summary: Mark a user annotation as seen
-      description: Record that Xiaxia read the annotation without writing a reply.
-      parameters:
-        - name: annotation_id
-          in: path
-          required: true
-          description: User annotation UUID.
-          schema:
-            type: string
-            format: uuid
-      responses:
-        "200":
-          description: Updated annotation status.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  annotation:
-                    $ref: "#/components/schemas/AnnotationState"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "404":
-          $ref: "#/components/responses/NotFound"
-  /api/annotations/{annotation_id}/reply:
-    post:
-      operationId: replyToAnnotation
-      summary: Write Xiaxia's reply to a user annotation
-      description: Persist text supplied by Xiaxia. The server stores it and does not generate persona content.
-      parameters:
-        - name: annotation_id
-          in: path
-          required: true
-          description: User annotation UUID.
-          schema:
-            type: string
-            format: uuid
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [response]
-              properties:
-                response:
-                  type: string
-                  minLength: 1
-                  maxLength: 50000
-      responses:
-        "200":
-          description: Durable reply and replied status.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  reply:
-                    $ref: "#/components/schemas/AnnotationReply"
-        "400":
-          $ref: "#/components/responses/BadRequest"
+                  annotation_status:
+                    type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
   /api/xiaxia/thoughts:
+    get:
+      operationId: listXiaxiaThoughts
+      summary: List Xiaxia Thoughts
+      description: List Xiaxia-owned Thoughts for one book, optionally one chapter, with stable anchors and pagination.
+      parameters:
+        - name: book_id
+          in: query
+          required: true
+          description: Book UUID.
+          schema:
+            type: string
+            format: uuid
+        - name: chapter_id
+          in: query
+          required: false
+          description: Optional chapter UUID within the book.
+          schema:
+            type: string
+            format: uuid
+        - name: page
+          in: query
+          required: false
+          description: One-based page number.
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          required: false
+          description: Results per page from 1 to 100.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: Paginated Xiaxia Thoughts.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  thoughts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/XiaxiaThought"
+                  pagination:
+                    $ref: "#/components/schemas/Pagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
     post:
       operationId: createXiaxiaThought
-      summary: Create an independent Xiaxia thought
-      description: Store Xiaxia-supplied text at a precise range, whole block, or chapter. Use block IDs and offsets returned by getReadingContext.
+      summary: Create one Xiaxia Thought
+      description: Save one exact range, block, or chapter Thought. Range text must match the supplied stable block offsets.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [book_id, chapter_id, scope, content]
-              properties:
-                book_id:
-                  type: string
-                  format: uuid
-                chapter_id:
-                  type: string
-                  format: uuid
-                scope:
-                  type: string
-                  enum: [range, block, chapter]
-                mark_type:
-                  type: string
-                  maxLength: 64
-                  description: Optional future-facing kind such as thought, like, question, or discuss.
-                content:
-                  type: string
-                  minLength: 1
-                  maxLength: 50000
-                block_id:
-                  type: string
-                  description: Required for block scope.
-                start_block_id:
-                  type: string
-                  description: Required for range scope.
-                start_offset:
-                  type: integer
-                  minimum: 0
-                end_block_id:
-                  type: string
-                  description: Required for range scope.
-                end_offset:
-                  type: integer
-                  minimum: 0
-                selected_text:
-                  type: string
-                  maxLength: 20000
-                  description: Optional exact check against the supplied range.
+              $ref: "#/components/schemas/ThoughtInput"
       responses:
         "201":
-          description: Stored independent thought with its exact anchor.
+          description: Created Xiaxia Thought.
           content:
             application/json:
               schema:
@@ -444,18 +421,199 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
-  /api/ai/progress:
+  /api/xiaxia/thoughts/{thought_id}:
+    patch:
+      operationId: updateXiaxiaThought
+      summary: Update one Xiaxia Thought
+      description: Modify Thought content or mark type. Anchor changes are accepted only after exact block and offset validation.
+      parameters:
+        - name: thought_id
+          in: path
+          required: true
+          description: Xiaxia Thought UUID.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ThoughtUpdateInput"
+      responses:
+        "200":
+          description: Updated Xiaxia Thought.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  xiaxia_thought:
+                    $ref: "#/components/schemas/XiaxiaThought"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteXiaxiaThought
+      summary: Delete one Xiaxia Thought
+      description: Delete only a Xiaxia-owned Thought. A linked user reply is removed by the same transaction.
+      parameters:
+        - name: thought_id
+          in: path
+          required: true
+          description: Xiaxia Thought UUID.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Deletion result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: boolean
+                  thought_id:
+                    type: string
+                    format: uuid
+                  deleted_user_reply:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/xiaxia/thoughts/batch-delete:
     post:
-      operationId: saveAiProgress
-      summary: Persist Xiaxia's chunk checkpoint
-      description: Save the last chapter chunk and block read. Set chapter_completed true only after reading the final chunk.
+      operationId: deleteXiaxiaThoughts
+      summary: Delete Xiaxia Thoughts by scope
+      description: Delete only Xiaxia-owned Thoughts for one book and optional chapter. User annotations are never targeted.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              properties:
+                book_id:
+                  type: string
+                  format: uuid
+                chapter_id:
+                  type: string
+                  format: uuid
               required: [book_id]
+      responses:
+        "200":
+          description: Deleted Thought IDs.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted_count:
+                    type: integer
+                  thought_ids:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/xiaxia/thoughts/preview:
+    post:
+      operationId: previewXiaxiaThoughts
+      summary: Validate Thought candidates
+      description: Validate 1 to 50 exact candidates and return candidate IDs. Preview never creates formal Thoughts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                candidates:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items:
+                    $ref: "#/components/schemas/ThoughtInput"
+              required: [candidates]
+      responses:
+        "200":
+          description: Candidate validation results.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  batch_id:
+                    type: string
+                    format: uuid
+                  candidates:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ThoughtCandidate"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/xiaxia/thoughts/commit:
+    post:
+      operationId: commitXiaxiaThoughts
+      summary: Commit validated Thought candidates
+      description: Batch commit valid unexpired candidates. Each candidate returns its own committed or failed result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                candidate_ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items:
+                    type: string
+                    format: uuid
+              required: [candidate_ids]
+      responses:
+        "200":
+          description: Per-candidate commit results.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CommitResult"
+                  committed_count:
+                    type: integer
+                  failed_count:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/ai/progress:
+    post:
+      operationId: saveAiProgress
+      summary: Save Xiaxia reading checkpoint
+      description: Save a chapter chunk checkpoint. Completion requires the final chunk; a stale final block is normalized to the final legal block.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
               properties:
                 book_id:
                   type: string
@@ -466,6 +624,8 @@ paths:
                 chunk_index:
                   type: integer
                   minimum: 0
+                chunk_id:
+                  type: string
                 last_block_id:
                   type: string
                 last_annotation_seen:
@@ -473,10 +633,10 @@ paths:
                   format: uuid
                 chapter_completed:
                   type: boolean
-                  default: false
+              required: [book_id]
       responses:
         "200":
-          description: Persisted checkpoint recoverable through getReadingState.
+          description: Persisted Xiaxia checkpoint.
           content:
             application/json:
               schema:
@@ -484,18 +644,43 @@ paths:
                 properties:
                   ai_reading_state:
                     $ref: "#/components/schemas/AiProgress"
+                  last_block_normalized:
+                    type: boolean
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+  /api/actions/undo:
+    post:
+      operationId: undoLastReadingAction
+      summary: Undo Xiaxia's latest trace operation
+      description: Undo the latest Xiaxia Thought or Reply create, update, delete, or batch operation unless later changes conflict.
+      responses:
+        "200":
+          description: Undone operation.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  undone:
+                    type: boolean
+                  operation:
+                    $ref: "#/components/schemas/OperationSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      bearerFormat: opaque-token
+      bearerFormat: ACTION_API_TOKEN
   responses:
     BadRequest:
       description: Invalid request.
@@ -504,13 +689,19 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Unauthorized:
-      description: Missing or invalid Bearer token.
+      description: Missing or invalid Action bearer token.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
     NotFound:
-      description: The requested private reading resource does not exist.
+      description: Requested record was not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: The target changed or cannot be undone safely.
       content:
         application/json:
           schema:
@@ -535,29 +726,12 @@ components:
           type: string
         format:
           type: string
-          enum: [epub, txt]
-        source_filename:
-          type: string
         chapter_count:
-          type: integer
-        progress_chapter_id:
-          type: string
-          format: uuid
-        progress_chapter_index:
           type: integer
         progress_percentage:
           type: number
-        current_chapter:
-          type: string
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
     ChapterDirectoryItem:
       type: object
-      required: [chapter_id, chapter_index, title, word_count]
       properties:
         chapter_id:
           type: string
@@ -568,21 +742,8 @@ components:
           type: string
         word_count:
           type: integer
-    ContextBook:
-      type: object
-      properties:
-        id:
-          type: string
-          format: uuid
-        title:
-          type: string
-        author:
-          type: string
-        chapter_count:
-          type: integer
     StableBlock:
       type: object
-      required: [block_id, block_order, text]
       properties:
         block_id:
           type: string
@@ -594,71 +755,21 @@ components:
           type: integer
         text:
           type: string
-    ChapterChunk:
-      type: object
-      required: [id, chapter_index, title, chunk_index, chunk_count, has_next, has_previous, chunk_text, blocks]
-      properties:
-        id:
-          type: string
-          format: uuid
-        chapter_index:
-          type: integer
-        title:
-          type: string
-        word_count:
-          type: integer
-        chunk_index:
-          type: integer
-        chunk_count:
-          type: integer
-        has_next:
-          type: boolean
-        has_previous:
-          type: boolean
-        chunk_text:
-          type: string
-        chunk_character_count:
-          type: integer
-        blocks:
-          type: array
-          items:
-            $ref: "#/components/schemas/StableBlock"
-        is_complete_chapter:
-          type: boolean
-        full_text:
-          type: string
-          description: Present only when the complete short chapter fits in one chunk.
-    UserProgress:
+    Anchor:
       type: object
       properties:
-        chapter_id:
+        scope:
           type: string
-          format: uuid
-        chapter_index:
-          type: integer
-        percentage:
-          type: number
-        position:
-          $ref: "#/components/schemas/ReadingPosition"
-        updated_at:
+        start_block_id:
+          type: [string, "null"]
+        start_offset:
+          type: [integer, "null"]
+        end_block_id:
+          type: [string, "null"]
+        end_offset:
+          type: [integer, "null"]
+        selected_text:
           type: string
-          format: date-time
-    ReadingPosition:
-      type: object
-      properties:
-        block_id:
-          type: string
-        char_offset:
-          type: integer
-        scroll_fraction:
-          type: number
-        display_mode:
-          type: string
-          enum: [scroll, paginated]
-        page_index:
-          type: integer
-        page_count:
-          type: integer
     Annotation:
       type: object
       properties:
@@ -681,25 +792,16 @@ components:
           type: string
         end_offset:
           type: integer
-        prefix_text:
-          type: string
-        suffix_text:
-          type: string
         comment:
           type: string
         status:
           type: string
-          enum: [pending, seen, replied]
+        owner:
+          type: string
+        content_type:
+          type: string
         xiaxia_response:
-          type: string
-        chapter_title:
-          type: string
-        chapter_index:
-          type: integer
-        book_title:
-          type: string
-        book_author:
-          type: string
+          type: [string, "null"]
         created_at:
           type: string
           format: date-time
@@ -712,6 +814,81 @@ components:
         id:
           type: string
           format: uuid
+        thought_id:
+          type: string
+          format: uuid
+        book_id:
+          type: string
+          format: uuid
+        chapter_id:
+          type: string
+          format: uuid
+        scope:
+          type: string
+        mark_type:
+          type: string
+        content:
+          type: string
+        thought_content:
+          type: string
+        selected_text:
+          type: string
+        start_block_id:
+          type: [string, "null"]
+        start_offset:
+          type: [integer, "null"]
+        end_block_id:
+          type: [string, "null"]
+        end_offset:
+          type: [integer, "null"]
+        owner:
+          type: string
+        content_type:
+          type: string
+        user_response:
+          type: [string, "null"]
+        anchor:
+          $ref: "#/components/schemas/Anchor"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    XiaxiaReply:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        annotation_id:
+          type: string
+          format: uuid
+        response:
+          type: string
+        owner:
+          type: string
+        content_type:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    AnnotationReplyInput:
+      type: object
+      properties:
+        response:
+          type: string
+          minLength: 1
+          maxLength: 50000
+      required: [response]
+    ThoughtInput:
+      type: object
+      properties:
         book_id:
           type: string
           format: uuid
@@ -723,7 +900,11 @@ components:
           enum: [range, block, chapter]
         mark_type:
           type: string
+          default: thought
         content:
+          type: string
+          maxLength: 50000
+        block_id:
           type: string
         selected_text:
           type: string
@@ -731,60 +912,118 @@ components:
           type: string
         start_offset:
           type: integer
+          minimum: 0
         end_block_id:
           type: string
         end_offset:
           type: integer
-        prefix_text:
+          minimum: 0
+      required: [book_id, chapter_id, scope, content]
+    ThoughtUpdateInput:
+      type: object
+      properties:
+        content:
           type: string
-        suffix_text:
+          maxLength: 50000
+        mark_type:
           type: string
-        chapter_title:
+        scope:
           type: string
+          enum: [range, block, chapter]
+        block_id:
+          type: string
+        selected_text:
+          type: string
+        start_block_id:
+          type: string
+        start_offset:
+          type: integer
+          minimum: 0
+        end_block_id:
+          type: string
+        end_offset:
+          type: integer
+          minimum: 0
+    ThoughtCandidate:
+      type: object
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+        validation_status:
+          type: string
+          enum: [valid, invalid]
+        validation_error:
+          type: [string, "null"]
+        matched_text:
+          type: string
+        anchor:
+          $ref: "#/components/schemas/Anchor"
+    CommitResult:
+      type: object
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [committed, failed]
+        thought_id:
+          type: string
+          format: uuid
+        error:
+          type: string
+    ChapterChunk:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
         chapter_index:
           type: integer
-        created_at:
+        title:
           type: string
-          format: date-time
-        updated_at:
+        word_count:
+          type: integer
+        chunk_index:
+          type: integer
+        chunk_id:
           type: string
-          format: date-time
-    AnnotationState:
+        chunk_count:
+          type: integer
+        has_next:
+          type: boolean
+        has_previous:
+          type: boolean
+        chunk_text:
+          type: string
+        blocks:
+          type: array
+          items:
+            $ref: "#/components/schemas/StableBlock"
+        is_complete_chapter:
+          type: boolean
+    ReadingContext:
       type: object
       properties:
-        id:
+        book:
+          $ref: "#/components/schemas/Book"
+        chapter:
+          $ref: "#/components/schemas/ChapterChunk"
+        annotations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Annotation"
+        xiaxia_thoughts:
+          type: array
+          items:
+            $ref: "#/components/schemas/XiaxiaThought"
+        focus_annotation:
+          $ref: "#/components/schemas/Annotation"
+        focus_annotation_chunk_index:
+          type: integer
+        reading_instruction:
           type: string
-          format: uuid
-        book_id:
-          type: string
-          format: uuid
-        chapter_id:
-          type: string
-          format: uuid
-        status:
-          type: string
-        updated_at:
-          type: string
-          format: date-time
-    AnnotationReply:
-      type: object
-      properties:
-        id:
-          type: string
-          format: uuid
-        annotation_id:
-          type: string
-          format: uuid
-        response:
-          type: string
-        status:
-          type: string
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
     AiProgress:
       type: object
       properties:
@@ -792,16 +1031,18 @@ components:
           type: string
           format: uuid
         last_chapter_read:
-          type: string
+          type: [string, "null"]
           format: uuid
         last_chunk_index:
-          type: integer
+          type: [integer, "null"]
+        last_chunk_id:
+          type: [string, "null"]
         last_block_id:
-          type: string
+          type: [string, "null"]
         chapter_completed:
           type: boolean
         last_annotation_seen:
-          type: string
+          type: [string, "null"]
           format: uuid
         updated_at:
           type: string
@@ -819,30 +1060,40 @@ components:
               format: uuid
             chapter_index:
               type: integer
-            chapter_title:
-              type: string
             percentage:
               type: number
-            position:
-              $ref: "#/components/schemas/ReadingPosition"
-            updated_at:
-              type: string
-              format: date-time
         xiaxia_progress:
           $ref: "#/components/schemas/AiProgress"
         pending_annotation_count:
           type: integer
-    AdjacentChapter:
+    Pagination:
+      type: object
+      properties:
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+        page_count:
+          type: integer
+        has_next:
+          type: boolean
+    OperationSummary:
       type: object
       properties:
         id:
           type: string
           format: uuid
-        chapter_index:
-          type: integer
-        title:
+        actor:
           type: string
-        full_text:
+        operation_type:
           type: string
-        word_count:
-          type: integer
+        target_type:
+          type: string
+        target_id:
+          type: [string, "null"]
+          format: uuid
+        created_at:
+          type: string
+          format: date-time

@@ -13,6 +13,7 @@ import storage
 from annotations import annotations_bp
 from auth import web_required
 from reading import reading_bp
+from management import management_bp
 
 
 REQUIRED_SETTINGS = (
@@ -59,6 +60,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     storage.init_app(app)
     app.register_blueprint(reading_bp)
     app.register_blueprint(annotations_bp)
+    app.register_blueprint(management_bp)
 
     @app.before_request
     def require_complete_configuration():
@@ -131,6 +133,11 @@ def create_app(test_config: dict | None = None) -> Flask:
     @web_required
     def annotations_overview_page(book_id):
         return render_template("annotations_overview.html", book_id=str(book_id))
+
+    @app.get("/annotations/manage")
+    @web_required
+    def annotations_management_page():
+        return render_template("annotations_management.html")
 
     @app.errorhandler(RequestEntityTooLarge)
     def too_large(_error):

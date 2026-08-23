@@ -68,7 +68,9 @@ def delete_objects(object_paths: list[str]) -> None:
     if not object_paths:
         return
     try:
-        _bucket().remove(object_paths)
+        # Keep requests comfortably below provider batch limits for image-heavy EPUBs.
+        for start in range(0, len(object_paths), 100):
+            _bucket().remove(object_paths[start : start + 100])
     except Exception as exc:
         raise ObjectStorageError("Supabase Storage cleanup failed") from exc
 

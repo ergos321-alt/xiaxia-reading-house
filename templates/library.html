@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#f5f0e7">
+  <meta name="theme-color" content="#f3ecdf">
   <title>共读小屋 · 书架</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
@@ -13,18 +13,33 @@
       <p class="eyebrow">Xiaxia Reading House</p>
       <h1>我们的书架</h1>
     </div>
-    <form method="post" action="{{ url_for('logout') }}">
-      <button class="text-button" type="submit">离开小屋</button>
-    </form>
+    <div class="header-actions">
+      <a class="text-button" href="{{ url_for('annotations_management_page') }}">批注管理</a>
+      <form method="post" action="{{ url_for('logout') }}">
+        <button class="text-button" type="submit">离开小屋</button>
+      </form>
+    </div>
   </header>
 
   <main class="library-main">
+    <section id="shared-reading-note" class="shared-reading-note" hidden aria-labelledby="shared-reading-title">
+      <div class="shared-note-pin" aria-hidden="true"></div>
+      <p id="shared-reading-title" class="shared-note-kicker">最近一起读到这里</p>
+      <a id="shared-reading-link" href="#">
+        <strong id="shared-reading-book"></strong>
+        <span id="shared-reading-chapter"></span>
+      </a>
+      <div class="shared-note-progress" aria-hidden="true"><span id="shared-reading-progress"></span></div>
+      <p id="shared-reading-percentage" class="shared-note-footnote"></p>
+    </section>
+
     <section class="upload-panel" aria-labelledby="upload-title">
-      <div>
+      <span class="upload-mark" aria-hidden="true">＋</span>
+      <div class="upload-copy">
         <h2 id="upload-title">把一本书带回家</h2>
         <p>支持普通 EPUB2 / EPUB3 与 TXT，单本不超过 {{ max_upload_mb }} MB。</p>
       </div>
-      <label class="upload-button" for="book-file">选择书籍</label>
+      <label class="upload-button" for="book-file">从设备中选一本</label>
       <input id="book-file" type="file" accept=".epub,.txt,application/epub+zip,text/plain" hidden>
       <div id="upload-status" class="upload-status" aria-live="polite"></div>
     </section>
@@ -59,8 +74,9 @@
         </div>
         <p class="book-progress"></p>
         <div class="book-card-actions">
-          <a class="continue-link" href="#">继续阅读 <span aria-hidden="true">→</span></a>
+          <a class="continue-link" href="#">翻开这本书 <span aria-hidden="true">→</span></a>
           <button class="edit-book-button text-button" type="button">编辑信息</button>
+          <button class="delete-book-button text-button" type="button">删除书籍</button>
         </div>
       </div>
     </article>

@@ -51,6 +51,7 @@
     empty.hidden = items.length > 0;
     for (const item of items) {
       const fragment = template.content.cloneNode(true);
+      fragment.querySelector(".overview-card").classList.add(item.kind === "user" ? "trace-user" : "trace-xiaxia");
       fragment.querySelector(".overview-kind").textContent = item.kind === "user" ? "我的划线 / 批注" : "林知夏的独立想法";
       fragment.querySelector(".overview-chapter").textContent = `第 ${Number(item.chapter_index) + 1} 章 · ${item.chapter_title}`;
       const quote = fragment.querySelector(".overview-quote");

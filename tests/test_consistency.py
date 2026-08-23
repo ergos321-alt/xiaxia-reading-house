@@ -16,6 +16,9 @@ def test_required_database_tables_are_declared():
         "annotations",
         "annotation_replies",
         "xiaxia_thoughts",
+        "thought_user_replies",
+        "xiaxia_thought_candidates",
+        "reading_operation_log",
         "ai_reading_state",
     }
     for table in required:
@@ -54,7 +57,7 @@ def test_action_schema_matches_implemented_action_routes():
     schema = yaml.safe_load(schema_text)
     sources = "\n".join(
         (ROOT / name).read_text(encoding="utf-8")
-        for name in ("reading.py", "annotations.py")
+        for name in ("reading.py", "annotations.py", "management.py")
     )
     required_paths = [
         "/api/reading/state",
@@ -63,10 +66,13 @@ def test_action_schema_matches_implemented_action_routes():
         "/api/books/{book_id}/annotations",
         "/api/reading/context",
         "/api/annotations/pending",
-        "/api/annotations/{annotation_id}",
         "/api/annotations/{annotation_id}/reply",
         "/api/annotations/{annotation_id}/seen",
         "/api/xiaxia/thoughts",
+        "/api/xiaxia/thoughts/{thought_id}",
+        "/api/xiaxia/thoughts/preview",
+        "/api/xiaxia/thoughts/commit",
+        "/api/actions/undo",
         "/api/ai/progress",
     ]
     assert set(required_paths) <= set(schema["paths"])
@@ -76,6 +82,7 @@ def test_action_schema_matches_implemented_action_routes():
         flask_path = path.replace("{book_id}", "<uuid:book_id>")
         flask_path = flask_path.replace("{chapter_id}", "<uuid:chapter_id>")
         flask_path = flask_path.replace("{annotation_id}", "<uuid:annotation_id>")
+        flask_path = flask_path.replace("{thought_id}", "<uuid:thought_id>")
         assert flask_path in sources
         for method, operation in path_item.items():
             if method not in methods:
@@ -133,6 +140,14 @@ def test_experience_migration_is_non_destructive_and_complete():
         assert destructive not in migration
 
 
+def test_v1_1_migration_is_non_destructive_and_complete():
+    migration = (ROOT / "migrations/004_v1_1_management.sql").read_text(encoding="utf-8").lower()
+    for item in ("thought_user_replies", "xiaxia_thought_candidates", "reading_operation_log", "last_chunk_id", "owner", "content_type"):
+        assert item in migration
+    for destructive in ("drop table", "truncate", "delete from books", "delete from annotations"):
+        assert destructive not in migration
+
+
 def test_chunk_and_thought_field_names_are_cross_file_consistent():
     files = {
         name: (ROOT / name).read_text(encoding="utf-8")
@@ -161,7 +176,9 @@ def test_frontend_references_real_static_files():
     assert (ROOT / "static/js/library.js").is_file()
     assert (ROOT / "static/js/reader-utils.js").is_file()
     assert (ROOT / "static/js/annotations-overview.js").is_file()
+    assert (ROOT / "static/js/annotations-management.js").is_file()
     assert (ROOT / "static/js/reader.js").is_file()
     assert (ROOT / "templates/library.html").is_file()
     assert (ROOT / "templates/reader.html").is_file()
     assert (ROOT / "templates/annotations_overview.html").is_file()
+    assert (ROOT / "templates/annotations_management.html").is_file()

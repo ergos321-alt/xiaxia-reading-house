@@ -112,13 +112,15 @@ class ReplyConnection:
     def __init__(self):
         self.calls = 0
 
-    def execute(self, _query, _params=()):
+    def execute(self, query, _params=()):
         self.calls += 1
-        if self.calls == 1:
+        if "select id, book_id, chapter_id from annotations" in query:
             return FakeCursor(
                 {"id": ANNOTATION_ID, "book_id": BOOK_ID, "chapter_id": CHAPTER_ID}
             )
-        if self.calls == 2:
+        if "select * from annotation_replies" in query:
+            return FakeCursor(None)
+        if "insert into annotation_replies" in query:
             return FakeCursor(
                 {
                     "id": REPLY_ID,
@@ -128,6 +130,8 @@ class ReplyConnection:
                     "updated_at": NOW,
                 }
             )
+        if "insert into reading_operation_log" in query:
+            return FakeCursor({"id": REPLY_ID})
         return FakeCursor()
 
 
@@ -148,4 +152,4 @@ def test_action_reply_is_returned_as_durable_replied_state(monkeypatch):
     payload = response.get_json()["reply"]
     assert payload["status"] == "replied"
     assert payload["response"] == "我读到了，也把这句话留在这里。"
-    assert connection.calls == 4
+    assert connection.calls == 6
