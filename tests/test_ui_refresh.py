@@ -54,6 +54,9 @@ def test_two_ink_system_and_collapsed_xiaxia_traces_are_present():
 
     for token in ("--user-ink", "--user-wash", "--xiaxia-ink", "--xiaxia-wash"):
         assert token in style
+    assert "linear-gradient(178deg" in style
+    assert "linear-gradient(179deg" in style
+    assert "background-color: transparent" in style
     assert 'content: "🐾"' in style
     assert 'class="thought-paw"' in reader
     assert "林知夏在这一章停留过" in thought_renderer
@@ -77,6 +80,32 @@ def test_mobile_selection_and_reader_anchors_remain_unchanged():
     assert ".selection-menu button { min-height: 48px" in style
 
 
+def test_reader_tools_page_edges_and_trace_actions_are_visually_demoted():
+    template = (ROOT / "templates/reader.html").read_text(encoding="utf-8")
+    source = (ROOT / "static/js/reader.js").read_text(encoding="utf-8")
+    style = (ROOT / "static/css/style.css").read_text(encoding="utf-8")
+
+    for element_id in (
+        "reader-menu-button",
+        "reader-menu",
+        "trace-menu-button",
+        "trace-actions-menu",
+        "page-previous",
+        "page-next",
+        "page-status",
+    ):
+        assert f'id="{element_id}"' in template
+    assert "只划线" in template
+    assert "留一句" in template
+    assert "reader-utility-tools" not in template
+    assert "toggleReaderMenu" in source
+    assert "showPageStatus" in source
+    assert 'goToPage(state.pageIndex + 1, "smooth", true)' in source
+    assert ".reader-paginated .page-turn span { opacity: 0" in style
+    assert ".reader-paginated .page-status.visible" in style
+    assert ".annotation-dialog" in style
+
+
 def test_ui_refresh_does_not_add_framework_or_change_action_files():
     templates_and_static = "\n".join(
         path.read_text(encoding="utf-8")
@@ -94,7 +123,7 @@ def test_refreshed_pages_and_static_assets_render_for_private_web_session():
     client = make_web_client()
     pages = {
         "/library": b'shared-reading-note',
-        f"/reader/{BOOK_ID}": b'reader-utility-tools',
+        f"/reader/{BOOK_ID}": b'reader-menu-button',
         f"/reader/{BOOK_ID}/annotations": b'annotation-overview-list',
         "/annotations/manage": b'management-filters',
         "/static/css/style.css": b'--xiaxia-ink',

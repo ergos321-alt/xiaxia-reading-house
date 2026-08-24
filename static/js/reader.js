@@ -14,6 +14,8 @@
   const pageNext = document.querySelector("#page-next");
   const pageStatus = document.querySelector("#page-status");
   const progressBar = document.querySelector("#reader-progress span");
+  const readerMenuButton = document.querySelector("#reader-menu-button");
+  const readerMenu = document.querySelector("#reader-menu");
   const tocButton = document.querySelector("#toc-button");
   const tocDrawer = document.querySelector("#toc-drawer");
   const tocClose = document.querySelector("#toc-close");
@@ -34,6 +36,10 @@
   const thoughtReplyText = document.querySelector("#thought-user-reply");
   const thoughtReplyButton = document.querySelector("#thought-reply-edit");
   const thoughtReplyDelete = document.querySelector("#thought-reply-delete");
+  const traceMenuButton = document.querySelector("#trace-menu-button");
+  const traceActionsMenu = document.querySelector("#trace-actions-menu");
+  const thoughtActions = document.querySelector("#thought-actions");
+  const annotationActions = document.querySelector("#annotation-actions");
   const toast = document.querySelector("#reader-toast");
   const query = new URLSearchParams(location.search);
 
@@ -64,6 +70,9 @@
     },
   };
 
+  let pageStatusTimer = null;
+  let pageStatusHideTimer = null;
+
   async function api(url, options = {}) {
     const headers = { ...(options.headers || {}) };
     if (options.body && !(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
@@ -71,6 +80,36 @@
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.message || data.error || `请求失败 (${response.status})`);
     return data;
+  }
+
+  function openReaderMenu() {
+    readerMenu.hidden = false;
+    readerMenuButton.setAttribute("aria-expanded", "true");
+  }
+
+  function closeReaderMenu() {
+    readerMenu.hidden = true;
+    readerMenuButton.setAttribute("aria-expanded", "false");
+  }
+
+  function toggleReaderMenu() {
+    if (readerMenu.hidden) openReaderMenu();
+    else closeReaderMenu();
+  }
+
+  function openTraceActions() {
+    traceActionsMenu.hidden = false;
+    traceMenuButton.setAttribute("aria-expanded", "true");
+  }
+
+  function closeTraceActions() {
+    traceActionsMenu.hidden = true;
+    traceMenuButton.setAttribute("aria-expanded", "false");
+  }
+
+  function toggleTraceActions() {
+    if (traceActionsMenu.hidden) openTraceActions();
+    else closeTraceActions();
   }
 
   async function initialize() {
@@ -458,8 +497,10 @@
     document.querySelector("#annotation-xiaxia-reply").textContent = annotation.xiaxia_response || "";
     document.querySelector("#xiaxia-thought-section").hidden = true;
     thoughtReplySection.hidden = true;
-    document.querySelector("#annotation-actions").hidden = false;
+    thoughtActions.hidden = true;
+    annotationActions.hidden = false;
     editAnnotationButton.textContent = annotation.comment ? "编辑" : "添加想法";
+    closeTraceActions();
     if (!annotationDialog.open) annotationDialog.showModal();
   }
 
@@ -477,7 +518,9 @@
     thoughtReplyText.textContent = thought.user_response || "（我还没有回复）";
     thoughtReplyButton.textContent = thought.user_response ? "编辑我的回复" : "回复林知夏";
     thoughtReplyDelete.hidden = !thought.user_response;
-    document.querySelector("#annotation-actions").hidden = true;
+    thoughtActions.hidden = false;
+    annotationActions.hidden = true;
+    closeTraceActions();
     if (!annotationDialog.open) annotationDialog.showModal();
   }
 
@@ -582,9 +625,9 @@
     const paginated = state.mode === "paginated";
     body.classList.toggle("reader-paginated", paginated);
     if (paginated) window.scrollTo({ top: 0, behavior: "auto" });
-    modeButton.textContent = paginated ? "滚动" : "分页";
+    modeButton.textContent = paginated ? "切换为滚动阅读" : "切换为分页阅读";
     modeButton.setAttribute("aria-label", paginated ? "切换到滚动阅读" : "切换到分页阅读");
-    pageStatus.hidden = !paginated;
+    hidePageStatus(true);
     updatePageControls();
   }
 
@@ -630,26 +673,27 @@
     return Number.parseFloat(getComputedStyle(content).columnGap) || 32;
   }
 
-  function goToPage(index, behavior = "smooth") {
+  function goToPage(index, behavior = "smooth", announce = false) {
     if (state.mode !== "paginated") return;
     state.pageIndex = utils.clamp(index, 0, state.pageCount - 1);
     content.scrollTo({ left: state.pageIndex * (content.clientWidth + pageGap()), top: 0, behavior });
     updatePageControls();
+    if (announce) showPageStatus();
     updateProgressIndicator();
   }
 
   async function turnPage(direction) {
     if (state.mode !== "paginated" || !state.loaded) return;
     if (direction === "next" && state.pageIndex < state.pageCount - 1) {
-      goToPage(state.pageIndex + 1);
+      goToPage(state.pageIndex + 1, "smooth", true);
     } else if (direction === "previous" && state.pageIndex > 0) {
-      goToPage(state.pageIndex - 1);
+      goToPage(state.pageIndex - 1, "smooth", true);
     } else if (direction === "next" && state.currentIndex < state.chapters.length - 1) {
       await loadChapter(state.currentIndex + 1);
-      goToPage(0, "auto");
+      goToPage(0, "auto", true);
     } else if (direction === "previous" && state.currentIndex > 0) {
       await loadChapter(state.currentIndex - 1);
-      goToPage(state.pageCount - 1, "auto");
+      goToPage(state.pageCount - 1, "auto", true);
     }
     delayedProgressSave();
   }
@@ -658,11 +702,33 @@
     const paginated = state.mode === "paginated";
     pagePrevious.hidden = !paginated;
     pageNext.hidden = !paginated;
-    pageStatus.hidden = !paginated;
-    if (!paginated) return;
+    if (!paginated) {
+      hidePageStatus(true);
+      return;
+    }
     pagePrevious.disabled = state.pageIndex === 0 && state.currentIndex === 0;
     pageNext.disabled = state.pageIndex >= state.pageCount - 1 && state.currentIndex >= state.chapters.length - 1;
     pageStatus.textContent = `${state.pageIndex + 1} / ${state.pageCount}`;
+  }
+
+  function showPageStatus() {
+    if (state.mode !== "paginated") return;
+    clearTimeout(pageStatusTimer);
+    clearTimeout(pageStatusHideTimer);
+    pageStatus.hidden = false;
+    requestAnimationFrame(() => pageStatus.classList.add("visible"));
+    pageStatusTimer = setTimeout(() => hidePageStatus(false), 1100);
+  }
+
+  function hidePageStatus(immediate = false) {
+    clearTimeout(pageStatusTimer);
+    clearTimeout(pageStatusHideTimer);
+    pageStatus.classList.remove("visible");
+    if (immediate) {
+      pageStatus.hidden = true;
+      return;
+    }
+    pageStatusHideTimer = setTimeout(() => { pageStatus.hidden = true; }, 260);
   }
 
   function pageForElement(element) {
@@ -944,7 +1010,10 @@
     noteDialog.close();
   });
   noteDialog.addEventListener("close", () => { state.editingAnnotationId = null; });
-  annotationDialog.addEventListener("close", () => { state.openRecord = null; });
+  annotationDialog.addEventListener("close", () => {
+    state.openRecord = null;
+    closeTraceActions();
+  });
   for (const button of document.querySelectorAll("[data-close-note]")) button.addEventListener("click", () => noteDialog.close());
   editAnnotationButton.addEventListener("click", () => state.openRecord?.kind === "user" && openEditAnnotation(state.openRecord.id));
   deleteAnnotationButton.addEventListener("click", deleteCurrentAnnotation);
@@ -954,12 +1023,24 @@
   nextButton.addEventListener("click", () => loadChapter(state.currentIndex + 1));
   pagePrevious.addEventListener("click", () => turnPage("previous"));
   pageNext.addEventListener("click", () => turnPage("next"));
-  modeButton.addEventListener("click", toggleReadingMode);
+  readerMenuButton.addEventListener("click", toggleReaderMenu);
+  traceMenuButton.addEventListener("click", toggleTraceActions);
+  modeButton.addEventListener("click", () => {
+    closeReaderMenu();
+    toggleReadingMode();
+  });
   document.querySelector("#font-down").addEventListener("click", () => changeFontSize(-1));
   document.querySelector("#font-up").addEventListener("click", () => changeFontSize(1));
-  tocButton.addEventListener("click", openToc);
+  tocButton.addEventListener("click", () => {
+    closeReaderMenu();
+    openToc();
+  });
   tocClose.addEventListener("click", closeToc);
   scrim.addEventListener("click", closeToc);
+  document.addEventListener("pointerdown", (event) => {
+    if (!readerMenu.hidden && !readerMenu.contains(event.target) && !readerMenuButton.contains(event.target)) closeReaderMenu();
+    if (!traceActionsMenu.hidden && !traceActionsMenu.contains(event.target) && !traceMenuButton.contains(event.target)) closeTraceActions();
+  });
 
   content.addEventListener("touchstart", (event) => {
     const touch = event.changedTouches[0];
@@ -973,6 +1054,18 @@
     if (direction) turnPage(direction);
   }, { passive: true });
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !readerMenu.hidden) {
+      event.preventDefault();
+      closeReaderMenu();
+      readerMenuButton.focus();
+      return;
+    }
+    if (event.key === "Escape" && !traceActionsMenu.hidden) {
+      event.preventDefault();
+      closeTraceActions();
+      traceMenuButton.focus();
+      return;
+    }
     if (state.mode !== "paginated" || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
     if (event.target.closest("input, textarea, dialog") || selectionIsActive()) return;
     if (event.key === "ArrowRight") { event.preventDefault(); turnPage("next"); }

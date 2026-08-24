@@ -9,19 +9,24 @@
 </head>
 <body class="reader-page" data-book-id="{{ book_id }}">
   <header class="reader-toolbar">
-    <div class="reader-nav-tools">
-      <a class="icon-button" href="{{ url_for('library_page') }}" aria-label="返回书架">←</a>
-      <button id="toc-button" class="icon-button" type="button" aria-label="打开目录" aria-expanded="false">☰</button>
-    </div>
+    <a class="icon-button reader-back" href="{{ url_for('library_page') }}" aria-label="返回书架">←</a>
     <div class="reader-heading">
       <strong id="reader-book-title">正在打开书籍…</strong>
       <span id="reader-chapter-title"></span>
     </div>
-    <div class="reader-utility-tools">
-      <button id="reading-mode" class="font-button" type="button" aria-label="切换分页或滚动模式">分页</button>
-      <a id="annotations-overview-link" class="font-button" href="{{ url_for('annotations_overview_page', book_id=book_id) }}" aria-label="划线与批注总览">批注</a>
-      <button id="font-down" class="font-button" type="button" aria-label="缩小字号">A−</button>
-      <button id="font-up" class="font-button" type="button" aria-label="放大字号">A＋</button>
+    <button id="reader-menu-button" class="icon-button reader-more-button" type="button" aria-label="打开阅读菜单" aria-expanded="false">···</button>
+    <div id="reader-menu" class="reader-menu" hidden>
+      <p class="reader-menu-title">书页旁的工具</p>
+      <button id="toc-button" class="reader-menu-item" type="button" aria-label="打开目录" aria-expanded="false">章节目录</button>
+      <button id="reading-mode" class="reader-menu-item" type="button" aria-label="切换分页或滚动模式">切换为分页阅读</button>
+      <a id="annotations-overview-link" class="reader-menu-item" href="{{ url_for('annotations_overview_page', book_id=book_id) }}" aria-label="划线与批注总览">书页痕迹</a>
+      <div class="reader-font-control" aria-label="字体大小">
+        <span>字体大小</span>
+        <div>
+          <button id="font-down" class="font-button" type="button" aria-label="缩小字号">A−</button>
+          <button id="font-up" class="font-button" type="button" aria-label="放大字号">A＋</button>
+        </div>
+      </div>
     </div>
   </header>
 
@@ -41,8 +46,8 @@
     <article id="chapter-content" class="chapter-content" tabindex="-1" aria-live="polite">
       <p class="reader-loading">正在翻到上次读过的地方…</p>
     </article>
-    <button id="page-previous" class="page-turn page-turn-previous" type="button" aria-label="上一页">‹</button>
-    <button id="page-next" class="page-turn page-turn-next" type="button" aria-label="下一页">›</button>
+    <button id="page-previous" class="page-turn page-turn-previous" type="button" aria-label="上一页"><span aria-hidden="true">‹</span></button>
+    <button id="page-next" class="page-turn page-turn-next" type="button" aria-label="下一页"><span aria-hidden="true">›</span></button>
     <div id="page-status" class="page-status" hidden aria-live="polite"></div>
     <nav class="chapter-navigation" aria-label="章节导航">
       <button id="previous-chapter" type="button">← 上一章</button>
@@ -51,9 +56,10 @@
     </nav>
   </main>
 
-  <div id="selection-menu" class="selection-menu" hidden>
-    <button id="highlight-selection" type="button">划线</button>
-    <button id="note-selection" type="button">写想法</button>
+  <div id="selection-menu" class="selection-menu" role="toolbar" aria-label="选中文字后的操作" hidden>
+    <span class="selection-pencil" aria-hidden="true">✎</span>
+    <button id="highlight-selection" type="button">只划线</button>
+    <button id="note-selection" type="button">留一句</button>
   </div>
 
   <dialog id="note-dialog" class="note-dialog">
@@ -76,32 +82,37 @@
     <form id="annotation-view-form" method="dialog">
       <div class="dialog-heading">
         <p id="annotation-kind" class="eyebrow">书页旁</p>
-        <button class="icon-button" value="close" aria-label="关闭">×</button>
+        <div class="sheet-heading-actions">
+          <button id="trace-menu-button" class="icon-button" type="button" aria-label="管理这条阅读痕迹" aria-expanded="false">···</button>
+          <button class="icon-button" value="close" aria-label="收起批注纸">×</button>
+        </div>
       </div>
       <blockquote id="annotation-quote"></blockquote>
       <section id="user-note-section">
-        <h3>我</h3>
+        <h3>🐶 张超</h3>
         <p id="annotation-user-note"></p>
       </section>
       <section id="xiaxia-reply-section">
-        <h3>林知夏的回复</h3>
+        <h3>🐱 林知夏</h3>
         <p id="annotation-xiaxia-reply"></p>
       </section>
       <section id="xiaxia-thought-section">
-        <h3>林知夏的独立想法</h3>
+        <h3>🐱 林知夏</h3>
         <p id="annotation-xiaxia-thought"></p>
       </section>
       <section id="thought-user-reply-section" hidden>
-        <h3>我的回复</h3>
+        <h3>🐶 张超</h3>
         <p id="thought-user-reply"></p>
-        <div class="dialog-actions">
+      </section>
+      <div id="trace-actions-menu" class="trace-actions-menu" hidden>
+        <div id="thought-actions" class="trace-action-group" hidden>
           <button id="thought-reply-delete" class="danger-button" type="button">删除回复</button>
           <button id="thought-reply-edit" class="secondary-button" type="button">回复林知夏</button>
         </div>
-      </section>
-      <div id="annotation-actions" class="dialog-actions">
-        <button id="delete-annotation" class="danger-button" type="button">删除</button>
-        <button id="edit-annotation" class="secondary-button" type="button">编辑</button>
+        <div id="annotation-actions" class="trace-action-group">
+          <button id="edit-annotation" class="secondary-button" type="button">编辑</button>
+          <button id="delete-annotation" class="danger-button" type="button">删除</button>
+        </div>
       </div>
     </form>
   </dialog>

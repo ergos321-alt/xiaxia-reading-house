@@ -71,3 +71,25 @@ def test_reader_keeps_exact_anchor_for_both_scroll_and_pagination_jump():
     assert "pageForElement(target)" in source
     assert "getBoundingClientRect().top + window.scrollY" in source
     assert "selected_text" in source  # fallback only when exact coordinates fail
+
+
+def test_reader_ui_refresh_keeps_navigation_and_actions_on_existing_controls():
+    source = READER.read_text(encoding="utf-8")
+    template = (ROOT / "templates/reader.html").read_text(encoding="utf-8")
+
+    for control_id in (
+        "reading-mode",
+        "toc-button",
+        "font-down",
+        "font-up",
+        "edit-annotation",
+        "delete-annotation",
+        "thought-reply-edit",
+        "thought-reply-delete",
+    ):
+        assert f'id="{control_id}"' in template
+    assert 'readerMenuButton.addEventListener("click", toggleReaderMenu)' in source
+    assert 'traceMenuButton.addEventListener("click", toggleTraceActions)' in source
+    assert 'pageStatusTimer = setTimeout(() => hidePageStatus(false), 1100)' in source
+    assert 'modeButton.addEventListener("click"' in source
+    assert 'tocButton.addEventListener("click"' in source
