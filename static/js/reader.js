@@ -5,6 +5,7 @@
   const body = document.body;
   const bookId = body.dataset.bookId;
   const content = document.querySelector("#chapter-content");
+  const readerShell = document.querySelector(".reader-shell");
   const bookTitle = document.querySelector("#reader-book-title");
   const chapterTitle = document.querySelector("#reader-chapter-title");
   const chapterPosition = document.querySelector("#chapter-position");
@@ -63,6 +64,7 @@
     pageIndex: 0,
     pageCount: 1,
     menuInteracting: false,
+    selectionSubmitting: false,
     selectionTimers: [],
     touchStart: null,
     target: {
@@ -357,7 +359,11 @@
 
   function scheduleSelectionCapture(delays = [120, 320, 620]) {
     for (const timer of state.selectionTimers) clearTimeout(timer);
-    state.selectionTimers = delays.map((delay) => setTimeout(captureSelection, delay));
+    state.selectionTimers = [];
+    if (state.selectionSubmitting) return;
+    state.selectionTimers = delays.map((delay) => setTimeout(() => {
+      if (!state.selectionSubmitting) captureSelection();
+    }, delay));
   }
 
   function captureSelection() {
@@ -429,20 +435,35 @@
     if (clearSaved) state.savedSelection = null;
   }
 
+  function clearSelectionInteraction() {
+    for (const timer of state.selectionTimers) clearTimeout(timer);
+    state.selectionTimers = [];
+    window.getSelection()?.removeAllRanges();
+    hideSelectionMenu(true);
+    selectionMenu.removeAttribute("data-placement");
+    selectionMenu.style.removeProperty("left");
+    selectionMenu.style.removeProperty("top");
+    selectionMenu.style.removeProperty("bottom");
+    state.menuInteracting = false;
+    state.selectionSubmitting = false;
+  }
+
   async function saveAnnotation(comment = "") {
     if (!state.savedSelection) return;
+    const selectionSnapshot = { ...state.savedSelection };
+    state.selectionSubmitting = true;
     hideSelectionMenu();
     try {
       const { annotation } = await api("/api/annotations", {
         method: "POST",
-        body: JSON.stringify({ ...state.savedSelection, comment }),
+        body: JSON.stringify({ ...selectionSnapshot, comment }),
       });
       state.annotations.push(annotation);
-      window.getSelection()?.removeAllRanges();
-      state.savedSelection = null;
+      clearSelectionInteraction();
       await refreshAnnotationMarks();
       showToast(comment ? "批注已经留在书页旁。" : "划线已经保存。");
     } catch (error) {
+      state.selectionSubmitting = false;
       showToast(`保存失败：${error.message}`);
     }
   }
@@ -649,6 +670,7 @@
 
   async function recalculatePages(anchor = null) {
     if (state.mode !== "paginated" || !state.loaded) {
+      body.style.removeProperty("--reader-viewport-height");
       content.style.removeProperty("--reader-column-width");
       content.style.removeProperty("--pagination-height");
       state.pageCount = 1;
@@ -658,12 +680,26 @@
       return;
     }
     const visual = window.visualViewport;
-    const viewportHeight = visual?.height || window.innerHeight;
+    const viewportHeight = Math.min(
+      Number(window.innerHeight) || Number(visual?.height) || 1,
+      Number(visual?.height) || Number(window.innerHeight) || 1,
+    );
     const viewportTop = visual?.offsetTop || 0;
-    const top = content.getBoundingClientRect().top - viewportTop;
-    const availableHeight = Math.max(240, viewportHeight - top - 60);
+    body.style.setProperty("--reader-viewport-height", `${viewportHeight}px`);
+    await nextFrame(1);
+    const shellRect = readerShell.getBoundingClientRect();
+    const contentRect = content.getBoundingClientRect();
+    const shellStyle = getComputedStyle(readerShell);
+    const availableHeight = utils.calculatePaginationHeight({
+      viewportTop,
+      viewportHeight,
+      contentTop: contentRect.top,
+      shellBottom: shellRect.bottom,
+      shellPaddingBottom: Number.parseFloat(shellStyle.paddingBottom) || 0,
+      guard: 10,
+    });
     content.style.setProperty("--pagination-height", `${availableHeight}px`);
-    content.style.setProperty("--reader-column-width", `${content.clientWidth}px`);
+    content.style.setProperty("--reader-column-width", `${Math.floor(contentRect.width)}px`);
     await nextFrame(2);
     const gap = pageGap();
     state.pageCount = utils.calculatePageCount(content.scrollWidth, content.clientWidth, gap);
@@ -679,7 +715,9 @@
   function goToPage(index, behavior = "smooth", announce = false) {
     if (state.mode !== "paginated") return;
     state.pageIndex = utils.clamp(index, 0, state.pageCount - 1);
-    content.scrollTo({ left: state.pageIndex * (content.clientWidth + pageGap()), top: 0, behavior });
+    const left = state.pageIndex * (content.clientWidth + pageGap());
+    if (behavior === "auto") content.scrollLeft = left;
+    else content.scrollTo({ left, top: 0, behavior });
     updatePageControls();
     if (announce) showPageStatus();
     updateProgressIndicator();
@@ -1109,7 +1147,10 @@
     if (!selectionIsActive()) hideSelectionMenu();
   }, { passive: true });
   window.addEventListener("resize", delayedResize, { passive: true });
+  window.addEventListener("orientationchange", delayedResize, { passive: true });
   window.visualViewport?.addEventListener("resize", delayedResize, { passive: true });
+  if (document.fonts?.ready) document.fonts.ready.then(delayedResize);
+  document.fonts?.addEventListener?.("loadingdone", delayedResize);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") saveProgress(true);
   });

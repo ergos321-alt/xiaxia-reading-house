@@ -4,7 +4,9 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import memories
+import reading
 from app import create_app
+from psycopg.errors import UndefinedTable
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -237,6 +239,7 @@ def test_completion_endpoint_requires_final_chapter_and_near_full_progress(monke
     response = web_client().post(f"/api/books/{BOOK_ID}/completion")
     assert response.status_code == 409
     assert response.get_json()["error"] == "book_not_at_end"
+    assert response.get_json()["message"] == "尚未读到最后一章末尾。"
 
 
 def test_completion_endpoint_marks_shared_only_when_both_are_complete(monkeypatch):
@@ -295,6 +298,240 @@ def test_completion_endpoint_marks_shared_only_when_both_are_complete(monkeypatc
     }
 
 
+def test_real_request_order_progress_completion_and_back_cover_is_closed(monkeypatch):
+    class FlowDatabase:
+        def __init__(self):
+            self.progress = None
+            self.state = {
+                "book_id": BOOK_ID,
+                "user_completed_at": None,
+                "xiaxia_completed_at": NOW,
+                "shared_completed_at": None,
+                "reflections_revealed_at": None,
+            }
+
+        def execute(self, query, params=()):
+            normalized = " ".join(query.split())
+            if "insert into reading_progress" in normalized:
+                self.progress = {
+                    "chapter_id": params[1],
+                    "chapter_index": params[2],
+                    "position": {
+                        "block_id": "b000002",
+                        "display_mode": "paginated",
+                        "page_index": 4,
+                        "page_count": 5,
+                    },
+                    "percentage": float(params[4]),
+                    "updated_at": NOW,
+                }
+                return self.progress
+            if "insert into reading_memory_events" in normalized:
+                return {"id": uuid4()}
+            raise AssertionError(normalized)
+
+        def fetch_one(self, query, _params=()):
+            normalized = " ".join(query.split())
+            if "select id from chapters" in normalized:
+                return {"id": CHAPTER_ID}
+            if "from books where id" in normalized:
+                return {
+                    "id": BOOK_ID,
+                    "title": "闭环测试书",
+                    "author": "测试作者",
+                    "cover_asset_path": None,
+                    "chapter_count": 1,
+                    "created_at": NOW,
+                }
+            raise AssertionError(normalized)
+
+        def fetch_all(self, query, _params=()):
+            normalized = " ".join(query.split())
+            if any(
+                table in normalized
+                for table in (
+                    "from annotations",
+                    "from xiaxia_thoughts",
+                    "from book_reflections",
+                    "from reading_letters",
+                    "from reading_memory_events",
+                )
+            ):
+                return []
+            raise AssertionError(normalized)
+
+        @contextmanager
+        def transaction(self):
+            database = self
+
+            class Connection:
+                def execute(self, query, params=()):
+                    normalized = " ".join(query.split())
+                    if "from reading_progress rp" in normalized:
+                        return Cursor(
+                            {
+                                **database.progress,
+                                "chapter_count": 1,
+                            }
+                        )
+                    if "insert into book_memory_state" in normalized:
+                        return Cursor(database.state)
+                    if "set user_completed_at" in normalized:
+                        database.state["user_completed_at"] = NOW
+                        return Cursor()
+                    if "select b.chapter_count" in normalized:
+                        return Cursor(
+                            {
+                                "chapter_count": 1,
+                                "completed_count": 1,
+                                "latest_completed_at": NOW,
+                            }
+                        )
+                    if "set xiaxia_completed_at" in normalized:
+                        database.state["xiaxia_completed_at"] = NOW
+                        return Cursor()
+                    if "set shared_completed_at" in normalized:
+                        database.state["shared_completed_at"] = NOW
+                        return Cursor()
+                    if "select * from book_memory_state" in normalized:
+                        return Cursor(database.state)
+                    if "insert into reading_memory_events" in normalized:
+                        return Cursor()
+                    raise AssertionError(normalized)
+
+            yield Connection()
+
+    database = FlowDatabase()
+    monkeypatch.setattr(reading.db, "execute", database.execute)
+    monkeypatch.setattr(reading.db, "fetch_one", database.fetch_one)
+    monkeypatch.setattr(reading.db, "fetch_all", database.fetch_all)
+    monkeypatch.setattr(reading.db, "transaction", database.transaction)
+
+    client = web_client()
+    progress = client.put(
+        f"/api/books/{BOOK_ID}/progress",
+        json={
+            "chapter_id": str(CHAPTER_ID),
+            "chapter_index": 0,
+            "position": {
+                "block_id": "b000002",
+                "char_offset": 0,
+                "scroll_fraction": 1,
+                "display_mode": "paginated",
+                "page_index": 4,
+                "page_count": 5,
+            },
+            "percentage": 100,
+        },
+    )
+    assert progress.status_code == 200
+
+    completion = client.post(f"/api/books/{BOOK_ID}/completion")
+    assert completion.status_code == 200
+    assert completion.get_json()["completion"]["shared_completed"] is True
+
+    cover = client.get(f"/api/books/{BOOK_ID}/back-cover")
+    assert cover.status_code == 200
+    payload = cover.get_json()
+    assert payload["access_state"] == "open"
+    assert payload["memory_state"] == "waiting_for_user_reflection"
+    assert payload["stamp"] == {
+        "visible": True,
+        "text": "一起读过",
+        "completed_month": "2026.08",
+        "completed_date": "2026.08.24",
+    }
+
+
+def test_unapplied_v2_migration_is_actionable_and_does_not_break_v1_progress(monkeypatch):
+    def missing_table(*_args, **_kwargs):
+        raise UndefinedTable("relation reading_memory_events does not exist")
+
+    monkeypatch.setattr(memories.db, "fetch_one", missing_table)
+    response = web_client().get(f"/api/books/{BOOK_ID}/back-cover")
+    assert response.status_code == 503
+    assert response.get_json() == {
+        "error": "v2_migration_required",
+        "message": "读完以后所需的数据表尚未就绪，请先执行 005_v2_reading_memories.sql。",
+        "migration": "migrations/005_v2_reading_memories.sql",
+    }
+
+    monkeypatch.setattr(memories.db, "execute", missing_table)
+    with make_app().app_context():
+        memories.record_user_progress_milestone(BOOK_ID, CHAPTER_ID, 100, NOW)
+
+        @contextmanager
+        def missing_v2_transaction():
+            raise UndefinedTable("relation ai_chapter_completions does not exist")
+            yield
+
+        monkeypatch.setattr(memories.db, "transaction", missing_v2_transaction)
+        memories.record_ai_chapter_completion(
+            BOOK_ID, CHAPTER_ID, f"{CHAPTER_ID}:0", "b000002", NOW
+        )
+
+
+def test_progress_http_response_survives_missing_v2_timeline_table(monkeypatch):
+    monkeypatch.setattr(reading.db, "fetch_one", lambda *_args, **_kwargs: {"id": CHAPTER_ID})
+
+    def execute(query, _params=()):
+        if "insert into reading_progress" in query:
+            return {
+                "chapter_id": CHAPTER_ID,
+                "chapter_index": 0,
+                "position": {"block_id": "b000002", "display_mode": "paginated"},
+                "percentage": 100.0,
+                "updated_at": NOW,
+            }
+        if "insert into reading_memory_events" in query:
+            raise UndefinedTable("relation reading_memory_events does not exist")
+        raise AssertionError(query)
+
+    monkeypatch.setattr(reading.db, "execute", execute)
+    response = web_client().put(
+        f"/api/books/{BOOK_ID}/progress",
+        json={
+            "chapter_id": str(CHAPTER_ID),
+            "chapter_index": 0,
+            "position": {
+                "block_id": "b000002",
+                "char_offset": 0,
+                "scroll_fraction": 1,
+                "display_mode": "paginated",
+                "page_index": 4,
+                "page_count": 5,
+            },
+            "percentage": 100,
+        },
+    )
+    assert response.status_code == 200
+    assert response.get_json()["progress"]["percentage"] == 100.0
+
+
+def test_stamp_and_back_cover_business_states_are_explicit():
+    stamp = memories._stamp_payload({"shared_completed_at": NOW})
+    assert stamp == {
+        "visible": True,
+        "text": "一起读过",
+        "completed_month": "2026.08",
+        "completed_date": "2026.08.24",
+    }
+    completion = {"shared_completed": False}
+    reflections = {
+        "revealed": False,
+        "user": {"submitted": False},
+        "xiaxia": {"submitted": False},
+    }
+    assert memories._memory_state(completion, reflections, "user") == "waiting_for_xiaxia_completion"
+    completion["shared_completed"] = True
+    assert memories._memory_state(completion, reflections, "user") == "waiting_for_user_reflection"
+    reflections["user"]["submitted"] = True
+    assert memories._memory_state(completion, reflections, "user") == "waiting_for_xiaxia_reflection"
+    reflections["xiaxia"]["submitted"] = True
+    reflections["revealed"] = True
+    assert memories._memory_state(completion, reflections, "user") == "reflections_revealed"
+
+
 def test_v2_web_and_xiaxia_identity_boundaries_are_separate():
     client = make_app().test_client()
     assert client.get(f"/reader/{BOOK_ID}/after-reading").status_code == 302
@@ -343,3 +580,5 @@ def test_v2_reader_and_back_cover_ui_keep_existing_anchor_model():
         assert field in memory_js
     for section in ("reading-stamp", "shared-stops-list", "user-reflection-form", "user-letter-form", "memory-timeline"):
         assert f'id="{section}"' in memory_template
+    assert "stamp?.completed_date || stamp?.completed_month" in memory_js
+    assert "waiting_for_xiaxia_completion" in memory_js

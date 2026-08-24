@@ -15,6 +15,21 @@
     return Math.max(1, Math.ceil((Number(scrollWidth) + Number(gap || 0)) / pageSpan));
   }
 
+  function calculatePaginationHeight({
+    viewportTop = 0,
+    viewportHeight,
+    contentTop,
+    shellBottom,
+    shellPaddingBottom = 0,
+    bottomInset = 0,
+    guard = 10,
+  }) {
+    const viewportBottom = Number(viewportTop) + Number(viewportHeight) - Number(bottomInset);
+    const shellContentBottom = Number(shellBottom) - Number(shellPaddingBottom);
+    const availableBottom = Math.min(viewportBottom, shellContentBottom);
+    return Math.max(1, Math.floor(availableBottom - Number(contentTop) - Number(guard)));
+  }
+
   function selectionMenuPosition({ rect, viewport, mobile, menuWidth = 180, menuHeight = 50, toolbarBottom = 76, margin = 12 }) {
     const viewportLeft = Number(viewport.offsetLeft || 0);
     const viewportTop = Number(viewport.offsetTop || 0);
@@ -74,5 +89,12 @@
     return JSON.stringify([user, xiaxia]);
   }
 
-  return { clamp, calculatePageCount, selectionMenuPosition, swipeDirection, syncSignature };
+  return {
+    clamp,
+    calculatePageCount,
+    calculatePaginationHeight,
+    selectionMenuPosition,
+    swipeDirection,
+    syncSignature,
+  };
 });

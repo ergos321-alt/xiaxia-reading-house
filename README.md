@@ -106,7 +106,7 @@ xiaxia-reading-house/
 
 `004` 是可重复执行的 V1.1 增量事务。`005` 也是可重复执行的增量事务，只新增 V2 表、索引、触发器、RLS 和保守里程碑回填：它不会删除或改写现有 books、chapters、progress、annotations、Thought、Reply 或 Storage metadata。不要重新运行 `schema.sql` 代替 migration。
 
-`005` 只把现有 `percentage=100` 的用户进度认作已完成；林知夏方面只回填旧 checkpoint 能证明的那一个已完成章节，不会用“最后一次停在末章”冒充读完整本。后续每个 `chapter_completed=true` 的最终 chunk 会写入 `ai_chapter_completions`，只有真实章节全部齐全才标记整本完成。
+`005` 只把现有 `percentage=100` 的用户进度认作已完成；林知夏方面只回填旧 checkpoint 能证明的那一个已完成章节，不会用“最后一次停在末章”冒充读完整本。后续每个 `chapter_completed=true` 的最终 chunk 会写入 `ai_chapter_completions`，只有真实章节全部齐全才标记整本完成。若封底 API 返回 `v2_migration_required`，表示部署代码已更新但此 migration 尚未成功提交；既有用户/AI 进度仍会保存，执行 `005` 后重新访问即可，不要清库或重跑 `schema.sql`。
 
 ### 仍是最早的 bytea 版
 
@@ -238,8 +238,15 @@ Schema 采用 Actions 兼容的保守写法：路径参数在每个 operation �
 - 共同停留处不建立易漂移的结果表。读取时直接使用现有用户 annotation 与 `scope=range/block` 的 Xiaxia Thought，在同一章节的同源 `block_id + offsets` 上按“完全相同 → 范围重叠 → 同一 block”匹配并聚合；chapter Thought 和双方 Reply 不参与。跳回正文仍传原 `chapter_id + annotation_id`。
 - `reading_letters` 分开保存 user→xiaxia 与 xiaxia→user，双方整本完成后才可写入或查看。它是每方一封可继续修改的信纸，不是聊天流。
 - `reading_memory_events` 只记录开始阅读、第一次共同停留、共同完成、第一次打开封底；Thought/Reply 的增删改和 Undo 不会进入时间线。
-- 共读印章只在 `shared_completed_at` 存在时出现在封底，月份直接来自共同完成时间；不进入正文，不作为徽章或成就。
+- 共读印章只在 `shared_completed_at` 存在时出现在封底，日期直接来自共同完成时间；不进入正文，不作为徽章或成就。
 - 删除书籍仍先清理该书私有 Storage 对象，再删除 `books`。V2 五张表都通过 `book_id ON DELETE CASCADE` 接入现有数据库清理，不会留下记忆孤儿数据。
+
+### V2 首轮验收修复
+
+- 最后一页入口仍先调用既有进度 API，再调用完成 API。V2 稀疏时间线是附加能力：表未就绪时不再连带回滚已经验收的用户/Xiaxia checkpoint；封底接口会以 `503 + v2_migration_required + migration` 明确指出缺少 `005`，不再退化为 `internal_server_error`。
+- 封底响应增加 `memory_state`，明确区分等待林知夏完成、等待任一方最终评价及双方评价已揭示；原有字段保持不变。双方整本完成后原子产生 `shared_completed_at`，印章立即按该日期显示。
+- Android 创建纯划线或带想法的 annotation 成功后，会取消所有延迟 Selection 捕获、清除浏览器 Selection、清空已冻结 snapshot 并移除浮动纸签定位样式；失败时仍保留 snapshot 供重试，稳定 anchor 不变。
+- 分页高度改为 `visualViewport` 与书页容器实际 content box 的交集，不再使用固定 `-60px`。iPad/PC 会在 resize、横竖屏切换、WebFont 加载完成及章节图片加载后重排，并预留行尾保护空间；仍使用同一份章节 DOM 与 block ID。
 
 ### Preview → Commit 与 Undo
 
@@ -254,7 +261,7 @@ Schema 采用 Actions 兼容的保守写法：路径参数在每个 operation �
 ## 阅读器与定位
 
 - 滚动模式保持原有整章连续阅读。
-- 分页模式只用 CSS columns/viewport 布局同一份章节 DOM；没有切碎或重建 publisher block，因此稳定 block ID 和字符 offsets 不变。
+- 分页模式只用 CSS columns/viewport 布局同一份章节 DOM；没有切碎或重建 publisher block，因此稳定 block ID 和字符 offsets 不变。可用高度来自可视 viewport 与 reader shell 内容区的实测交集，并为 WebKit 行盒预留少量安全空间。
 - 手机使用左右滑动与两侧点击按钮；桌面使用两侧按钮和方向键。viewport、字号、图片加载或方向变化后动态重算页数。
 - 切换模式、重新分页和后台批注同步前先记录可见 block；之后用同一 block 恢复滚动位置或计算其所在页。
 - 用户进度继续保存 block_id、char_offset、scroll_fraction，并附带 display_mode、page_index/page_count；恢复优先使用稳定 block。
@@ -270,6 +277,7 @@ Schema 采用 Actions 兼容的保守写法：路径参数在每个 operation �
 4. 粗指针设备不再固定在底部：优先放到 Selection Range 下方并留出原生手柄间距；空间不足时移到选区上方，最后才在 `visualViewport` 内夹取安全位置。软键盘、工具栏、滚动或横竖屏改变 viewport 时重新定位。
 5. 自定义按钮 `pointerdown` 发生时再次冻结 selection snapshot，然后阻止焦点切换清空原生 Selection；真正写入仍使用已冻结的稳定 block/offset，而不是临时 selected text 搜索。
 6. 有活动 Selection、批注编辑窗口或菜单交互时，12 秒轮询不更新 marks，避免后台同步破坏选择。
+7. 保存成功后统一执行 Selection 收尾：取消仍在排队的 Android 延迟捕获、`removeAllRanges()`、隐藏并复位浮动纸签，再恢复正常阅读；创建请求始终使用按钮点击前冻结的 snapshot。
 
 这部分包含可自动测试的定位、滑动、分页和同步 helper 测试，但仓库交付环境不等同真实 Android 设备；必须按下文执行实机验收。
 
@@ -335,12 +343,19 @@ ruff check .
 9. 检查共同停留处的 exact、范围重叠与同一段落案例，点击“回到这一页”，确认仍由原 annotation anchor 精确跳回。
 10. 双方完成后分别保存两封读后信，刷新确认持久化；确认印章仅在封底出现，时间线没有 Thought/Reply CRUD 日志。
 
+### iPad Safari / WebKit
+
+1. 在竖屏与横屏分别打开长章节分页模式，逐页确认最后一行完整显示，正文不会在仍有空白时被裁切。
+2. 改变字号、切换分屏宽度并旋转设备，确认重排后仍停留在同一稳定 block 附近。
+3. 等待页面字体与章节图片完成加载，再翻到后续页面，确认页数已经自动更新。
+4. 在重排后的页面创建划线、打开 Thought 与 Reply，刷新后确认 anchor、页码和阅读进度均可恢复。
+
 ### Android Chrome
 
 1. 使用真实 Android Chrome 登录并打开一章，分别在滚动和分页模式操作。
 2. 长按正文、拖动选择手柄；确认系统“复制/分享/全选/网页搜索”等菜单仍可使用。
 3. 保持选择，确认 Reading House 的“划线/写想法”入口显示在选区附近，并会在空间不足时切换到另一侧，而不是固定在底部。
-4. 分别保存纯划线和带批注；打开软键盘后重复测试，确认入口与对话框不被遮挡。
+4. 分别保存纯划线和带批注；每次保存成功后确认浏览器 Selection 与浮动操作纸签都立即消失，可以继续阅读。打开软键盘后重复测试，确认入口与对话框不被遮挡。
 5. 点击纯划线补写 comment、编辑、删除；刷新后检查精确位置。
 6. 左右滑动和点击翻页，跨页选择可选文本，并检查保存/恢复位置。
 7. 保持文本 Selection 至少 15 秒，确认后台轮询不清除当前选择。

@@ -8,7 +8,8 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from flask import Blueprint, jsonify, render_template, request, url_for
+from flask import Blueprint, current_app, jsonify, render_template, request, url_for
+from psycopg.errors import UndefinedColumn, UndefinedTable
 from psycopg.types.json import Jsonb
 
 import database as db
@@ -25,6 +26,23 @@ MEMORY_EVENT_LABELS = {
     "completed_reading": "我们一起读完了这本书",
     "back_cover_opened": "第一次打开封底",
 }
+
+
+@memories_bp.errorhandler(UndefinedTable)
+@memories_bp.errorhandler(UndefinedColumn)
+def memory_schema_unavailable(error):
+    """Turn an unapplied V2 migration into an actionable business response."""
+    current_app.logger.error("V2 reading-memory schema is unavailable: %s", error)
+    return (
+        jsonify(
+            {
+                "error": "v2_migration_required",
+                "message": "读完以后所需的数据表尚未就绪，请先执行 005_v2_reading_memories.sql。",
+                "migration": "migrations/005_v2_reading_memories.sql",
+            }
+        ),
+        503,
+    )
 
 
 @memories_bp.get("/reader/<uuid:book_id>/after-reading")
@@ -90,8 +108,16 @@ def complete_book_for_user(book_id: UUID):
         ).fetchone()
         if not progress:
             if not conn.execute("select id from books where id = %s", (book_id,)).fetchone():
-                return jsonify({"error": "book_not_found"}), 404
-            return jsonify({"error": "reading_progress_not_found"}), 409
+                return jsonify({"error": "book_not_found", "message": "没有找到这本书。"}), 404
+            return (
+                jsonify(
+                    {
+                        "error": "reading_progress_not_found",
+                        "message": "还没有可用于完成本书的阅读进度。",
+                    }
+                ),
+                409,
+            )
         final_index = max(0, int(progress["chapter_count"]) - 1)
         if (
             int(progress["chapter_index"]) != final_index
@@ -101,6 +127,7 @@ def complete_book_for_user(book_id: UUID):
                 jsonify(
                     {
                         "error": "book_not_at_end",
+                        "message": "尚未读到最后一章末尾。",
                         "required_chapter_index": final_index,
                         "current_percentage": float(progress["percentage"]),
                     }
@@ -155,16 +182,20 @@ def record_user_progress_milestone(
     """Record only the first meaningful progress write, never routine saves."""
     if percentage <= 0:
         return
-    db.execute(
-        """
-        insert into reading_memory_events (
-            book_id, event_type, actor, chapter_id, dedupe_key, happened_at
-        ) values (%s, 'started_reading', 'user', %s, 'book', coalesce(%s, now()))
-        on conflict (book_id, event_type, dedupe_key) do nothing
-        returning id
-        """,
-        (book_id, chapter_id, happened_at),
-    )
+    try:
+        db.execute(
+            """
+            insert into reading_memory_events (
+                book_id, event_type, actor, chapter_id, dedupe_key, happened_at
+            ) values (%s, 'started_reading', 'user', %s, 'book', coalesce(%s, now()))
+            on conflict (book_id, event_type, dedupe_key) do nothing
+            returning id
+            """,
+            (book_id, chapter_id, happened_at),
+        )
+    except (UndefinedTable, UndefinedColumn) as error:
+        # V2 timeline recording must never make the established V1 progress API fail.
+        current_app.logger.warning("Skipped V2 user milestone before migration: %s", error)
 
 
 def record_ai_chapter_completion(
@@ -175,30 +206,35 @@ def record_ai_chapter_completion(
     happened_at: datetime | None = None,
 ) -> None:
     """Persist a verified final-chunk checkpoint and refresh book completion."""
-    with db.transaction() as conn:
-        chapter = conn.execute(
-            "select id from chapters where id = %s and book_id = %s",
-            (chapter_id, book_id),
-        ).fetchone()
-        if not chapter:
-            return
-        _ensure_state(conn, book_id)
-        conn.execute(
-            """
-            insert into ai_chapter_completions (
-                book_id, chapter_id, last_chunk_id, last_block_id, completed_at
-            ) values (%s, %s, %s, %s, coalesce(%s, now()))
-            on conflict (book_id, chapter_id) do update set
-                last_chunk_id = excluded.last_chunk_id,
-                last_block_id = excluded.last_block_id,
-                completed_at = least(
-                    ai_chapter_completions.completed_at, excluded.completed_at
-                )
-            """,
-            (book_id, chapter_id, chunk_id, last_block_id, happened_at),
-        )
-        _refresh_ai_completion(conn, book_id)
-        _refresh_shared_completion(conn, book_id)
+    try:
+        with db.transaction() as conn:
+            chapter = conn.execute(
+                "select id from chapters where id = %s and book_id = %s",
+                (chapter_id, book_id),
+            ).fetchone()
+            if not chapter:
+                return
+            _ensure_state(conn, book_id)
+            conn.execute(
+                """
+                insert into ai_chapter_completions (
+                    book_id, chapter_id, last_chunk_id, last_block_id, completed_at
+                ) values (%s, %s, %s, %s, coalesce(%s, now()))
+                on conflict (book_id, chapter_id) do update set
+                    last_chunk_id = excluded.last_chunk_id,
+                    last_block_id = excluded.last_block_id,
+                    completed_at = least(
+                        ai_chapter_completions.completed_at, excluded.completed_at
+                    )
+                """,
+                (book_id, chapter_id, chunk_id, last_block_id, happened_at),
+            )
+            _refresh_ai_completion(conn, book_id)
+            _refresh_shared_completion(conn, book_id)
+    except (UndefinedTable, UndefinedColumn) as error:
+        # The V2 completion ledger is additive; an unapplied migration must not
+        # roll back the already verified Xiaxia checkpoint written by V1.1.
+        current_app.logger.warning("Skipped V2 Xiaxia completion before migration: %s", error)
 
 
 def _back_cover_response(book_id: UUID, perspective: str):
@@ -270,6 +306,7 @@ def _back_cover_response(book_id: UUID, perspective: str):
         "timeline": [_event_payload(row) for row in events],
         "stamp": _stamp_payload(state),
     }
+    payload["memory_state"] = _memory_state(payload["completion"], payload["reflections"], perspective)
     response = jsonify(payload)
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -552,7 +589,24 @@ def _stamp_payload(state: dict[str, Any]) -> dict[str, Any]:
         "visible": completed_at is not None,
         "text": "一起读过",
         "completed_month": completed_at.strftime("%Y.%m") if completed_at else None,
+        "completed_date": completed_at.strftime("%Y.%m.%d") if completed_at else None,
     }
+
+
+def _memory_state(
+    completion: dict[str, Any], reflections: dict[str, Any], perspective: str
+) -> str:
+    if not completion.get("shared_completed"):
+        counterpart = "xiaxia" if perspective == "user" else "user"
+        return f"waiting_for_{counterpart}_completion"
+    if reflections.get("revealed"):
+        return "reflections_revealed"
+    if not reflections.get(perspective, {}).get("submitted"):
+        return f"waiting_for_{perspective}_reflection"
+    counterpart = "xiaxia" if perspective == "user" else "user"
+    if not reflections.get(counterpart, {}).get("submitted"):
+        return f"waiting_for_{counterpart}_reflection"
+    return "waiting_for_reflection_reveal"
 
 
 def _event_payload(row: dict[str, Any]) -> dict[str, Any]:

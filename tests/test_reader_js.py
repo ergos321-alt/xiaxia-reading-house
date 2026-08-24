@@ -18,6 +18,22 @@ const assert = require('assert');
 const utils = require({json.dumps(str(UTILS))});
 assert.strictEqual(utils.calculatePageCount(700, 700, 32), 1);
 assert.strictEqual(utils.calculatePageCount(1432, 700, 32), 2);
+assert.strictEqual(utils.calculatePaginationHeight({{
+  viewportTop: 0,
+  viewportHeight: 900,
+  contentTop: 122,
+  shellBottom: 900,
+  shellPaddingBottom: 48,
+  guard: 10,
+}}), 720);
+assert.strictEqual(utils.calculatePaginationHeight({{
+  viewportTop: 24,
+  viewportHeight: 1000,
+  contentTop: 120,
+  shellBottom: 1024,
+  shellPaddingBottom: 54,
+  guard: 10,
+}}), 840);
 assert.strictEqual(utils.swipeDirection({{x: 300, y: 100}}, {{x: 180, y: 105}}, false), 'next');
 assert.strictEqual(utils.swipeDirection({{x: 180, y: 100}}, {{x: 300, y: 105}}, false), 'previous');
 assert.strictEqual(utils.swipeDirection({{x: 300, y: 100}}, {{x: 180, y: 105}}, true), null);
@@ -56,6 +72,11 @@ def test_android_selection_strategy_is_wired_without_disabling_native_selection(
     assert "visualViewport" in source
     assert "state.savedSelection" in source
     assert "captureSelection();" in source
+    assert "function clearSelectionInteraction()" in source
+    assert "state.selectionSubmitting = true" in source
+    assert "clearSelectionInteraction();" in source
+    assert "window.getSelection()?.removeAllRanges()" in source
+    assert 'selectionMenu.style.removeProperty("top")' in source
     assert 'placement: "mobile-below"' in (ROOT / "static/js/reader-utils.js").read_text(encoding="utf-8")
     assert "user-select: none" not in style
     assert "-webkit-user-select: none" not in style
@@ -93,3 +114,17 @@ def test_reader_ui_refresh_keeps_navigation_and_actions_on_existing_controls():
     assert 'pageStatusTimer = setTimeout(() => hidePageStatus(false), 1100)' in source
     assert 'modeButton.addEventListener("click"' in source
     assert 'tocButton.addEventListener("click"' in source
+
+
+def test_paginated_reader_reflows_for_webkit_fonts_and_visual_viewport():
+    source = READER.read_text(encoding="utf-8")
+    style = (ROOT / "static/css/style.css").read_text(encoding="utf-8")
+
+    assert "calculatePaginationHeight" in source
+    assert 'body.style.setProperty("--reader-viewport-height"' in source
+    assert 'window.addEventListener("orientationchange", delayedResize' in source
+    assert "document.fonts?.ready" in source
+    assert 'document.fonts?.addEventListener?.("loadingdone", delayedResize)' in source
+    assert "overflow-x: auto" in style
+    assert "overflow-y: hidden" in style
+    assert "scrollbar-width: none" in style

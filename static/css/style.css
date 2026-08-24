@@ -318,23 +318,37 @@ a { color: inherit; }
 .finish-book-entry button::after { content: "  →"; opacity: .5; }
 .finish-book-entry button:disabled { opacity: .55; cursor: wait; }
 
-.reader-paginated { height: 100dvh; overflow: hidden; }
+.reader-paginated {
+  height: 100vh;
+  height: var(--reader-viewport-height, 100dvh);
+  overflow: hidden;
+}
 .reader-paginated .reader-shell {
-  height: calc(100dvh - 58px - env(safe-area-inset-top));
+  height: calc(var(--reader-viewport-height, 100dvh) - 58px - env(safe-area-inset-top));
   padding-top: 2rem;
   padding-bottom: calc(2.9rem + env(safe-area-inset-bottom));
   overflow: hidden;
+  min-height: 0;
 }
 .reader-paginated .chapter-content {
   width: 100%;
   height: var(--pagination-height, calc(100dvh - 10rem));
+  min-height: 0;
+  padding-bottom: .18em;
   column-width: var(--reader-column-width, 700px);
   column-count: auto;
   column-gap: var(--reader-column-gap, 32px);
   column-fill: auto;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
   scroll-behavior: smooth;
+  orphans: 2;
+  widows: 2;
 }
+.reader-paginated .chapter-content::-webkit-scrollbar { display: none; }
 .reader-paginated .chapter-navigation { display: none; }
 .reader-paginated .finish-book-entry:not([hidden]) {
   position: fixed;

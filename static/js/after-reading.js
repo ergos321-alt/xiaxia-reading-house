@@ -35,6 +35,7 @@
       reflection_locked_after_reveal: "两张纸条已经一起打开，不能再改写了。",
       owner_has_not_completed_book: "这一方还没有读完整本书。",
       shared_reading_not_completed: "两个人都读完以后，信纸才会展开。",
+      v2_migration_required: "读完以后所需的数据表尚未就绪，请先执行 V2 migration。",
     };
     return messages[code] || code || "暂时无法完成";
   }
@@ -65,7 +66,7 @@
     document.querySelector("#memory-book-title").textContent = data.book.title;
     document.querySelector("#memory-book-author").textContent = data.book.author || "";
     document.title = `${data.book.title} · 读完以后`;
-    renderCompletion(data.completion, data.stamp);
+    renderCompletion(data.completion, data.stamp, data.memory_state);
     renderReflections(data.reflections);
     renderStops(data.shared_stops.preview || [], true);
     state.stopPageCount = Math.max(1, Math.ceil((data.shared_stops.count || 0) / 20));
@@ -75,14 +76,21 @@
     renderTimeline(data.timeline || []);
   }
 
-  function renderCompletion(completion, stamp) {
+  function renderCompletion(completion, stamp, memoryState = "") {
     const note = document.querySelector("#completion-note");
-    note.textContent = completion.shared_completed
+    const notes = {
+      waiting_for_xiaxia_completion: "我已经读完；这张封底还在等另一种墨水走到这里。",
+      waiting_for_user_reflection: "两个人都已读完；我的最后一张纸条还没有写好。",
+      waiting_for_xiaxia_reflection: "两个人都已读完；林知夏的最后一张纸条还合着。",
+      waiting_for_reflection_reveal: "两张纸条都已写好，正在一起展开。",
+      reflections_revealed: "两个人都走到了这本书的最后一页。",
+    };
+    note.textContent = notes[memoryState] || (completion.shared_completed
       ? "两个人都走到了这本书的最后一页。"
-      : "我已经读完；这张封底还在等另一种墨水走到这里。";
+      : "我已经读完；这张封底还在等另一种墨水走到这里。");
     const stampNode = document.querySelector("#reading-stamp");
     stampNode.hidden = !stamp?.visible;
-    document.querySelector("#stamp-month").textContent = stamp?.completed_month || "";
+    document.querySelector("#stamp-month").textContent = stamp?.completed_date || stamp?.completed_month || "";
     document.querySelector("#letters-section").hidden = !completion.shared_completed;
   }
 
@@ -222,7 +230,7 @@
       const data = await api(`/api/books/${bookId}/back-cover`);
       state.data = data;
       renderReflections(data.reflections);
-      renderCompletion(data.completion, data.stamp);
+      renderCompletion(data.completion, data.stamp, data.memory_state);
     } catch (error) {
       showToast(error.message);
     }
