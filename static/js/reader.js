@@ -65,6 +65,9 @@
     pageCount: 1,
     menuInteracting: false,
     selectionSubmitting: false,
+    selectionUiVisible: false,
+    selectionEpoch: 0,
+    selectionSuppressedUntil: 0,
     selectionTimers: [],
     touchStart: null,
     target: {
@@ -360,13 +363,23 @@
   function scheduleSelectionCapture(delays = [120, 320, 620]) {
     for (const timer of state.selectionTimers) clearTimeout(timer);
     state.selectionTimers = [];
-    if (state.selectionSubmitting) return;
+    if (state.selectionSubmitting || Date.now() < state.selectionSuppressedUntil) return;
+    const expectedEpoch = state.selectionEpoch;
     state.selectionTimers = delays.map((delay) => setTimeout(() => {
-      if (!state.selectionSubmitting) captureSelection();
+      if (
+        !state.selectionSubmitting &&
+        expectedEpoch === state.selectionEpoch &&
+        Date.now() >= state.selectionSuppressedUntil
+      ) captureSelection(expectedEpoch);
     }, delay));
   }
 
-  function captureSelection() {
+  function captureSelection(expectedEpoch = state.selectionEpoch) {
+    if (
+      state.selectionSubmitting ||
+      expectedEpoch !== state.selectionEpoch ||
+      Date.now() < state.selectionSuppressedUntil
+    ) return;
     const selection = window.getSelection();
     if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return;
     const range = selection.getRangeAt(0).cloneRange();
@@ -393,10 +406,15 @@
     };
     const rects = [...range.getClientRects()].filter((rect) => rect.width || rect.height);
     if (!rects.length) return;
-    positionSelectionMenu(rects[rects.length - 1]);
+    positionSelectionMenu(rects[rects.length - 1], expectedEpoch);
   }
 
-  function positionSelectionMenu(rect) {
+  function positionSelectionMenu(rect, expectedEpoch = state.selectionEpoch) {
+    if (
+      state.selectionSubmitting ||
+      expectedEpoch !== state.selectionEpoch ||
+      Date.now() < state.selectionSuppressedUntil
+    ) return;
     const visual = window.visualViewport;
     const viewport = {
       offsetLeft: visual?.offsetLeft || 0,
@@ -407,7 +425,11 @@
     };
     const mobile = matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
     const position = utils.selectionMenuPosition({ rect, viewport, mobile });
+    state.selectionUiVisible = true;
     selectionMenu.hidden = false;
+    selectionMenu.classList.remove("is-hidden");
+    selectionMenu.setAttribute("aria-hidden", "false");
+    selectionMenu.style.removeProperty("display");
     selectionMenu.dataset.placement = position.placement;
     selectionMenu.style.left = `${position.left}px`;
     selectionMenu.style.top = position.top == null ? "auto" : `${position.top}px`;
@@ -431,15 +453,22 @@
   }
 
   function hideSelectionMenu(clearSaved = false) {
+    state.selectionUiVisible = false;
     selectionMenu.hidden = true;
+    selectionMenu.classList.add("is-hidden");
+    selectionMenu.setAttribute("aria-hidden", "true");
+    selectionMenu.style.setProperty("display", "none", "important");
     if (clearSaved) state.savedSelection = null;
   }
 
   function clearSelectionInteraction() {
+    state.selectionEpoch += 1;
+    state.selectionSuppressedUntil = Date.now() + 900;
     for (const timer of state.selectionTimers) clearTimeout(timer);
     state.selectionTimers = [];
+    state.savedSelection = null;
     window.getSelection()?.removeAllRanges();
-    hideSelectionMenu(true);
+    hideSelectionMenu(false);
     selectionMenu.removeAttribute("data-placement");
     selectionMenu.style.removeProperty("left");
     selectionMenu.style.removeProperty("top");
@@ -449,7 +478,7 @@
   }
 
   async function saveAnnotation(comment = "") {
-    if (!state.savedSelection) return;
+    if (!state.savedSelection) return false;
     const selectionSnapshot = { ...state.savedSelection };
     state.selectionSubmitting = true;
     hideSelectionMenu();
@@ -462,9 +491,11 @@
       clearSelectionInteraction();
       await refreshAnnotationMarks();
       showToast(comment ? "批注已经留在书页旁。" : "划线已经保存。");
+      return true;
     } catch (error) {
       state.selectionSubmitting = false;
       showToast(`保存失败：${error.message}`);
+      return false;
     }
   }
 
@@ -1047,10 +1078,10 @@
     setTimeout(() => { state.menuInteracting = false; }, 500);
   });
   window.visualViewport?.addEventListener("resize", () => {
-    if (!selectionMenu.hidden) scheduleSelectionCapture([80]);
+    if (state.selectionUiVisible) scheduleSelectionCapture([80]);
   });
   window.visualViewport?.addEventListener("scroll", () => {
-    if (!selectionMenu.hidden) scheduleSelectionCapture([80]);
+    if (state.selectionUiVisible) scheduleSelectionCapture([80]);
   });
 
   content.addEventListener("click", (event) => {
@@ -1072,9 +1103,12 @@
   document.querySelector("#note-selection").addEventListener("click", openNewNoteDialog);
   noteForm.addEventListener("submit", async (event) => {
     event.preventDefault();
+    const created = state.editingAnnotationId
+      ? false
+      : await saveAnnotation(noteText.value.trim());
     if (state.editingAnnotationId) await saveEditedAnnotation(noteText.value.trim());
-    else await saveAnnotation(noteText.value.trim());
     noteDialog.close();
+    if (created) requestAnimationFrame(() => content.focus({ preventScroll: true }));
   });
   noteDialog.addEventListener("close", () => { state.editingAnnotationId = null; });
   annotationDialog.addEventListener("close", () => {
@@ -1156,5 +1190,6 @@
   });
   window.addEventListener("pagehide", () => saveProgress(true));
 
+  hideSelectionMenu();
   initialize();
 })();

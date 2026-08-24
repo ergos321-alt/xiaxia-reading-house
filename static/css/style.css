@@ -491,6 +491,7 @@ mark.target-flash, .chapter-thought.target-flash { animation: annotation-target-
   box-shadow: 0 10px 26px rgba(72,53,35,.15);
   transform: translate(-50%, calc(-100% - 10px)) rotate(-.25deg);
 }
+.selection-menu[hidden], .selection-menu.is-hidden { display: none !important; }
 .selection-menu[data-placement="below"] { transform: translate(-50%, 10px) rotate(-.25deg); }
 .selection-menu[data-placement="mobile-below"],
 .selection-menu[data-placement="mobile-clamped"] { transform: translate(-50%, 0) rotate(-.25deg); }

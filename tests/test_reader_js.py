@@ -74,9 +74,14 @@ def test_android_selection_strategy_is_wired_without_disabling_native_selection(
     assert "captureSelection();" in source
     assert "function clearSelectionInteraction()" in source
     assert "state.selectionSubmitting = true" in source
+    assert "state.selectionUiVisible = false" in source
+    assert "state.selectionEpoch += 1" in source
+    assert "state.selectionSuppressedUntil = Date.now() + 900" in source
     assert "clearSelectionInteraction();" in source
     assert "window.getSelection()?.removeAllRanges()" in source
+    assert 'selectionMenu.style.setProperty("display", "none", "important")' in source
     assert 'selectionMenu.style.removeProperty("top")' in source
+    assert ".selection-menu[hidden], .selection-menu.is-hidden { display: none !important; }" in style
     assert 'placement: "mobile-below"' in (ROOT / "static/js/reader-utils.js").read_text(encoding="utf-8")
     assert "user-select: none" not in style
     assert "-webkit-user-select: none" not in style
