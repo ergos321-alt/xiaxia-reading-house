@@ -5,6 +5,7 @@ from uuid import UUID
 import pytest
 
 import annotations as annotations_api
+import memories
 import reading
 from app import create_app
 
@@ -531,6 +532,12 @@ def test_short_chapter_is_not_split_unnecessarily(monkeypatch):
 
 def test_original_reading_progress_persists_paginated_display_state(monkeypatch):
     captured = {}
+    milestone_calls = []
+    monkeypatch.setattr(
+        memories,
+        "record_user_progress_milestone",
+        lambda *args: milestone_calls.append(args),
+    )
     monkeypatch.setattr(
         reading.db, "fetch_one", lambda *_args, **_kwargs: {"id": CHAPTER_ID}
     )
@@ -567,9 +574,16 @@ def test_original_reading_progress_persists_paginated_display_state(monkeypatch)
     assert position["block_id"] == "b000007"
     assert position["display_mode"] == "paginated"
     assert position["page_index"] == 3
+    assert milestone_calls and milestone_calls[0][:2] == (BOOK_ID, CHAPTER_ID)
 
 
 def test_ai_chunk_checkpoint_persists_and_completed_requires_final_chunk(monkeypatch):
+    completion_calls = []
+    monkeypatch.setattr(
+        memories,
+        "record_ai_chapter_completion",
+        lambda *args: completion_calls.append(args),
+    )
     long_html = make_long_chapter_html()
     chunks = reading._chunk_chapter_blocks(reading._chapter_blocks(long_html))
     monkeypatch.setattr(
@@ -671,6 +685,8 @@ def test_ai_chunk_checkpoint_persists_and_completed_requires_final_chunk(monkeyp
     assert state["last_chunk_index"] == final_index
     assert state["last_block_id"] == final_block
     assert state["chapter_completed"] is True
+    assert len(completion_calls) == 1
+    assert completion_calls[0][:2] == (BOOK_ID, OTHER_CHAPTER_ID)
     assert captured["params"][2:6] == (
         final_index, f"{OTHER_CHAPTER_ID}:{final_index}", final_block, True
     )

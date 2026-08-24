@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover">
+  <meta name="theme-color" content="#efe5d4">
+  <title>读完以后 · 共读小屋</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="after-reading-page" data-book-id="{{ book_id }}">
+  <header class="memory-page-header">
+    <a href="{{ url_for('reader_page', book_id=book_id) }}" aria-label="回到正文">← 回到书里</a>
+    <span>读完以后</span>
+  </header>
+
+  <main class="memory-shell">
+    <p id="memory-loading" class="reader-loading">正在翻开封底…</p>
+
+    <section id="memory-locked" class="memory-locked" hidden>
+      <p class="memory-kicker">这页还夹在书里</p>
+      <h1 id="locked-book-title"></h1>
+      <p id="locked-message"></p>
+      <a href="{{ url_for('reader_page', book_id=book_id) }}">继续读下去</a>
+    </section>
+
+    <div id="memory-content" hidden>
+      <section class="back-cover-leaf" aria-labelledby="memory-book-title">
+        <div class="back-cover-heading">
+          <div>
+            <p class="memory-kicker">我们读完这本书以后</p>
+            <h1 id="memory-book-title"></h1>
+            <p id="memory-book-author" class="memory-book-author"></p>
+          </div>
+          <div id="reading-stamp" class="reading-stamp" hidden aria-label="共读完成印章">
+            <span>一起读过</span>
+            <b>🐶 × 🐱</b>
+            <small id="stamp-month"></small>
+          </div>
+        </div>
+        <p id="completion-note" class="completion-note"></p>
+      </section>
+
+      <section class="memory-section reflections-section" aria-labelledby="reflections-title">
+        <header class="memory-section-heading">
+          <p class="memory-kicker">两张合上的纸条</p>
+          <h2 id="reflections-title">最后想留下的话</h2>
+          <p id="reflection-rule" class="memory-help">彼此都写好以前，只能看见自己的那一张。</p>
+        </header>
+        <div class="reflection-pair">
+          <article class="reflection-sheet reflection-user">
+            <p class="trace-owner">🐶 我的读后话</p>
+            <form id="user-reflection-form">
+              <label for="user-rating">这本书留给我的分量</label>
+              <select id="user-rating" required>
+                <option value="">请选择</option>
+                <option value="1">1 / 5</option>
+                <option value="2">2 / 5</option>
+                <option value="3">3 / 5</option>
+                <option value="4">4 / 5</option>
+                <option value="5">5 / 5</option>
+              </select>
+              <label for="user-review">读完以后</label>
+              <textarea id="user-review" rows="7" maxlength="50000" required placeholder="写下真正想留在封底的话。"></textarea>
+              <button id="save-user-reflection" type="submit">把这张纸条合上</button>
+            </form>
+            <div id="user-reflection-read" class="reflection-read" hidden></div>
+          </article>
+
+          <article class="reflection-sheet reflection-xiaxia">
+            <p class="trace-owner">🐱 林知夏的读后话</p>
+            <div id="xiaxia-reflection-sealed" class="sealed-note">
+              <span aria-hidden="true">封</span>
+              <p>她的纸条仍然合着。</p>
+            </div>
+            <div id="xiaxia-reflection-read" class="reflection-read" hidden></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="memory-section shared-stops-section" aria-labelledby="shared-stops-title">
+        <header class="memory-section-heading">
+          <p class="memory-kicker">同一页上的两种笔迹</p>
+          <h2 id="shared-stops-title">共同停留处</h2>
+          <p class="memory-help">不是为了证明想法相同，只是记得我们都曾在这里慢下来。</p>
+        </header>
+        <div id="shared-stops-list" class="shared-stops-list"></div>
+        <button id="load-more-stops" class="memory-text-button" type="button" hidden>再翻几处</button>
+        <p id="shared-stops-empty" class="memory-empty" hidden>这本书里还没有两个人在同一处留下笔迹。</p>
+      </section>
+
+      <section id="letters-section" class="memory-section letters-section" aria-labelledby="letters-title">
+        <header class="memory-section-heading">
+          <p class="memory-kicker">写给读过同一本书的人</p>
+          <h2 id="letters-title">读后信</h2>
+        </header>
+        <div class="letter-pair">
+          <article class="letter-sheet letter-user">
+            <p class="trace-owner">🐶 写给林知夏</p>
+            <form id="user-letter-form">
+              <textarea id="user-letter" rows="9" maxlength="50000" required placeholder="这不是聊天记录，是读完以后想交给她的一封信。"></textarea>
+              <button type="submit">把信留在这里</button>
+            </form>
+            <time id="user-letter-date"></time>
+          </article>
+          <article class="letter-sheet letter-xiaxia">
+            <p class="trace-owner">🐱 林知夏写给我</p>
+            <p id="xiaxia-letter" class="letter-content">信纸还是空的。</p>
+            <time id="xiaxia-letter-date"></time>
+          </article>
+        </div>
+      </section>
+
+      <section class="memory-section timeline-section" aria-labelledby="timeline-title">
+        <header class="memory-section-heading">
+          <p class="memory-kicker">只留下值得记住的日子</p>
+          <h2 id="timeline-title">这本书的共读时间</h2>
+        </header>
+        <ol id="memory-timeline" class="memory-timeline"></ol>
+      </section>
+    </div>
+  </main>
+
+  <div id="memory-toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="{{ url_for('static', filename='js/after-reading.js') }}" defer></script>
+</body>
+</html>

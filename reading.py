@@ -399,6 +399,13 @@ def save_progress(book_id: UUID):
         """,
         (book_id, chapter_id, chapter_index, Jsonb(sanitized_position), percentage),
     )
+    # V2 records only the first meaningful reading milestone. The progress
+    # response and its existing persistence contract remain unchanged.
+    from memories import record_user_progress_milestone
+
+    record_user_progress_milestone(
+        book_id, chapter_id, percentage, row.get("updated_at")
+    )
     return jsonify({"progress": _json_safe(row)})
 
 
@@ -727,6 +734,18 @@ def save_ai_progress():
             chapter_completed_supplied,
         ),
     )
+    if chapter_completed and chapter_id is not None:
+        # Keep the current checkpoint as-is and separately record the verified
+        # final-chunk completion used by the V2 whole-book memory layer.
+        from memories import record_ai_chapter_completion
+
+        record_ai_chapter_completion(
+            book_id,
+            chapter_id,
+            resolved_chunk_id,
+            last_block_id,
+            state.get("updated_at"),
+        )
     return jsonify(
         {
             "ai_reading_state": _json_safe(state),

@@ -20,6 +20,7 @@
       <button id="toc-button" class="reader-menu-item" type="button" aria-label="打开目录" aria-expanded="false">章节目录</button>
       <button id="reading-mode" class="reader-menu-item" type="button" aria-label="切换分页或滚动模式">切换为分页阅读</button>
       <a id="annotations-overview-link" class="reader-menu-item" href="{{ url_for('annotations_overview_page', book_id=book_id) }}" aria-label="划线与批注总览">书页痕迹</a>
+      <a id="after-reading-link" class="reader-menu-item" href="{{ url_for('memories.after_reading_page', book_id=book_id) }}" aria-label="打开读完以后">读完以后</a>
       <div class="reader-font-control" aria-label="字体大小">
         <span>字体大小</span>
         <div>
@@ -46,6 +47,10 @@
     <article id="chapter-content" class="chapter-content" tabindex="-1" aria-live="polite">
       <p class="reader-loading">正在翻到上次读过的地方…</p>
     </article>
+    <section id="finish-book-entry" class="finish-book-entry" hidden>
+      <p>这一页已经读到末尾。</p>
+      <button id="finish-book-button" type="button">合上正文，翻到读完以后</button>
+    </section>
     <button id="page-previous" class="page-turn page-turn-previous" type="button" aria-label="上一页"><span aria-hidden="true">‹</span></button>
     <button id="page-next" class="page-turn page-turn-next" type="button" aria-label="下一页"><span aria-hidden="true">›</span></button>
     <div id="page-status" class="page-status" hidden aria-live="polite"></div>

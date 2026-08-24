@@ -1,8 +1,8 @@
-# Xiaxia Reading House V1.1
+# Xiaxia Reading House V2
 
 一间私人双人 AI 共读空间。Supabase PostgreSQL 只保存结构化数据、正文文本和稳定锚点；原始 EPUB/TXT、封面及 EPUB 正文图片保存在私有 Supabase Storage。服务器只提供书籍事实、文本、状态与持久化能力，不生成林知夏人格内容。
 
-V1.1 保留既有 EPUB/TXT 解析、章节顺序、双阅读进度、Storage 与 `block ID + character offsets` 定位模型；本轮只补齐长期管理能力：AI checkpoint 同源校验、Thought/双方 Reply 管理、Preview → Commit、批量操作、服务端 Undo、全局管理中心、安全删书与 Android Chrome 选区菜单定位。
+V2 以已验收的 V1.1 为唯一基础，不改解析、章节、Storage、批注、Reply、Undo、进度或现有 Action 契约；只在书籍读完以后增加私人记忆层：双盲最终评价、共同停留处、双向读后信、克制共读时间线与封底印章。它们保存共同记忆，不做评分社区、统计、排行榜、成就或自动总结。
 
 ## 项目目录
 
@@ -17,6 +17,7 @@ xiaxia-reading-house/
 ├── annotations.py
 ├── management.py
 ├── operations.py
+├── memories.py
 ├── schema.sql
 ├── openapi.yaml
 ├── requirements.txt
@@ -26,13 +27,15 @@ xiaxia-reading-house/
 │   ├── 001_prepare_storage_refactor.sql
 │   ├── 002_finalize_storage_refactor.sql
 │   ├── 003_v1_experience_refactor.sql
-│   └── 004_v1_1_management.sql
+│   ├── 004_v1_1_management.sql
+│   └── 005_v2_reading_memories.sql
 ├── scripts/
 │   └── migrate_legacy_bytea_to_storage.py
 ├── templates/
 │   ├── login.html
 │   ├── library.html
 │   ├── reader.html
+│   ├── after_reading.html
 │   ├── annotations_overview.html
 │   ├── annotations_management.html
 │   └── error.html
@@ -42,6 +45,7 @@ xiaxia-reading-house/
 │       ├── library.js
 │       ├── reader-utils.js
 │       ├── reader.js
+│       ├── after-reading.js
 │       ├── annotations-overview.js
 │       └── annotations-management.js
 └── tests/
@@ -52,13 +56,14 @@ xiaxia-reading-house/
     ├── test_v1_1_management.py
     ├── test_reader_js.py
     ├── test_storage.py
-    └── test_consistency.py
+    ├── test_consistency.py
+    └── test_v2_memories.py
 ```
 
 ## 架构与持久化边界
 
 - Flask 是唯一数据入口。浏览器使用私人密码 Session；Custom GPT Action 使用 `Authorization: Bearer <ACTION_API_TOKEN>`。
-- `books`、`chapters`、`reading_progress`、用户 `annotations`、`annotation_replies`、独立 `xiaxia_thoughts`、`thought_user_replies`、候选记录、操作日志与 `ai_reading_state` 存在 PostgreSQL。
+- `books`、`chapters`、`reading_progress`、用户 `annotations`、`annotation_replies`、独立 `xiaxia_thoughts`、`thought_user_replies`、候选记录、操作日志与 `ai_reading_state` 存在 PostgreSQL。V2 另用独立表保存逐章 AI 完成事实、整本完成状态、最终评价、读后信与稀疏记忆事件。
 - `books.source_object_path` 与 `book_assets.object_path` 只保存 Storage object path；`book_assets` 另存 MIME type 和 byte size，不存在长期 `bytea`。
 - 私有 bucket `xiaxia-reading-house-private` 保存原始上传文件、封面与 EPUB 图片。所有对象保持 `public=false`，且不向 `anon`/`authenticated` 提供对象 policy。
 - 浏览器通过鉴权后的 Flask 资源代理读取封面和正文图片，不接触 service role/Secret key，也不获得永久公开 URL。
@@ -88,17 +93,20 @@ xiaxia-reading-house/
 
 完成后到 Storage 页面再次确认 bucket 显示为 **Private**，且没有为浏览器角色添加读、写、更新或删除 policy。
 
-### 已部署并已有真实数据的 V1
+### 已部署并已有真实数据的 V1 / V1.1
 
 不需要清库，也不需要重新导入书籍。执行顺序：
 
 1. 备份 Supabase PostgreSQL。
 2. 若尚未运行过，先运行 `migrations/003_v1_experience_refactor.sql`。
 3. 运行 `migrations/004_v1_1_management.sql`。
-4. 确认事务成功提交，再部署本项目新代码。
-5. 运行下文网页、Action 与 Android 手工验收。
+4. 运行 `migrations/005_v2_reading_memories.sql`。
+5. 确认事务成功提交，再部署本项目新代码。
+6. 运行下文网页、Action 与 Android 手工验收。
 
-`004` 是可重复执行的增量事务：补齐所有权字段、`last_chunk_id`、用户回复、候选预览和操作日志；不删除或改写现有 books、chapters、progress、annotations、Thought、Reply 或 Storage metadata。不要重新运行 `schema.sql` 代替 migration。
+`004` 是可重复执行的 V1.1 增量事务。`005` 也是可重复执行的增量事务，只新增 V2 表、索引、触发器、RLS 和保守里程碑回填：它不会删除或改写现有 books、chapters、progress、annotations、Thought、Reply 或 Storage metadata。不要重新运行 `schema.sql` 代替 migration。
+
+`005` 只把现有 `percentage=100` 的用户进度认作已完成；林知夏方面只回填旧 checkpoint 能证明的那一个已完成章节，不会用“最后一次停在末章”冒充读完整本。后续每个 `chapter_completed=true` 的最终 chunk 会写入 `ai_chapter_completions`，只有真实章节全部齐全才标记整本完成。
 
 ### 仍是最早的 bytea 版
 
@@ -107,7 +115,7 @@ xiaxia-reading-house/
 3. 配置全部 Supabase/Storage 环境变量。
 4. 运行 `python scripts/migrate_legacy_bytea_to_storage.py`。
 5. 成功后运行 `migrations/002_finalize_storage_refactor.sql`。
-6. 再按顺序运行 `003_v1_experience_refactor.sql` 与 `004_v1_1_management.sql`。
+6. 再按顺序运行 `003_v1_experience_refactor.sql`、`004_v1_1_management.sql` 与 `005_v2_reading_memories.sql`。
 7. 部署新代码。
 
 `002` 只有在每条旧资产都已有 `object_path` 后才删除旧 `data` 列；未迁移记录会使脚本中止，不会静默丢失图片。旧架构没有原始文件可迁移；新上传书籍会正常保留原始 EPUB/TXT。
@@ -161,6 +169,8 @@ https://xiaxia-reading-house.onrender.com
 
 Schema 采用 Actions 兼容的保守写法：路径参数在每个 operation 内直接展开；所有 object 都显式声明 `properties`；没有 `objecta`、server variables、discriminator、`oneOf`/`anyOf`；operationId 唯一；所有 operation description 均少于 300 字符。
 
+本阶段按产品边界冻结 `openapi.yaml`：V2 Web/数据库能力没有加入 Custom GPT Action Schema，既有 operationId、endpoint 和字段均未改变。后端已为 Xiaxia 最终评价和读后信预留独立 Bearer 身份路由，但当前 GPT 不会从冻结 Schema 中发现它们；待单独的 Action 升级阶段再公开，不应手工改动现有 Schema。
+
 ### 林知夏自主连续阅读顺序
 
 1. `listBooks` 取得 `book_id`。
@@ -211,8 +221,25 @@ Schema 采用 Actions 兼容的保守写法：路径参数在每个 operation �
 | 用户回复 Xiaxia Thought | `POST` / `PATCH` / `DELETE /api/xiaxia/thoughts/{thought_id}/reply` | 网页 |
 | 林知夏 chunk checkpoint | `POST /api/ai/progress` | Action |
 | 撤销 Xiaxia 最近操作 | `POST /api/actions/undo` | Action |
+| 封底聚合数据 | `GET /api/books/{book_id}/back-cover` | 网页 |
+| 明确完成整本书 | `POST /api/books/{book_id}/completion` | 网页 |
+| 共同停留处 | `GET /api/books/{book_id}/shared-stops` | 网页 |
+| 用户最终评价 | `PUT /api/books/{book_id}/reflection` | 网页 |
+| 用户读后信 | `PUT /api/books/{book_id}/letter` | 网页 |
+| Xiaxia 最终评价/读后信（暂未进 Schema） | `PUT /api/xiaxia/books/{book_id}/reflection`、`PUT /api/xiaxia/books/{book_id}/letter` | 后端 Action 身份预留 |
 
-既有 endpoint 没有改名。新增接口的 Flask route、数据库字段、前端 fetch、OpenAPI path/operationId、测试和本文档使用同一套字段名。
+既有 endpoint 没有改名、没有改变返回结构。V2 Web 接口的 Flask route、数据库字段、前端 fetch、测试和本文档使用同一套字段名；按本阶段要求，V2 路径不写入冻结的 `openapi.yaml`。
+
+## V2 读完以后
+
+- 用户只能在真实最后一章末尾点击“合上正文”完成；前端先用原进度 API 保存最终章节、稳定 block 和 100%，服务器再校验 `chapter_index=最后一章` 且 `percentage>=99.5`，不能从任意页面伪造完成。
+- 林知夏沿用原 `/api/ai/progress`。每个通过最终 chunk 校验的章节另记一条 `ai_chapter_completions`；只有数量与该书真实 `chapter_count` 一致才产生 `xiaxia_completed_at`。当前 checkpoint 的响应格式不变。
+- `book_reflections` 每书每方一条。读取响应在服务器端按 user/xiaxia perspective 裁剪：揭示前只返回自己的评分/正文以及对方是否提交，不向浏览器传对方隐藏正文；第二方提交后原子写入 `reflections_revealed_at`，两张纸条同时开放并锁定。
+- 共同停留处不建立易漂移的结果表。读取时直接使用现有用户 annotation 与 `scope=range/block` 的 Xiaxia Thought，在同一章节的同源 `block_id + offsets` 上按“完全相同 → 范围重叠 → 同一 block”匹配并聚合；chapter Thought 和双方 Reply 不参与。跳回正文仍传原 `chapter_id + annotation_id`。
+- `reading_letters` 分开保存 user→xiaxia 与 xiaxia→user，双方整本完成后才可写入或查看。它是每方一封可继续修改的信纸，不是聊天流。
+- `reading_memory_events` 只记录开始阅读、第一次共同停留、共同完成、第一次打开封底；Thought/Reply 的增删改和 Undo 不会进入时间线。
+- 共读印章只在 `shared_completed_at` 存在时出现在封底，月份直接来自共同完成时间；不进入正文，不作为徽章或成就。
+- 删除书籍仍先清理该书私有 Storage 对象，再删除 `books`。V2 五张表都通过 `book_id ON DELETE CASCADE` 接入现有数据库清理，不会留下记忆孤儿数据。
 
 ### Preview → Commit 与 Undo
 
@@ -271,15 +298,17 @@ flask --app app run
 
 ```bash
 pytest
-python -m py_compile app.py annotations.py auth.py database.py epub_parser.py reading.py management.py operations.py storage.py
+python -m py_compile app.py annotations.py auth.py database.py epub_parser.py reading.py management.py memories.py operations.py storage.py
 node --check static/js/reader-utils.js
 node --check static/js/reader.js
 node --check static/js/library.js
 node --check static/js/annotations-overview.js
 node --check static/js/annotations-management.js
+node --check static/js/after-reading.js
+ruff check .
 ```
 
-测试覆盖 EPUB2/EPUB3 cover、异常 title fallback、书籍信息编辑、批注 CRUD/cascade/补写、四类 owner/content_type、Thought 与双方 Reply CRUD、Preview 不落正式表、批量 Commit/Delete、anchor validation、Undo/冲突、全局筛选与跳转字段、长短章节 chunk、annotation 所属 chunk、Thought 后 checkpoint、中途/最终/完成/跨章进度、删书与 Storage 清理、多书路径隔离、原有用户进度、自动同步、私有 Storage、身份边界，以及 OpenAPI/Flask/SQL/JS/README 一致性。
+测试覆盖 EPUB2/EPUB3 cover、异常 title fallback、书籍信息编辑、批注 CRUD/cascade/补写、四类 owner/content_type、Thought 与双方 Reply CRUD、Preview 不落正式表、批量 Commit/Delete、anchor validation、Undo/冲突、全局筛选与跳转字段、长短章节 chunk、annotation 所属 chunk、Thought 后 checkpoint、中途/最终/完成/跨章进度、删书与 Storage 清理、多书路径隔离、原有用户进度、自动同步、私有 Storage、身份边界，以及 OpenAPI/Flask/SQL/JS/README 一致性。V2 专项覆盖完成门槛、逐章 AI 完成、exact/overlap/same-block 匹配、稳定锚点、双盲裁剪、身份隔离、增量 migration、Action Schema 冻结与封底 UI 接线。
 
 ## V1.1 UI / UX Refresh
 
@@ -301,6 +330,10 @@ node --check static/js/annotations-management.js
 4. 使用左右按钮和键盘方向键翻页，刷新后确认进度恢复。
 5. 新建纯划线，点击后“添加想法”，再编辑；分别删除无 reply 和有 reply 的批注，确认后者出现明确警告。
 6. 打开批注总览，逐一测试四个筛选以及滚动/分页精确跳回和短暂高亮。
+7. 在最后一章末页点击“合上正文，翻到读完以后”，确认其他章节不能提前完成，刷新后封底仍可打开。
+8. 提交用户评分与读后话，检查页面只显示自己的原文和“林知夏是否已提交”，不能在 HTML/网络响应中找到她的隐藏正文；双方提交后再确认同时揭示并锁定。
+9. 检查共同停留处的 exact、范围重叠与同一段落案例，点击“回到这一页”，确认仍由原 annotation anchor 精确跳回。
+10. 双方完成后分别保存两封读后信，刷新确认持久化；确认印章仅在封底出现，时间线没有 Thought/Reply CRUD 日志。
 
 ### Android Chrome
 

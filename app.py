@@ -14,6 +14,7 @@ from annotations import annotations_bp
 from auth import web_required
 from reading import reading_bp
 from management import management_bp
+from memories import memories_bp
 
 
 REQUIRED_SETTINGS = (
@@ -61,6 +62,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.register_blueprint(reading_bp)
     app.register_blueprint(annotations_bp)
     app.register_blueprint(management_bp)
+    app.register_blueprint(memories_bp)
 
     @app.before_request
     def require_complete_configuration():

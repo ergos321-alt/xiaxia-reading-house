@@ -6,6 +6,7 @@ import pytest
 
 import annotations as annotations_api
 import management
+import memories
 import operations
 import reading
 from app import create_app
@@ -130,6 +131,12 @@ def test_action_and_web_write_boundaries_are_separate():
 
 
 def test_thought_creation_then_completed_progress_saves_successfully(monkeypatch):
+    memory_calls = []
+    monkeypatch.setattr(
+        memories,
+        "record_ai_chapter_completion",
+        lambda *args: memory_calls.append(args),
+    )
     class CreationConnection:
         def execute(self, query, _params=()):
             if "insert into xiaxia_thoughts" in query:
@@ -191,6 +198,7 @@ def test_thought_creation_then_completed_progress_saves_successfully(monkeypatch
     )
     assert saved.status_code == 200
     assert saved.get_json()["ai_reading_state"]["chapter_completed"] is True
+    assert memory_calls and memory_calls[0][:2] == (BOOK_ID, CHAPTER_ID)
 
 
 def test_list_xiaxia_thoughts_has_owner_anchor_and_pagination(monkeypatch):

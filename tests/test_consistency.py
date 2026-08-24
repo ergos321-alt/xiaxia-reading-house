@@ -20,6 +20,11 @@ def test_required_database_tables_are_declared():
         "xiaxia_thought_candidates",
         "reading_operation_log",
         "ai_reading_state",
+        "book_memory_state",
+        "ai_chapter_completions",
+        "book_reflections",
+        "reading_letters",
+        "reading_memory_events",
     }
     for table in required:
         assert f"create table if not exists {table}" in sql
@@ -178,7 +183,9 @@ def test_frontend_references_real_static_files():
     assert (ROOT / "static/js/annotations-overview.js").is_file()
     assert (ROOT / "static/js/annotations-management.js").is_file()
     assert (ROOT / "static/js/reader.js").is_file()
+    assert (ROOT / "static/js/after-reading.js").is_file()
     assert (ROOT / "templates/library.html").is_file()
     assert (ROOT / "templates/reader.html").is_file()
+    assert (ROOT / "templates/after_reading.html").is_file()
     assert (ROOT / "templates/annotations_overview.html").is_file()
     assert (ROOT / "templates/annotations_management.html").is_file()

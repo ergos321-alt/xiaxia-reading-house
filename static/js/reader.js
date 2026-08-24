@@ -13,6 +13,8 @@
   const pagePrevious = document.querySelector("#page-previous");
   const pageNext = document.querySelector("#page-next");
   const pageStatus = document.querySelector("#page-status");
+  const finishBookEntry = document.querySelector("#finish-book-entry");
+  const finishBookButton = document.querySelector("#finish-book-button");
   const progressBar = document.querySelector("#reader-progress span");
   const readerMenuButton = document.querySelector("#reader-menu-button");
   const readerMenu = document.querySelector("#reader-menu");
@@ -212,6 +214,7 @@
       button.classList.toggle("current", index === state.currentIndex);
     }
     updatePageControls();
+    updateFinishEntry();
   }
 
   function applyAnnotations() {
@@ -704,11 +707,20 @@
     pageNext.hidden = !paginated;
     if (!paginated) {
       hidePageStatus(true);
+      updateFinishEntry();
       return;
     }
     pagePrevious.disabled = state.pageIndex === 0 && state.currentIndex === 0;
     pageNext.disabled = state.pageIndex >= state.pageCount - 1 && state.currentIndex >= state.chapters.length - 1;
     pageStatus.textContent = `${state.pageIndex + 1} / ${state.pageCount}`;
+    updateFinishEntry();
+  }
+
+  function updateFinishEntry() {
+    if (!finishBookEntry || !state.chapters.length) return;
+    const finalChapter = state.currentIndex === state.chapters.length - 1;
+    const finalPage = state.mode !== "paginated" || state.pageIndex >= state.pageCount - 1;
+    finishBookEntry.hidden = !(state.loaded && finalChapter && finalPage);
   }
 
   function showPageStatus() {
@@ -781,12 +793,13 @@
     });
   }
 
-  async function saveProgress(keepalive = false) {
+  async function saveProgress(keepalive = false, forceComplete = false) {
     if (!state.loaded || !state.chapters.length) return;
-    const fraction = state.mode === "paginated"
+    const fraction = forceComplete ? 1 : state.mode === "paginated"
       ? (state.pageCount > 1 ? state.pageIndex / (state.pageCount - 1) : 0)
       : utils.clamp(window.scrollY / Math.max(1, document.documentElement.scrollHeight - window.innerHeight), 0, 1);
-    const block = firstVisibleBlock();
+    const blocks = [...content.querySelectorAll("[data-block-id]")];
+    const block = forceComplete ? blocks[blocks.length - 1] : firstVisibleBlock();
     const percentage = utils.clamp(((state.currentIndex + fraction) / state.chapters.length) * 100, 0, 100);
     const payload = {
       chapter_id: state.chapters[state.currentIndex].id,
@@ -803,8 +816,24 @@
     };
     try {
       await api(`/api/books/${bookId}/progress`, { method: "PUT", body: JSON.stringify(payload), keepalive });
-    } catch (_error) {
+    } catch (error) {
+      if (forceComplete) throw error;
       // Autosave retries on the next scroll, page turn, or visibility event.
+    }
+  }
+
+  async function openAfterReading() {
+    if (!finishBookButton || finishBookButton.disabled) return;
+    finishBookButton.disabled = true;
+    finishBookButton.textContent = "正在合上这本书…";
+    try {
+      await saveProgress(true, true);
+      await api(`/api/books/${bookId}/completion`, { method: "POST" });
+      location.assign(`/reader/${bookId}/after-reading`);
+    } catch (error) {
+      finishBookButton.disabled = false;
+      finishBookButton.textContent = "合上正文，翻到读完以后";
+      showToast(`暂时还不能翻到封底：${error.message}`);
     }
   }
 
@@ -1023,6 +1052,7 @@
   nextButton.addEventListener("click", () => loadChapter(state.currentIndex + 1));
   pagePrevious.addEventListener("click", () => turnPage("previous"));
   pageNext.addEventListener("click", () => turnPage("next"));
+  finishBookButton?.addEventListener("click", openAfterReading);
   readerMenuButton.addEventListener("click", toggleReaderMenu);
   traceMenuButton.addEventListener("click", toggleTraceActions);
   modeButton.addEventListener("click", () => {
