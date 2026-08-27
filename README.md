@@ -22,6 +22,7 @@ xiaxia-reading-house/
 ├── openapi.yaml
 ├── requirements.txt
 ├── Procfile
+├── EPUB_IMPORT_PROFILE.md
 ├── .env.example
 ├── migrations/
 │   ├── 001_prepare_storage_refactor.sql
@@ -30,7 +31,8 @@ xiaxia-reading-house/
 │   ├── 004_v1_1_management.sql
 │   └── 005_v2_reading_memories.sql
 ├── scripts/
-│   └── migrate_legacy_bytea_to_storage.py
+│   ├── migrate_legacy_bytea_to_storage.py
+│   └── profile_epub_memory.py
 ├── templates/
 │   ├── login.html
 │   ├── library.html
@@ -86,12 +88,16 @@ xiaxia-reading-house/
 
 - EPUB2/EPUB3 同时支持 `toc.ncx`、`nav.xhtml`、spine 与 manifest 正文 fallback。NAV/NCX、guide、metadata、cover、CSS、font 或单张图片损坏时降级，不阻断其余正文。
 - href 会统一处理 fragment、URL encoding、相对路径、反斜杠与大小写差异；重复 spine item、空章节和不存在的 TOC 目标会跳过并写入轻量 warning。
-- 只把正文实际引用的图片与有效封面写入 private Storage；source 与必要图片使用最多 4 路有界并发上传，不保存未使用图片、字体或 CSS。
-- 全书先解析并验证出有效 normalized chapters，之后才上传 Storage 和写数据库。chapters/assets 使用批量写入；数据库异常会回滚事务，Storage 或数据库任一阶段失败都会按本次 book UUID 清理已确认上传的对象。
+- 上传请求先流式落到单次导入临时文件并计算 SHA-256，不再长期保留整本 raw bytes。正文只读取当前 XHTML；图片只分块校验并保存 archive entry/size/hash，生产路径的 `ParsedAsset` 不保存 image bytes。
+- 只把正文实际引用的图片与有效封面写入 private Storage；必要图片按 ZIP entry 流式解压、最多 2 路上传，不保存未使用图片、字体或 CSS。内容相同的图片复用同一 private object，但每个原始 asset path 仍保留独立 metadata。
+- 全书先解析并验证出有效 normalized chapters，再把 normalized HTML/text 暂存到本次导入目录，随后上传 Storage 和写数据库。chapters/assets 以生成器批量写入；数据库异常会回滚事务，Storage 或数据库任一阶段失败都会按本次 book UUID 清理已确认上传的对象。
+- 进程内只允许一本书进入导入重资源区；并发上传返回 `import_resource_exhausted`。Supabase client 首次初始化加锁，避免内部上传线程重复创建 client。
 - Gunicorn hard timeout 保持 120 秒；应用在 105 秒设置协作式安全截止，能够在 worker hard kill 前返回 `epub_import_timeout` 并清理本次导入。
-- 导入日志只记录 filename、byte size、EPUB version、manifest/spine/chapter/asset 数量、parse/storage/database/total duration、warning count 与 failure stage，不记录正文。
+- 导入日志逐阶段记录 filename、compressed/uncompressed byte size、archive/XHTML/image/font 数量、EPUB version、manifest/spine/chapter/asset 数量、parse/storage/database/total duration、current/peak RSS、warning count 与 failure stage，不记录正文。
 
-稳定错误码包括：`unsupported_archive`、`invalid_epub`、`no_readable_content`、`epub_parse_failed`、`epub_import_timeout`、`storage_upload_failed` 与 `database_write_failed`。响应只返回用户可理解的短消息，不暴露 traceback、连接串或数据库细节。
+稳定错误码包括：`unsupported_archive`、`invalid_epub`、`no_readable_content`、`epub_parse_failed`、`epub_import_timeout`、`storage_upload_failed`、`database_write_failed`、`import_worker_terminated` 与 `import_resource_exhausted`。浏览器只在 import 收到无 JSON 的 upstream 502/503 时推断 worker/resource 分类；后端明确返回的 Storage 错误不会被覆盖。响应只返回用户可理解的短消息，不暴露 traceback、连接串或数据库细节。
+
+三本真实失败 EPUB 的 archive 结构、修改前后阶段 RSS、2×4 并发压力结果与完整导入结果见 `EPUB_IMPORT_PROFILE.md`。
 
 EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading House `chapter_id + block_id + fragment`。同页/跨页脚注会在当前页打开轻量注释纸片；普通章节链接和 backlink 在阅读器内部跳转。缺失脚注显示 `footnote_target_missing`，浏览器不会导航到原 EPUB 相对路径或 404。
 
@@ -150,7 +156,7 @@ EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading H
 | `FLASK_SECRET_KEY` | 是 | 独立随机 Session 签名密钥 |
 | `MAX_UPLOAD_MB` | 否 | 默认 50 |
 | `DB_POOL_MIN` | 否 | 默认 1，免费实例可设 0 |
-| `DB_POOL_MAX` | 否 | 默认 5 |
+| `DB_POOL_MAX` | 否 | 默认 2，与单 worker / 2 threads 对齐 |
 | `COOKIE_SECURE` | 否 | Render HTTPS 保持 true |
 
 `SUPABASE_SERVICE_ROLE_KEY` 只能存在于 Render 后端环境变量或本地未提交 `.env`；不得写进 Git、HTML、JavaScript、OpenAPI 或聊天正文。本轮没有新增外部服务，也没有新增必填环境变量。
@@ -159,7 +165,7 @@ EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading H
 
 1. 把整个目录提交到 Git 仓库，Render 新建 Python Web Service。
 2. Build Command：`pip install -r requirements.txt`
-3. Start Command：`gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120 app:app`
+3. Start Command：`gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120 app:app`
 4. Health Check Path：`/health`
 5. 配置上表七个必填环境变量后部署。
 

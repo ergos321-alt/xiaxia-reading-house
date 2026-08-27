@@ -21,7 +21,7 @@ def init_app(app: Any) -> None:
     global _database_url, _pool_min, _pool_max
     _database_url = app.config.get("DATABASE_URL") or None
     _pool_min = int(app.config.get("DB_POOL_MIN", 1))
-    _pool_max = int(app.config.get("DB_POOL_MAX", 5))
+    _pool_max = int(app.config.get("DB_POOL_MAX", 2))
 
 
 def _get_pool() -> ConnectionPool:

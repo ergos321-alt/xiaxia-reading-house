@@ -25,8 +25,27 @@
     const response = await fetch(url, { credentials: "same-origin", ...options, headers });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const error = new Error(data.message || data.error || `请求失败 (${response.status})`);
-      error.data = data;
+      const upstreamFailures = {
+        502: {
+          error: "import_worker_terminated",
+          message: "导入进程被服务器终止，通常是可用内存或进程资源不足；本次书籍未完成导入",
+        },
+        503: {
+          error: "import_resource_exhausted",
+          message: "导入服务当前资源不足，请稍后重试",
+        },
+        504: {
+          error: "epub_import_timeout",
+          message: "导入超过服务器处理时间，本次书籍未完成导入",
+        },
+      };
+      const isBookImport = url === "/api/books" && options.method === "POST";
+      const diagnostic = data.error
+        ? data
+        : ((isBookImport && upstreamFailures[response.status]) || data);
+      const error = new Error(diagnostic.message || diagnostic.error || `请求失败 (${response.status})`);
+      error.data = diagnostic;
+      error.code = diagnostic.error || "book_import_failed";
       throw error;
     }
     return data;

@@ -76,7 +76,14 @@ def parsed_book(chapter_count=1):
             )
             for index in range(chapter_count)
         ],
-        assets=[ParsedAsset("Images/used.png", "image/png", b"image")],
+        assets=[
+            ParsedAsset(
+                "Images/used.png",
+                "image/png",
+                b"image",
+                archive_path="Images/used.png",
+            )
+        ],
         epub_version="3.0",
         manifest_item_count=chapter_count + 1,
         spine_item_count=chapter_count,
@@ -107,12 +114,21 @@ def install_pipeline(monkeypatch, connection, parsed, uploaded, deleted):
         yield connection
 
     monkeypatch.setattr(reading.db, "transaction", transaction)
-    monkeypatch.setattr(reading, "parse_uploaded_book", lambda *_args: parsed)
+    monkeypatch.setattr(
+        reading, "parse_uploaded_book_path", lambda *_args, **_kwargs: parsed
+    )
     monkeypatch.setattr(
         reading.object_storage,
-        "upload_many",
-        lambda objects: uploaded.extend(path for path, _data, _type in objects)
-        or [path for path, _data, _type in objects],
+        "upload_file",
+        lambda path, _file, _type: uploaded.append(path),
+    )
+    monkeypatch.setattr(
+        reading.object_storage,
+        "upload_archive_entries",
+        lambda _archive, objects, **_kwargs: uploaded.extend(
+            path for path, _entry, _type in objects
+        )
+        or [path for path, _entry, _type in objects],
     )
     monkeypatch.setattr(
         reading.object_storage,
@@ -136,6 +152,21 @@ def test_five_hundred_chapters_use_two_bulk_database_calls(monkeypatch):
     assert batches == {"assets": 1, "chapters": 500}
     assert len(uploaded) == 2
     assert deleted == []
+
+
+def test_second_concurrent_import_is_rejected_before_reading_upload(monkeypatch):
+    assert reading._IMPORT_LOCK.acquire(blocking=False)
+    try:
+        response = client().post(
+            "/api/books",
+            data={"file": (BytesIO(b"epub"), "poems.epub")},
+            content_type="multipart/form-data",
+        )
+    finally:
+        reading._IMPORT_LOCK.release()
+
+    assert response.status_code == 429
+    assert response.get_json()["error"] == "import_resource_exhausted"
 
 
 def test_database_failure_rolls_back_storage_and_returns_stable_error(monkeypatch):
@@ -162,13 +193,22 @@ def test_partial_storage_failure_cleans_only_confirmed_uploads(monkeypatch):
         yield connection
 
     monkeypatch.setattr(reading.db, "transaction", transaction)
-    monkeypatch.setattr(reading, "parse_uploaded_book", lambda *_args: parsed_book())
+    monkeypatch.setattr(
+        reading,
+        "parse_uploaded_book_path",
+        lambda *_args, **_kwargs: parsed_book(),
+    )
     monkeypatch.setattr(
         reading.object_storage,
-        "upload_many",
-        lambda _objects: (_ for _ in ()).throw(
+        "upload_file",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        reading.object_storage,
+        "upload_archive_entries",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
             reading.object_storage.ObjectStorageBatchError(
-                "forced storage failure", ["books/partial/source/source.epub"]
+                "forced storage failure", ["books/partial/assets/used.png"]
             )
         ),
     )
@@ -182,7 +222,9 @@ def test_partial_storage_failure_cleans_only_confirmed_uploads(monkeypatch):
     )
     assert response.status_code == 502
     assert response.get_json()["error"] == "storage_upload_failed"
-    assert deleted == ["books/partial/source/source.epub"]
+    assert len(deleted) == 2
+    assert "books/partial/assets/used.png" in deleted
+    assert any(path.endswith("/source/source.epub") for path in deleted)
     assert not any("insert into books" in query for query, _params in connection.execute_queries)
 
 
@@ -190,15 +232,15 @@ def test_timeout_like_parse_interruption_returns_408_without_persistence(monkeyp
     called = {"storage": False, "database": False}
     monkeypatch.setattr(
         reading,
-        "parse_uploaded_book",
-        lambda *_args: (_ for _ in ()).throw(
+        "parse_uploaded_book_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
             BookParseError("超时", "epub_import_timeout")
         ),
     )
     monkeypatch.setattr(
         reading.object_storage,
-        "upload_many",
-        lambda _objects: called.__setitem__("storage", True),
+        "upload_file",
+        lambda *_args: called.__setitem__("storage", True),
     )
 
     @contextmanager
@@ -222,8 +264,7 @@ def test_deadline_after_storage_upload_cleans_objects_before_database(monkeypatc
     uploaded = []
     deleted = []
     install_pipeline(monkeypatch, connection, parsed_book(), uploaded, deleted)
-    clock = iter([0.0, 1.0, 2.0, 3.0, 4.0, 106.0, 107.0])
-    monkeypatch.setattr(reading.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(reading, "IMPORT_DEADLINE_SECONDS", -1)
     response = client().post(
         "/api/books",
         data={"file": (BytesIO(b"epub"), "book.epub")},

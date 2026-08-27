@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shutil
+import tempfile
+import threading
+import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import UUID
 
@@ -24,10 +29,15 @@ class ObjectStorageBatchError(ObjectStorageError):
         self.uploaded_paths = uploaded_paths
 
 
+class ObjectStorageDeadlineError(ObjectStorageBatchError):
+    """The caller's import deadline expired during a bounded asset batch."""
+
+
 _client: Client | None = None
 _supabase_url: str | None = None
 _service_role_key: str | None = None
 _bucket_name: str | None = None
+_client_lock = threading.Lock()
 
 
 def init_app(app: Any) -> None:
@@ -63,8 +73,25 @@ def upload_bytes(object_path: str, data: bytes, media_type: str) -> None:
         raise ObjectStorageError("Supabase Storage upload failed") from exc
 
 
+def upload_file(object_path: str, file_path: str | Path, media_type: str) -> None:
+    """Stream one local file to Storage without materialising it as bytes."""
+    try:
+        with Path(file_path).open("rb") as source:
+            _bucket().upload(
+                path=object_path,
+                file=source,
+                file_options={
+                    "content-type": media_type,
+                    "cache-control": "86400",
+                    "upsert": "false",
+                },
+            )
+    except Exception as exc:
+        raise ObjectStorageError("Supabase Storage upload failed") from exc
+
+
 def upload_many(
-    objects: list[tuple[str, bytes, str]], *, max_workers: int = 4
+    objects: list[tuple[str, bytes, str]], *, max_workers: int = 2
 ) -> list[str]:
     """Upload distinct required objects with small bounded concurrency.
 
@@ -99,6 +126,77 @@ def upload_many(
     return sorted(uploaded)
 
 
+def upload_archive_entries(
+    archive_path: str | Path,
+    objects: list[tuple[str, str, str]],
+    *,
+    max_workers: int = 2,
+    deadline: float | None = None,
+) -> list[str]:
+    """Extract and upload only selected ZIP entries with bounded memory."""
+    unique: dict[str, tuple[str, str]] = {}
+    for object_path, entry_path, media_type in objects:
+        unique.setdefault(object_path, (entry_path, media_type))
+    if not unique:
+        return []
+
+    uploaded: list[str] = []
+    worker_count = max(1, min(max_workers, len(unique)))
+    with tempfile.TemporaryDirectory(prefix="rh-epub-assets-") as temp_dir:
+        temp_root = Path(temp_dir)
+
+        def extract_and_upload(
+            index: int,
+            object_path: str,
+            entry_path: str,
+            media_type: str,
+        ) -> str:
+            if deadline is not None and time.perf_counter() >= deadline:
+                raise TimeoutError("book import deadline reached")
+            staged_path = temp_root / f"asset-{index:06d}"
+            with zipfile.ZipFile(archive_path) as archive:
+                with archive.open(entry_path) as source:
+                    with staged_path.open("wb") as target:
+                        shutil.copyfileobj(source, target, length=256 * 1024)
+            upload_file(object_path, staged_path, media_type)
+            staged_path.unlink(missing_ok=True)
+            return object_path
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    extract_and_upload,
+                    index,
+                    object_path,
+                    entry_path,
+                    media_type,
+                ): object_path
+                for index, (object_path, (entry_path, media_type)) in enumerate(
+                    unique.items()
+                )
+            }
+            failure: Exception | None = None
+            deadline_reached = False
+            for future in as_completed(futures):
+                try:
+                    uploaded.append(future.result())
+                except Exception as exc:
+                    failure = failure or exc
+                    deadline_reached = deadline_reached or isinstance(
+                        exc, TimeoutError
+                    )
+            if failure is not None:
+                error_type = (
+                    ObjectStorageDeadlineError
+                    if deadline_reached
+                    else ObjectStorageBatchError
+                )
+                raise error_type(
+                    "Supabase Storage archive upload failed", sorted(uploaded)
+                ) from failure
+    return sorted(uploaded)
+
+
 def download_bytes(object_path: str) -> bytes:
     """Download one object from the private bucket on the server."""
     try:
@@ -114,8 +212,9 @@ def delete_objects(object_paths: list[str]) -> None:
         return
     try:
         # Keep requests comfortably below provider batch limits for image-heavy EPUBs.
-        for start in range(0, len(object_paths), 100):
-            _bucket().remove(object_paths[start : start + 100])
+        unique_paths = sorted(set(object_paths))
+        for start in range(0, len(unique_paths), 100):
+            _bucket().remove(unique_paths[start : start + 100])
     except Exception as exc:
         raise ObjectStorageError("Supabase Storage cleanup failed") from exc
 
@@ -135,12 +234,21 @@ def ping() -> bool:
         return False
 
 
-def object_path_for_asset(book_id: UUID, asset_path: str, is_cover: bool) -> str:
+def object_path_for_asset(
+    book_id: UUID,
+    asset_path: str,
+    is_cover: bool,
+    content_sha256: str | None = None,
+) -> str:
     """Return the deterministic private object path for one EPUB asset."""
     suffix = PurePosixPath(asset_path).suffix.lower()
     if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
         suffix = ""
-    digest = hashlib.sha256(asset_path.encode("utf-8")).hexdigest()[:24]
+    digest = (
+        content_sha256
+        if content_sha256 and re.fullmatch(r"[a-f0-9]{64}", content_sha256)
+        else hashlib.sha256(asset_path.encode("utf-8")).hexdigest()
+    )[:24]
     category = "cover" if is_cover else "assets"
     return f"books/{book_id}/{category}/{digest}{suffix}"
 
@@ -154,7 +262,9 @@ def _get_client() -> Client:
     if not _supabase_url or not _service_role_key:
         raise ObjectStorageError("Supabase Storage is not configured")
     if _client is None:
-        _client = create_client(_supabase_url, _service_role_key)
+        with _client_lock:
+            if _client is None:
+                _client = create_client(_supabase_url, _service_role_key)
     return _client
 
 

@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import gc
+import hashlib
 import json
 import logging
+import os
+import resource
+import tempfile
+import threading
 import time
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterable
 from urllib.parse import unquote
 from uuid import UUID, uuid4
 
@@ -17,7 +24,7 @@ from psycopg.types.json import Jsonb
 import database as db
 import storage as object_storage
 from auth import action_required, api_or_session_required, web_api_required
-from epub_parser import BookParseError, parse_uploaded_book
+from epub_parser import BookParseError, parse_uploaded_book_path
 
 
 reading_bp = Blueprint("reading", __name__)
@@ -32,6 +39,8 @@ BOOK_FIELDS = """
 ACTION_CHUNK_TARGET_CHARS = 6000
 ACTION_CHUNK_MAX_CHARS = 8000
 IMPORT_DEADLINE_SECONDS = 105
+UPLOAD_STREAM_CHUNK_BYTES = 1024 * 1024
+_IMPORT_LOCK = threading.BoundedSemaphore(1)
 
 
 class ImportDeadlineExceeded(RuntimeError):
@@ -60,63 +69,349 @@ def list_books():
 @reading_bp.post("/api/books")
 @web_api_required
 def upload_book():
-    started_at = time.perf_counter()
-    deadline = started_at + IMPORT_DEADLINE_SECONDS
-    stage = "request"
     upload = request.files.get("file")
     if upload is None or not upload.filename:
         return jsonify({"error": "file_required"}), 400
     filename = (
-        upload.filename.replace("\\", "/").rsplit("/", 1)[-1].replace("\x00", "")[:255]
+        upload.filename.replace("\\", "/")
+        .rsplit("/", 1)[-1]
+        .replace("\x00", "")[:255]
     )
     if not filename:
         return jsonify({"error": "invalid_filename"}), 400
-    raw = upload.read()
-    _log_import(
-        "started",
-        filename=filename,
-        size=len(raw),
-        failure_stage=None,
-    )
-    stage = "parse"
-    parse_started = time.perf_counter()
+    if not _IMPORT_LOCK.acquire(blocking=False):
+        return (
+            jsonify(
+                {
+                    "error": "import_resource_exhausted",
+                    "message": "当前已有一本书正在导入，请等待完成后再试",
+                }
+            ),
+            429,
+        )
     try:
-        parsed = parse_uploaded_book(filename, raw, deadline)
-    except BookParseError as exc:
+        return _upload_book_locked(upload, filename)
+    finally:
+        _IMPORT_LOCK.release()
+
+
+def _upload_book_locked(upload: Any, filename: str):
+    started_at = time.perf_counter()
+    deadline = started_at + IMPORT_DEADLINE_SECONDS
+    memory = _ImportMemoryProbe()
+    stage = "request"
+    suffix = PurePosixPath(filename).suffix.lower() or ".upload"
+    with tempfile.TemporaryDirectory(prefix="rh-book-import-") as temp_dir:
+        source_path = Path(temp_dir) / f"source{suffix}"
+        source_size, source_sha256 = _spool_upload(upload, source_path)
+
+        def observe(stage_name: str) -> None:
+            memory.mark(stage_name)
+            _log_import(
+                "stage",
+                filename=filename,
+                archive_compressed_size=source_size,
+                stage=stage_name,
+                **memory.fields(),
+            )
+
         _log_import(
-            "failed",
+            "started",
             filename=filename,
-            size=len(raw),
-            total_duration=_duration(started_at),
-            failure_stage=stage,
-            error_code=exc.code,
+            archive_compressed_size=source_size,
+            failure_stage=None,
+            **memory.fields(),
         )
-        status = 408 if exc.code == "epub_import_timeout" else 422
-        return jsonify({"error": exc.code, "message": str(exc)}), status
-    parse_duration = _duration(parse_started)
-
-    book_id = uuid4()
-    source_media_type = (
-        "application/epub+zip" if parsed.format == "epub" else "text/plain"
-    )
-    source_object_path = f"books/{book_id}/source/source.{parsed.format}"
-    uploaded_objects: list[str] = []
-    asset_records: list[tuple[Any, str]] = []
-    upload_objects = [(source_object_path, raw, source_media_type)]
-    for asset in parsed.assets:
-        object_path = object_storage.object_path_for_asset(
-            book_id, asset.path, asset.path == parsed.cover_asset_path
+        stage = "parse"
+        parse_started = time.perf_counter()
+        observe("parse_before")
+        try:
+            parsed = parse_uploaded_book_path(
+                filename,
+                source_path,
+                deadline,
+                source_sha256=source_sha256,
+                stage_observer=observe,
+            )
+        except BookParseError as exc:
+            observe("parse_after")
+            _log_import(
+                "failed",
+                filename=filename,
+                archive_compressed_size=source_size,
+                total_duration=_duration(started_at),
+                failure_stage=stage,
+                error_code=exc.code,
+                **memory.fields(),
+            )
+            status = 408 if exc.code == "epub_import_timeout" else 422
+            return jsonify({"error": exc.code, "message": str(exc)}), status
+        observe("parse_after")
+        parse_duration = _duration(parse_started)
+        _log_import(
+            "parsed",
+            filename=filename,
+            archive_compressed_size=source_size,
+            archive_uncompressed_size=parsed.archive_uncompressed_size,
+            archive_item_count=parsed.archive_item_count,
+            xhtml_count=parsed.xhtml_item_count,
+            image_count=parsed.image_item_count,
+            font_count=parsed.font_item_count,
+            epub_version=parsed.epub_version,
+            manifest_item_count=parsed.manifest_item_count,
+            spine_item_count=parsed.spine_item_count,
+            chapter_count=len(parsed.chapters),
+            asset_count=len(parsed.assets),
+            parse_duration=parse_duration,
+            warning_count=len(parsed.warnings),
+            **memory.fields(),
         )
-        asset_records.append((asset, object_path))
-        upload_objects.append((object_path, asset.data, asset.media_type))
+        chapter_content = _stage_normalized_chapters(
+            parsed.chapters, Path(temp_dir)
+        )
+        gc.collect()
+        _release_unused_heap()
+        observe("normalized_ready")
 
-    try:
-        stage = "duplicate_check"
-        with db.transaction() as conn:
-            existing = conn.execute(
+        book_id = uuid4()
+        source_media_type = (
+            "application/epub+zip" if parsed.format == "epub" else "text/plain"
+        )
+        source_object_path = f"books/{book_id}/source/source.{parsed.format}"
+        uploaded_objects: list[str] = []
+        asset_records: list[tuple[Any, str]] = []
+        asset_uploads: dict[str, tuple[str, str, str]] = {}
+        for asset in parsed.assets:
+            object_path = object_storage.object_path_for_asset(
+                book_id,
+                asset.path,
+                asset.path == parsed.cover_asset_path,
+                asset.content_sha256,
+            )
+            asset_records.append((asset, object_path))
+            if parsed.format == "epub" and asset.archive_path:
+                asset_uploads.setdefault(
+                    object_path,
+                    (object_path, asset.archive_path, asset.media_type),
+                )
+
+        try:
+            stage = "duplicate_check"
+            with db.transaction() as conn:
+                existing = conn.execute(
+                    "select id, title from books where source_sha256 = %s",
+                    (parsed.source_sha256,),
+                ).fetchone()
+                if existing:
+                    return (
+                        jsonify(
+                            {
+                                "error": "book_already_exists",
+                                "book_id": str(existing["id"]),
+                                "title": existing["title"],
+                            }
+                        ),
+                        409,
+                    )
+
+            stage = "storage"
+            storage_started = time.perf_counter()
+            observe("storage_before")
+            object_storage.upload_file(
+                source_object_path, source_path, source_media_type
+            )
+            uploaded_objects.append(source_object_path)
+            if time.perf_counter() >= deadline:
+                raise ImportDeadlineExceeded
+            if asset_uploads:
+                uploaded_objects.extend(
+                    object_storage.upload_archive_entries(
+                        source_path,
+                        list(asset_uploads.values()),
+                        max_workers=2,
+                        deadline=deadline,
+                    )
+                )
+            observe("storage_after")
+            storage_duration = _duration(storage_started)
+            if time.perf_counter() >= deadline:
+                raise ImportDeadlineExceeded
+
+            chapter_ids = [uuid4() for _chapter in parsed.chapters]
+            first_chapter_id = chapter_ids[0]
+            stage = "database"
+            database_started = time.perf_counter()
+            observe("database_before")
+            with db.transaction() as conn:
+                book = conn.execute(
+                    """
+                    insert into books (
+                        id, title, author, format, source_filename, source_sha256,
+                        source_object_path, source_media_type, source_byte_size,
+                        cover_asset_path, chapter_count, toc
+                    ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    returning id, title, author, format, source_filename,
+                              cover_asset_path, chapter_count, toc, created_at, updated_at
+                    """,
+                    (
+                        book_id,
+                        parsed.title,
+                        parsed.author,
+                        parsed.format,
+                        parsed.source_filename,
+                        parsed.source_sha256,
+                        source_object_path,
+                        source_media_type,
+                        source_size,
+                        parsed.cover_asset_path,
+                        len(parsed.chapters),
+                        Jsonb(parsed.toc),
+                    ),
+                ).fetchone()
+
+                _bulk_execute(
+                    conn,
+                    """
+                    insert into book_assets (
+                        book_id, asset_path, object_path, media_type, byte_size
+                    ) values (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        (
+                            book_id,
+                            asset.path,
+                            object_path,
+                            asset.media_type,
+                            asset.byte_size,
+                        )
+                        for asset, object_path in asset_records
+                    ),
+                )
+                _bulk_execute(
+                    conn,
+                    """
+                    insert into chapters (
+                        id, book_id, chapter_index, title, href, content_html,
+                        content_text, word_count
+                    ) values (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        (
+                            chapter_ids[index],
+                            book_id,
+                            chapter.chapter_index,
+                            chapter.title,
+                            chapter.href,
+                            chapter_content[index][0].read_text(
+                                encoding="utf-8"
+                            ),
+                            chapter_content[index][1].read_text(
+                                encoding="utf-8"
+                            ),
+                            chapter.word_count,
+                        )
+                        for index, chapter in enumerate(parsed.chapters)
+                    ),
+                )
+                conn.execute(
+                    """
+                    insert into reading_progress (
+                        book_id, chapter_id, chapter_index, position, percentage
+                    ) values (%s, %s, 0, %s, 0)
+                    """,
+                    (
+                        book_id,
+                        first_chapter_id,
+                        Jsonb(
+                            {
+                                "block_id": "b000001",
+                                "char_offset": 0,
+                                "scroll_fraction": 0,
+                            }
+                        ),
+                    ),
+                )
+                conn.execute(
+                    "insert into ai_reading_state (book_id) values (%s)",
+                    (book_id,),
+                )
+            observe("database_after")
+            database_duration = _duration(database_started)
+        except ImportDeadlineExceeded:
+            _cleanup_uploaded_objects(uploaded_objects)
+            _log_import(
+                "failed",
+                filename=filename,
+                archive_compressed_size=source_size,
+                parse_duration=parse_duration,
+                total_duration=_duration(started_at),
+                failure_stage=stage,
+                error_code="epub_import_timeout",
+                **memory.fields(),
+            )
+            return (
+                jsonify(
+                    {
+                        "error": "epub_import_timeout",
+                        "message": "导入超过安全处理时间，未保存任何不完整书籍",
+                    }
+                ),
+                408,
+            )
+        except object_storage.ObjectStorageDeadlineError as exc:
+            uploaded_objects = sorted(
+                set(uploaded_objects).union(exc.uploaded_paths)
+            )
+            _cleanup_uploaded_objects(uploaded_objects)
+            _log_import(
+                "failed",
+                filename=filename,
+                archive_compressed_size=source_size,
+                parse_duration=parse_duration,
+                total_duration=_duration(started_at),
+                failure_stage=stage,
+                error_code="epub_import_timeout",
+                **memory.fields(),
+            )
+            return (
+                jsonify(
+                    {
+                        "error": "epub_import_timeout",
+                        "message": "导入超过安全处理时间，未保存任何不完整书籍",
+                    }
+                ),
+                408,
+            )
+        except object_storage.ObjectStorageBatchError as exc:
+            uploaded_objects = sorted(
+                set(uploaded_objects).union(exc.uploaded_paths)
+            )
+            _cleanup_uploaded_objects(uploaded_objects)
+            _log_import(
+                "failed",
+                filename=filename,
+                archive_compressed_size=source_size,
+                parse_duration=parse_duration,
+                total_duration=_duration(started_at),
+                failure_stage=stage,
+                error_code="storage_upload_failed",
+                **memory.fields(),
+            )
+            return (
+                jsonify(
+                    {
+                        "error": "storage_upload_failed",
+                        "message": "书籍资源保存失败，已撤销本次导入",
+                    }
+                ),
+                502,
+            )
+        except UniqueViolation:
+            _cleanup_uploaded_objects(uploaded_objects)
+            existing = db.fetch_one(
                 "select id, title from books where source_sha256 = %s",
                 (parsed.source_sha256,),
-            ).fetchone()
+            )
             if existing:
                 return (
                     jsonify(
@@ -128,219 +423,70 @@ def upload_book():
                     ),
                     409,
                 )
-
-        stage = "storage"
-        storage_started = time.perf_counter()
-        uploaded_objects = object_storage.upload_many(upload_objects)
-        storage_duration = _duration(storage_started)
-        if time.perf_counter() >= deadline:
-            raise ImportDeadlineExceeded
-
-        chapter_records = [
-            (
-                uuid4(),
-                book_id,
-                chapter.chapter_index,
-                chapter.title,
-                chapter.href,
-                chapter.content_html,
-                chapter.content_text,
-                chapter.word_count,
-            )
-            for chapter in parsed.chapters
-        ]
-        first_chapter_id = chapter_records[0][0]
-
-        stage = "database"
-        database_started = time.perf_counter()
-        with db.transaction() as conn:
-            book = conn.execute(
-                """
-                insert into books (
-                    id, title, author, format, source_filename, source_sha256,
-                    source_object_path, source_media_type, source_byte_size,
-                    cover_asset_path, chapter_count, toc
-                ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                returning id, title, author, format, source_filename,
-                          cover_asset_path, chapter_count, toc, created_at, updated_at
-                """,
-                (
-                    book_id,
-                    parsed.title,
-                    parsed.author,
-                    parsed.format,
-                    parsed.source_filename,
-                    parsed.source_sha256,
-                    source_object_path,
-                    source_media_type,
-                    len(raw),
-                    parsed.cover_asset_path,
-                    len(parsed.chapters),
-                    Jsonb(parsed.toc),
-                ),
-            ).fetchone()
-
-            _bulk_execute(
-                conn,
-                """
-                insert into book_assets (
-                    book_id, asset_path, object_path, media_type, byte_size
-                ) values (%s, %s, %s, %s, %s)
-                """,
-                [
-                    (
-                        book_id,
-                        asset.path,
-                        object_path,
-                        asset.media_type,
-                        len(asset.data),
-                    )
-                    for asset, object_path in asset_records
-                ],
-            )
-            _bulk_execute(
-                conn,
-                """
-                insert into chapters (
-                    id, book_id, chapter_index, title, href, content_html,
-                    content_text, word_count
-                ) values (%s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                chapter_records,
-            )
-            conn.execute(
-                """
-                insert into reading_progress (
-                    book_id, chapter_id, chapter_index, position, percentage
-                ) values (%s, %s, 0, %s, 0)
-                """,
-                (
-                    book_id,
-                    first_chapter_id,
-                    Jsonb(
-                        {
-                            "block_id": "b000001",
-                            "char_offset": 0,
-                            "scroll_fraction": 0,
-                        }
-                    ),
-                ),
-            )
-            conn.execute(
-                "insert into ai_reading_state (book_id) values (%s)", (book_id,)
-            )
-        database_duration = _duration(database_started)
-    except ImportDeadlineExceeded:
-        _cleanup_uploaded_objects(uploaded_objects)
-        _log_import(
-            "failed",
-            filename=filename,
-            size=len(raw),
-            parse_duration=parse_duration,
-            total_duration=_duration(started_at),
-            failure_stage=stage,
-            error_code="epub_import_timeout",
-        )
-        return (
-            jsonify(
-                {
-                    "error": "epub_import_timeout",
-                    "message": "导入超过安全处理时间，未保存任何不完整书籍",
-                }
-            ),
-            408,
-        )
-    except object_storage.ObjectStorageBatchError as exc:
-        uploaded_objects = exc.uploaded_paths
-        _cleanup_uploaded_objects(uploaded_objects)
-        _log_import(
-            "failed",
-            filename=filename,
-            size=len(raw),
-            parse_duration=parse_duration,
-            total_duration=_duration(started_at),
-            failure_stage=stage,
-            error_code="storage_upload_failed",
-        )
-        return (
-            jsonify(
-                {
-                    "error": "storage_upload_failed",
-                    "message": "书籍资源保存失败，已撤销本次导入",
-                }
-            ),
-            502,
-        )
-    except UniqueViolation:
-        _cleanup_uploaded_objects(uploaded_objects)
-        existing = db.fetch_one(
-            "select id, title from books where source_sha256 = %s",
-            (parsed.source_sha256,),
-        )
-        if existing:
             return (
                 jsonify(
                     {
-                        "error": "book_already_exists",
-                        "book_id": str(existing["id"]),
-                        "title": existing["title"],
+                        "error": "database_write_failed",
+                        "message": "书籍写入失败，已撤销本次导入",
                     }
                 ),
-                409,
+                500,
             )
-        return (
-            jsonify(
-                {
-                    "error": "database_write_failed",
-                    "message": "书籍写入失败，已撤销本次导入",
-                }
-            ),
-            500,
-        )
-    except Exception:
-        _cleanup_uploaded_objects(uploaded_objects)
-        logger.exception("book_import database_or_storage_failure stage=%s", stage)
-        error_code = (
-            "storage_upload_failed" if stage == "storage" else "database_write_failed"
-        )
-        status = 502 if stage == "storage" else 500
+        except Exception:
+            _cleanup_uploaded_objects(uploaded_objects)
+            logger.exception(
+                "book_import database_or_storage_failure stage=%s", stage
+            )
+            error_code = (
+                "storage_upload_failed"
+                if stage == "storage"
+                else "database_write_failed"
+            )
+            status = 502 if stage == "storage" else 500
+            _log_import(
+                "failed",
+                filename=filename,
+                archive_compressed_size=source_size,
+                parse_duration=parse_duration,
+                total_duration=_duration(started_at),
+                failure_stage=stage,
+                error_code=error_code,
+                **memory.fields(),
+            )
+            return (
+                jsonify(
+                    {
+                        "error": error_code,
+                        "message": "书籍导入失败，已撤销本次导入",
+                    }
+                ),
+                status,
+            )
+
         _log_import(
-            "failed",
+            "completed",
             filename=filename,
-            size=len(raw),
+            archive_compressed_size=source_size,
+            archive_uncompressed_size=parsed.archive_uncompressed_size,
+            archive_item_count=parsed.archive_item_count,
+            xhtml_count=parsed.xhtml_item_count,
+            image_count=parsed.image_item_count,
+            font_count=parsed.font_item_count,
+            epub_version=parsed.epub_version,
+            manifest_item_count=parsed.manifest_item_count,
+            spine_item_count=parsed.spine_item_count,
+            chapter_count=len(parsed.chapters),
+            asset_count=len(parsed.assets),
+            storage_upload_count=1 + len(asset_uploads),
             parse_duration=parse_duration,
+            storage_duration=storage_duration,
+            database_duration=database_duration,
             total_duration=_duration(started_at),
-            failure_stage=stage,
-            error_code=error_code,
+            failure_stage=None,
+            warning_count=len(parsed.warnings),
+            **memory.fields(),
         )
-        return (
-            jsonify(
-                {
-                    "error": error_code,
-                    "message": "书籍导入失败，已撤销本次导入",
-                }
-            ),
-            status,
-        )
-
-    _log_import(
-        "completed",
-        filename=filename,
-        size=len(raw),
-        epub_version=parsed.epub_version,
-        manifest_item_count=parsed.manifest_item_count,
-        spine_item_count=parsed.spine_item_count,
-        chapter_count=len(parsed.chapters),
-        asset_count=len(parsed.assets),
-        parse_duration=parse_duration,
-        storage_duration=storage_duration,
-        database_duration=database_duration,
-        total_duration=_duration(started_at),
-        failure_stage=None,
-        warning_count=len(parsed.warnings),
-    )
-
-    return jsonify({"book": _serialize_book(book)}), 201
+        return jsonify({"book": _serialize_book(book)}), 201
 
 
 @reading_bp.get("/api/books/<uuid:book_id>")
@@ -1184,16 +1330,95 @@ def _cleanup_uploaded_objects(object_paths: list[str]) -> None:
         )
 
 
-def _bulk_execute(conn: Any, query: str, rows: list[tuple[Any, ...]]) -> None:
+def _bulk_execute(
+    conn: Any, query: str, rows: Iterable[tuple[Any, ...]]
+) -> None:
     """Use psycopg pipeline-backed executemany; keep simple test doubles usable."""
-    if not rows:
-        return
     executemany = getattr(conn, "executemany", None)
     if callable(executemany):
         executemany(query, rows)
         return
     for row in rows:
         conn.execute(query, row)
+
+
+def _spool_upload(upload: Any, target: Path) -> tuple[int, str]:
+    """Copy the request stream to disk while hashing it with bounded memory."""
+    digest = hashlib.sha256()
+    byte_size = 0
+    with target.open("wb") as destination:
+        while chunk := upload.stream.read(UPLOAD_STREAM_CHUNK_BYTES):
+            destination.write(chunk)
+            digest.update(chunk)
+            byte_size += len(chunk)
+    return byte_size, digest.hexdigest()
+
+
+def _stage_normalized_chapters(
+    chapters: list[Any], temp_root: Path
+) -> list[tuple[Path, Path]]:
+    """Move normalized chapter bodies out of RAM until the DB transaction."""
+    staged: list[tuple[Path, Path]] = []
+    chapter_root = temp_root / "normalized-chapters"
+    chapter_root.mkdir()
+    for index, chapter in enumerate(chapters):
+        html_path = chapter_root / f"{index:06d}.html"
+        text_path = chapter_root / f"{index:06d}.txt"
+        html_path.write_text(chapter.content_html, encoding="utf-8")
+        text_path.write_text(chapter.content_text, encoding="utf-8")
+        chapter.content_html = ""
+        chapter.content_text = ""
+        staged.append((html_path, text_path))
+    return staged
+
+
+def _release_unused_heap() -> None:
+    """Best-effort Linux heap trim after large transient DOMs are released."""
+    try:
+        import ctypes
+
+        trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+        if trim is not None:
+            trim(0)
+    except (AttributeError, OSError):
+        return
+
+
+def _current_rss_mb() -> float:
+    try:
+        with open("/proc/self/statm", encoding="ascii") as status:
+            resident_pages = int(status.read().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        return _peak_rss_mb()
+
+
+def _peak_rss_mb() -> float:
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+class _ImportMemoryProbe:
+    """Collect lightweight process RSS checkpoints for structured logs."""
+
+    def __init__(self) -> None:
+        self._values: dict[str, float] = {}
+        self.mark("request")
+
+    def mark(self, stage: str) -> None:
+        self._values[f"{stage}_rss_mb"] = round(_current_rss_mb(), 2)
+
+    def fields(self) -> dict[str, float]:
+        return {
+            **self._values,
+            "peak_rss_mb": round(_peak_rss_mb(), 2),
+        }
 
 
 def _duration(started_at: float) -> float:

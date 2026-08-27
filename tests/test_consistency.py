@@ -30,6 +30,14 @@ def test_required_database_tables_are_declared():
         assert f"create table if not exists {table}" in sql
 
 
+def test_render_process_shape_preserves_import_memory_headroom():
+    command = (ROOT / "Procfile").read_text(encoding="utf-8")
+
+    assert "--workers 1" in command
+    assert "--threads 2" in command
+    assert "--timeout 120" in command
+
+
 def test_binary_assets_are_private_storage_metadata_only():
     sql = (ROOT / "schema.sql").read_text(encoding="utf-8")
     reading = (ROOT / "reading.py").read_text(encoding="utf-8")

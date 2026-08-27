@@ -9,6 +9,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 UTILS = ROOT / "static/js/reader-utils.js"
 READER = ROOT / "static/js/reader.js"
+LIBRARY = ROOT / "static/js/library.js"
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
@@ -133,3 +134,14 @@ def test_paginated_reader_reflows_for_webkit_fonts_and_visual_viewport():
     assert "overflow-x: auto" in style
     assert "overflow-y: hidden" in style
     assert "scrollbar-width: none" in style
+
+
+def test_library_distinguishes_killed_worker_from_json_storage_failure():
+    source = LIBRARY.read_text(encoding="utf-8")
+
+    assert '502: {' in source
+    assert 'error: "import_worker_terminated"' in source
+    assert 'error: "import_resource_exhausted"' in source
+    assert 'error: "epub_import_timeout"' in source
+    assert "const diagnostic = data.error" in source
+    assert 'url === "/api/books" && options.method === "POST"' in source

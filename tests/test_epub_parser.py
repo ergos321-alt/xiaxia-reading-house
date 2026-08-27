@@ -2,7 +2,11 @@ from pathlib import Path
 
 from ebooklib import epub
 
-from epub_parser import BookParseError, parse_uploaded_book
+from epub_parser import (
+    BookParseError,
+    parse_uploaded_book,
+    parse_uploaded_book_path,
+)
 
 
 PNG_BYTES = (
@@ -99,6 +103,23 @@ def test_epub_metadata_spine_images_and_stable_blocks(tmp_path):
         "images/cover.png",
         "images/inside.png",
     }
+
+
+def test_path_parser_streams_assets_as_metadata_without_resident_bytes(tmp_path):
+    target = tmp_path / "streamed.epub"
+    target.write_bytes(build_epub(tmp_path))
+    parsed = parse_uploaded_book_path(target.name, target)
+
+    assert parsed.archive_compressed_size == target.stat().st_size
+    assert parsed.archive_uncompressed_size > parsed.archive_compressed_size
+    assert parsed.archive_item_count > 0
+    assert parsed.xhtml_item_count > 0
+    assert parsed.image_item_count >= 2
+    assert parsed.font_item_count == 0
+    assert all(asset.data is None for asset in parsed.assets)
+    assert all(asset.archive_path for asset in parsed.assets)
+    assert all(asset.byte_size > 0 for asset in parsed.assets)
+    assert all(asset.content_sha256 for asset in parsed.assets)
 
 
 def test_epub3_manifest_cover_image_is_detected(tmp_path):

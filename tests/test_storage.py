@@ -1,6 +1,10 @@
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from io import BytesIO
+from pathlib import Path
+import zipfile
+
+import pytest
 
 import reading
 import storage
@@ -88,6 +92,56 @@ def test_storage_batch_deduplicates_paths_and_reports_partial_success(monkeypatc
     else:
         raise AssertionError("the failed object must surface a batch error")
     assert len(uploaded) == 2
+
+
+def test_archive_upload_streams_selected_entries_and_deduplicates(tmp_path, monkeypatch):
+    archive_path = tmp_path / "assets.epub"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("images/a.png", b"A" * 1000)
+        archive.writestr("images/b.png", b"B" * 2000)
+    uploaded = []
+
+    def fake_upload(object_path, file_path, media_type):
+        uploaded.append((object_path, Path(file_path).read_bytes(), media_type))
+
+    monkeypatch.setattr(storage, "upload_file", fake_upload)
+    result = storage.upload_archive_entries(
+        archive_path,
+        [
+            ("books/id/assets/a.png", "images/a.png", "image/png"),
+            ("books/id/assets/a.png", "images/a.png", "image/png"),
+            ("books/id/assets/b.png", "images/b.png", "image/png"),
+        ],
+        max_workers=2,
+    )
+
+    assert result == ["books/id/assets/a.png", "books/id/assets/b.png"]
+    assert sorted((path, len(data)) for path, data, _type in uploaded) == [
+        ("books/id/assets/a.png", 1000),
+        ("books/id/assets/b.png", 2000),
+    ]
+
+
+def test_archive_upload_stops_at_deadline_before_network(tmp_path, monkeypatch):
+    archive_path = tmp_path / "assets.epub"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("images/a.png", b"A")
+    network_called = False
+
+    def fake_upload(*_args):
+        nonlocal network_called
+        network_called = True
+
+    monkeypatch.setattr(storage, "upload_file", fake_upload)
+    with pytest.raises(storage.ObjectStorageDeadlineError) as raised:
+        storage.upload_archive_entries(
+            archive_path,
+            [("books/id/assets/a.png", "images/a.png", "image/png")],
+            deadline=0,
+        )
+
+    assert raised.value.uploaded_paths == []
+    assert network_called is False
 
 
 def test_storage_health_rejects_public_bucket(monkeypatch):
@@ -194,7 +248,12 @@ def test_upload_persists_binaries_in_storage_and_only_metadata_in_postgres(monke
             )
         ],
         assets=[
-            ParsedAsset(path="images/cover.png", media_type="image/png", data=b"COVER")
+            ParsedAsset(
+                path="images/cover.png",
+                media_type="image/png",
+                data=b"COVER",
+                archive_path="images/cover.png",
+            )
         ],
         cover_asset_path="images/cover.png",
     )
@@ -205,12 +264,25 @@ def test_upload_persists_binaries_in_storage_and_only_metadata_in_postgres(monke
     def fake_transaction():
         yield connection
 
-    monkeypatch.setattr(reading, "parse_uploaded_book", lambda *_args: parsed)
+    monkeypatch.setattr(
+        reading, "parse_uploaded_book_path", lambda *_args, **_kwargs: parsed
+    )
     monkeypatch.setattr(reading.db, "transaction", fake_transaction)
     monkeypatch.setattr(
         reading.object_storage,
-        "upload_bytes",
-        lambda path, data, media_type: uploads.append((path, data, media_type)),
+        "upload_file",
+        lambda path, file_path, media_type: uploads.append(
+            (path, Path(file_path).read_bytes(), media_type)
+        ),
+    )
+    monkeypatch.setattr(
+        reading.object_storage,
+        "upload_archive_entries",
+        lambda _archive, objects, **_kwargs: uploads.extend(
+            (path, b"COVER", media_type)
+            for path, _entry, media_type in objects
+        )
+        or [path for path, _entry, _media_type in objects],
     )
 
     app = create_app(

@@ -7,6 +7,7 @@ unused images are never materialised in memory.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import html
 import mimetypes
@@ -16,8 +17,8 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from io import BytesIO
-from pathlib import PurePosixPath
-from typing import Any, Iterable
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Iterable
 from urllib.parse import unquote, urldefrag, urlsplit
 
 import bleach
@@ -37,7 +38,17 @@ class BookParseError(ValueError):
 class ParsedAsset:
     path: str
     media_type: str
-    data: bytes
+    data: bytes | None = None
+    archive_path: str | None = None
+    byte_size: int = 0
+    content_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.data is not None:
+            if not self.byte_size:
+                self.byte_size = len(self.data)
+            if not self.content_sha256:
+                self.content_sha256 = hashlib.sha256(self.data).hexdigest()
 
 
 @dataclass(slots=True)
@@ -64,6 +75,12 @@ class ParsedBook:
     epub_version: str | None = None
     manifest_item_count: int = 0
     spine_item_count: int = 0
+    archive_compressed_size: int = 0
+    archive_uncompressed_size: int = 0
+    archive_item_count: int = 0
+    xhtml_item_count: int = 0
+    image_item_count: int = 0
+    font_item_count: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -108,6 +125,9 @@ MAX_ARCHIVE_ENTRIES = 20_000
 MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 MAX_ENTRY_BYTES = 128 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 300
+STREAM_CHUNK_BYTES = 256 * 1024
+
+StageObserver = Callable[[str], None]
 
 
 def parse_uploaded_book(
@@ -124,14 +144,67 @@ def parse_uploaded_book(
     )
 
 
+def parse_uploaded_book_path(
+    filename: str,
+    source_path: str | Path,
+    deadline: float | None = None,
+    *,
+    source_sha256: str | None = None,
+    stage_observer: StageObserver | None = None,
+) -> ParsedBook:
+    """Parse a spooled upload without retaining the compressed book in RAM."""
+    path = Path(source_path)
+    extension = PurePosixPath(filename).suffix.lower()
+    digest = source_sha256 or _sha256_path(path)
+    if extension == ".epub":
+        return _parse_epub_source(
+            filename,
+            path,
+            source_sha256=digest,
+            archive_compressed_size=path.stat().st_size,
+            materialize_assets=False,
+            deadline=deadline,
+            stage_observer=stage_observer,
+        )
+    if extension == ".txt":
+        parsed = _parse_txt(filename, path.read_bytes())
+        parsed.source_sha256 = digest
+        parsed.archive_compressed_size = path.stat().st_size
+        return parsed
+    raise BookParseError(
+        "仅支持 EPUB 和 TXT 文件；上传内容不是受支持的书籍 archive",
+        "unsupported_archive",
+    )
+
+
 def _parse_epub(
     filename: str, data: bytes, *, deadline: float | None = None
 ) -> ParsedBook:
-    if not data:
+    return _parse_epub_source(
+        filename,
+        BytesIO(data),
+        source_sha256=hashlib.sha256(data).hexdigest(),
+        archive_compressed_size=len(data),
+        materialize_assets=True,
+        deadline=deadline,
+    )
+
+
+def _parse_epub_source(
+    filename: str,
+    source: str | Path | BytesIO,
+    *,
+    source_sha256: str,
+    archive_compressed_size: int,
+    materialize_assets: bool,
+    deadline: float | None = None,
+    stage_observer: StageObserver | None = None,
+) -> ParsedBook:
+    if archive_compressed_size <= 0:
         raise BookParseError("EPUB 文件为空", "invalid_epub")
     _check_deadline(deadline)
     try:
-        archive = zipfile.ZipFile(BytesIO(data))
+        archive = zipfile.ZipFile(source)
     except (zipfile.BadZipFile, OSError) as exc:
         raise BookParseError(
             "文件不是有效的 EPUB archive，可能已损坏或格式不受支持",
@@ -140,7 +213,7 @@ def _parse_epub(
 
     warnings: list[str] = []
     try:
-        archive_names = _validate_archive(archive)
+        archive_names, archive_stats = _validate_archive(archive)
         opf_path = _find_opf_path(archive, archive_names, warnings)
         opf = _parse_markup(
             _read_archive_entry(archive, archive_names, opf_path), xml=True
@@ -226,6 +299,8 @@ def _parse_epub(
                     word_count=_count_words(plain_text),
                 )
             )
+            if len(chapters) % 50 == 0:
+                gc.collect()
 
         if not chapters:
             raise BookParseError(
@@ -239,6 +314,7 @@ def _parse_epub(
         wanted_assets = set(referenced_assets)
         if cover_path:
             wanted_assets.add(cover_path)
+        _observe(stage_observer, "asset_extraction_before")
         assets = _extract_used_assets(
             archive,
             archive_names,
@@ -247,7 +323,9 @@ def _parse_epub(
             warnings,
             deadline,
             opf_dir,
+            materialize=materialize_assets,
         )
+        _observe(stage_observer, "asset_extraction_after")
         available_assets = {asset.path for asset in assets}
         if cover_path not in available_assets:
             cover_path = None
@@ -261,12 +339,12 @@ def _parse_epub(
                 "no_readable_content",
             )
 
-        return ParsedBook(
+        parsed = ParsedBook(
             title=_preferred_book_title(metadata_title, filename),
             author=_clean_metadata(author),
             format="epub",
             source_filename=filename,
-            source_sha256=hashlib.sha256(data).hexdigest(),
+            source_sha256=source_sha256,
             toc=toc,
             chapters=chapters,
             assets=assets,
@@ -274,8 +352,16 @@ def _parse_epub(
             epub_version=epub_version,
             manifest_item_count=len(manifest),
             spine_item_count=len(spine_ids),
+            archive_compressed_size=archive_compressed_size,
+            archive_uncompressed_size=archive_stats["uncompressed_size"],
+            archive_item_count=archive_stats["item_count"],
+            xhtml_item_count=archive_stats["xhtml_count"],
+            image_item_count=archive_stats["image_count"],
+            font_item_count=archive_stats["font_count"],
             warnings=_dedupe(warnings),
         )
+        opf.decompose()
+        return parsed
     except BookParseError:
         raise
     except Exception as exc:
@@ -287,16 +373,29 @@ def _parse_epub(
         archive.close()
 
 
-def _validate_archive(archive: zipfile.ZipFile) -> dict[str, str]:
+def _validate_archive(
+    archive: zipfile.ZipFile,
+) -> tuple[dict[str, str], dict[str, int]]:
     infos = archive.infolist()
     if not infos or len(infos) > MAX_ARCHIVE_ENTRIES:
         raise BookParseError("EPUB archive 条目数量异常", "unsupported_archive")
     total = 0
+    item_count = 0
+    xhtml_count = 0
+    image_count = 0
+    font_count = 0
     names: dict[str, str] = {}
     for info in infos:
         normalized = _normalize_archive_path(info.filename)
         if not normalized or info.is_dir():
             continue
+        item_count += 1
+        suffix = PurePosixPath(normalized).suffix.lower()
+        xhtml_count += suffix in {".xhtml", ".html", ".htm"}
+        image_count += suffix in {
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".avif"
+        }
+        font_count += suffix in {".ttf", ".otf", ".woff", ".woff2", ".eot"}
         if info.file_size > MAX_ENTRY_BYTES:
             raise BookParseError(
                 "EPUB 中存在异常大的单个资源", "unsupported_archive"
@@ -314,7 +413,13 @@ def _validate_archive(archive: zipfile.ZipFile) -> dict[str, str]:
                 "EPUB 压缩比例异常，已拒绝处理", "unsupported_archive"
             )
         names.setdefault(normalized.lower(), info.filename)
-    return names
+    return names, {
+        "uncompressed_size": total,
+        "item_count": item_count,
+        "xhtml_count": xhtml_count,
+        "image_count": image_count,
+        "font_count": font_count,
+    }
 
 
 def _find_opf_path(
@@ -414,7 +519,9 @@ def _parse_nav_toc(
             warnings.append("nav_without_toc")
             return []
         root_list = nav.find(["ol", "ul"])
-        return _parse_html_toc_list(root_list, item.href) if root_list else []
+        result = _parse_html_toc_list(root_list, item.href) if root_list else []
+        soup.decompose()
+        return result
     except Exception:
         warnings.append("broken_nav_fallback")
         return []
@@ -459,7 +566,9 @@ def _parse_ncx_toc(
             lambda tag: isinstance(tag, Tag)
             and _local_name(tag.name) == "navmap"
         )
-        return _parse_ncx_points(nav_map, item.href) if nav_map else []
+        result = _parse_ncx_points(nav_map, item.href) if nav_map else []
+        soup.decompose()
+        return result
     except Exception:
         warnings.append("broken_ncx_fallback")
         return []
@@ -616,8 +725,10 @@ def _sanitize_chapter(
         anchor["data-epub-target-fragment"] = unquote(fragment)
         anchor["data-epub-link-kind"] = link_kind
 
+    rendered = "".join(str(child) for child in root.children)
+    soup.decompose()
     cleaned = bleach.clean(
-        "".join(str(child) for child in root.children),
+        rendered,
         tags=ALLOWED_TAGS,
         attributes=ALLOWED_ATTRIBUTES,
         protocols={"http", "https", "mailto"},
@@ -672,7 +783,10 @@ def _assign_block_ids(fragment: str) -> tuple[str, str]:
             plain_blocks.append(
                 re.sub(r"\s+", " ", wrapper.get_text("", strip=False)).strip()
             )
-    return str(soup), "\n\n".join(plain_blocks)
+    stable_html = str(soup)
+    plain_text = "\n\n".join(plain_blocks)
+    soup.decompose()
+    return stable_html, plain_text
 
 
 def _find_cover_path(
@@ -726,9 +840,12 @@ def _find_cover_path(
                     )
                     image = soup.find("img", src=True)
                     if image:
-                        return _resolve_internal_href(
+                        cover = _resolve_internal_href(
                             item.href, str(image.get("src"))
                         )
+                        soup.decompose()
+                        return cover
+                    soup.decompose()
                 except Exception:
                     warnings.append("broken_guide_cover")
     named = [
@@ -753,6 +870,8 @@ def _extract_used_assets(
     warnings: list[str],
     deadline: float | None,
     opf_dir: str,
+    *,
+    materialize: bool,
 ) -> list[ParsedAsset]:
     by_href = {_href_key(item.href): item for item in manifest.values()}
     assets: list[ParsedAsset] = []
@@ -772,16 +891,37 @@ def _extract_used_assets(
         if not media_type.startswith(IMAGE_MEDIA_PREFIX):
             warnings.append(f"unsupported_asset_skipped:{path}")
             continue
+        actual_path = names.get(_normalize_archive_path(archive_path).lower())
+        if not actual_path:
+            warnings.append(f"missing_image_skipped:{path}")
+            continue
         try:
-            payload = _read_archive_entry(archive, names, archive_path)
+            digest = hashlib.sha256()
+            total = 0
+            payload_parts: list[bytes] | None = [] if materialize else None
+            with archive.open(actual_path) as stream:
+                while chunk := stream.read(STREAM_CHUNK_BYTES):
+                    _check_deadline(deadline)
+                    digest.update(chunk)
+                    total += len(chunk)
+                    if payload_parts is not None:
+                        payload_parts.append(chunk)
         except Exception:
             warnings.append(f"missing_image_skipped:{path}")
             continue
-        if not payload:
+        if not total:
             warnings.append(f"broken_image_skipped:{path}")
             continue
+        payload = b"".join(payload_parts) if payload_parts is not None else None
         assets.append(
-            ParsedAsset(_normalize_asset_path(path), media_type, payload)
+            ParsedAsset(
+                path=_normalize_asset_path(path),
+                media_type=media_type,
+                data=payload,
+                archive_path=actual_path,
+                byte_size=total,
+                content_sha256=digest.hexdigest(),
+            )
         )
     return assets
 
@@ -801,6 +941,7 @@ def _drop_missing_image_references(
                 changed = True
         if changed:
             chapter.content_html = str(soup)
+        soup.decompose()
     return chapters
 
 
@@ -809,9 +950,10 @@ def _prune_empty_after_asset_cleanup(
 ) -> list[ParsedChapter]:
     retained: list[ParsedChapter] = []
     for chapter in chapters:
-        if chapter.content_text.strip() or BeautifulSoup(
-            chapter.content_html, "html.parser"
-        ).find("img"):
+        soup = BeautifulSoup(chapter.content_html, "html.parser")
+        has_image = soup.find("img") is not None
+        soup.decompose()
+        if chapter.content_text.strip() or has_image:
             chapter.chapter_index = len(retained)
             retained.append(chapter)
         else:
@@ -883,9 +1025,10 @@ def _metadata_text(package: Tag, local_name: str) -> str | None:
 
 
 def _clean_metadata(value: str) -> str:
-    return re.sub(
-        r"\s+", " ", BeautifulSoup(value, "html.parser").get_text(" ")
-    ).strip()
+    soup = BeautifulSoup(value, "html.parser")
+    cleaned = re.sub(r"\s+", " ", soup.get_text(" ")).strip()
+    soup.decompose()
+    return cleaned
 
 
 def _preferred_book_title(metadata_title: str | None, filename: str) -> str:
@@ -1025,7 +1168,22 @@ def _link_kind(anchor: Tag, raw_href: str) -> str:
 def _title_from_html(fragment: str) -> str | None:
     soup = BeautifulSoup(fragment, "html.parser")
     heading = soup.find(["h1", "h2", "h3", "h4", "h5", "h6"])
-    return _clean_metadata(heading.get_text(" ")) if heading else None
+    title = _clean_metadata(heading.get_text(" ")) if heading else None
+    soup.decompose()
+    return title
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(STREAM_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _observe(observer: StageObserver | None, stage: str) -> None:
+    if observer is not None:
+        observer(stage)
 
 
 def _txt_to_html(text: str) -> str:
