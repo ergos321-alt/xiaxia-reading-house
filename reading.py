@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import time
 from typing import Any
+from urllib.parse import unquote
 from uuid import UUID, uuid4
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from flask import Blueprint, Response, jsonify, request, url_for
+from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
 import database as db
@@ -16,6 +21,7 @@ from epub_parser import BookParseError, parse_uploaded_book
 
 
 reading_bp = Blueprint("reading", __name__)
+logger = logging.getLogger(__name__)
 
 
 BOOK_FIELDS = """
@@ -25,6 +31,11 @@ BOOK_FIELDS = """
 
 ACTION_CHUNK_TARGET_CHARS = 6000
 ACTION_CHUNK_MAX_CHARS = 8000
+IMPORT_DEADLINE_SECONDS = 105
+
+
+class ImportDeadlineExceeded(RuntimeError):
+    """Cooperative deadline reached before the Gunicorn hard timeout."""
 
 
 @reading_bp.get("/api/books")
@@ -49,6 +60,9 @@ def list_books():
 @reading_bp.post("/api/books")
 @web_api_required
 def upload_book():
+    started_at = time.perf_counter()
+    deadline = started_at + IMPORT_DEADLINE_SECONDS
+    stage = "request"
     upload = request.files.get("file")
     if upload is None or not upload.filename:
         return jsonify({"error": "file_required"}), 400
@@ -58,10 +72,28 @@ def upload_book():
     if not filename:
         return jsonify({"error": "invalid_filename"}), 400
     raw = upload.read()
+    _log_import(
+        "started",
+        filename=filename,
+        size=len(raw),
+        failure_stage=None,
+    )
+    stage = "parse"
+    parse_started = time.perf_counter()
     try:
-        parsed = parse_uploaded_book(filename, raw)
+        parsed = parse_uploaded_book(filename, raw, deadline)
     except BookParseError as exc:
-        return jsonify({"error": "book_parse_failed", "message": str(exc)}), 422
+        _log_import(
+            "failed",
+            filename=filename,
+            size=len(raw),
+            total_duration=_duration(started_at),
+            failure_stage=stage,
+            error_code=exc.code,
+        )
+        status = 408 if exc.code == "epub_import_timeout" else 422
+        return jsonify({"error": exc.code, "message": str(exc)}), status
+    parse_duration = _duration(parse_started)
 
     book_id = uuid4()
     source_media_type = (
@@ -69,7 +101,17 @@ def upload_book():
     )
     source_object_path = f"books/{book_id}/source/source.{parsed.format}"
     uploaded_objects: list[str] = []
+    asset_records: list[tuple[Any, str]] = []
+    upload_objects = [(source_object_path, raw, source_media_type)]
+    for asset in parsed.assets:
+        object_path = object_storage.object_path_for_asset(
+            book_id, asset.path, asset.path == parsed.cover_asset_path
+        )
+        asset_records.append((asset, object_path))
+        upload_objects.append((object_path, asset.data, asset.media_type))
+
     try:
+        stage = "duplicate_check"
         with db.transaction() as conn:
             existing = conn.execute(
                 "select id, title from books where source_sha256 = %s",
@@ -87,18 +129,31 @@ def upload_book():
                     409,
                 )
 
-            object_storage.upload_bytes(source_object_path, raw, source_media_type)
-            uploaded_objects.append(source_object_path)
+        stage = "storage"
+        storage_started = time.perf_counter()
+        uploaded_objects = object_storage.upload_many(upload_objects)
+        storage_duration = _duration(storage_started)
+        if time.perf_counter() >= deadline:
+            raise ImportDeadlineExceeded
 
-            asset_records: list[tuple[Any, str]] = []
-            for asset in parsed.assets:
-                object_path = object_storage.object_path_for_asset(
-                    book_id, asset.path, asset.path == parsed.cover_asset_path
-                )
-                object_storage.upload_bytes(object_path, asset.data, asset.media_type)
-                uploaded_objects.append(object_path)
-                asset_records.append((asset, object_path))
+        chapter_records = [
+            (
+                uuid4(),
+                book_id,
+                chapter.chapter_index,
+                chapter.title,
+                chapter.href,
+                chapter.content_html,
+                chapter.content_text,
+                chapter.word_count,
+            )
+            for chapter in parsed.chapters
+        ]
+        first_chapter_id = chapter_records[0][0]
 
+        stage = "database"
+        database_started = time.perf_counter()
+        with db.transaction() as conn:
             book = conn.execute(
                 """
                 insert into books (
@@ -125,74 +180,165 @@ def upload_book():
                 ),
             ).fetchone()
 
-            for asset, object_path in asset_records:
-                conn.execute(
-                    """
-                    insert into book_assets (
-                        book_id, asset_path, object_path, media_type, byte_size
-                    ) values (%s, %s, %s, %s, %s)
-                    """,
+            _bulk_execute(
+                conn,
+                """
+                insert into book_assets (
+                    book_id, asset_path, object_path, media_type, byte_size
+                ) values (%s, %s, %s, %s, %s)
+                """,
+                [
                     (
                         book_id,
                         asset.path,
                         object_path,
                         asset.media_type,
                         len(asset.data),
+                    )
+                    for asset, object_path in asset_records
+                ],
+            )
+            _bulk_execute(
+                conn,
+                """
+                insert into chapters (
+                    id, book_id, chapter_index, title, href, content_html,
+                    content_text, word_count
+                ) values (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                chapter_records,
+            )
+            conn.execute(
+                """
+                insert into reading_progress (
+                    book_id, chapter_id, chapter_index, position, percentage
+                ) values (%s, %s, 0, %s, 0)
+                """,
+                (
+                    book_id,
+                    first_chapter_id,
+                    Jsonb(
+                        {
+                            "block_id": "b000001",
+                            "char_offset": 0,
+                            "scroll_fraction": 0,
+                        }
                     ),
-                )
-
-            first_chapter = None
-            for chapter in parsed.chapters:
-                inserted = conn.execute(
-                    """
-                    insert into chapters (
-                        book_id, chapter_index, title, href, content_html,
-                        content_text, word_count
-                    ) values (%s, %s, %s, %s, %s, %s, %s)
-                    returning id, chapter_index
-                    """,
-                    (
-                        book_id,
-                        chapter.chapter_index,
-                        chapter.title,
-                        chapter.href,
-                        chapter.content_html,
-                        chapter.content_text,
-                        chapter.word_count,
-                    ),
-                ).fetchone()
-                if first_chapter is None:
-                    first_chapter = inserted
-
-            if first_chapter:
-                conn.execute(
-                    """
-                    insert into reading_progress (
-                        book_id, chapter_id, chapter_index, position, percentage
-                    ) values (%s, %s, %s, %s, 0)
-                    """,
-                    (
-                        book_id,
-                        first_chapter["id"],
-                        first_chapter["chapter_index"],
-                        Jsonb(
-                            {
-                                "block_id": "b000001",
-                                "char_offset": 0,
-                                "scroll_fraction": 0,
-                            }
-                        ),
-                    ),
-                )
+                ),
+            )
             conn.execute(
                 "insert into ai_reading_state (book_id) values (%s)", (book_id,)
             )
-    except object_storage.ObjectStorageError:
+        database_duration = _duration(database_started)
+    except ImportDeadlineExceeded:
         _cleanup_uploaded_objects(uploaded_objects)
-        return jsonify({"error": "private_storage_unavailable"}), 502
+        _log_import(
+            "failed",
+            filename=filename,
+            size=len(raw),
+            parse_duration=parse_duration,
+            total_duration=_duration(started_at),
+            failure_stage=stage,
+            error_code="epub_import_timeout",
+        )
+        return (
+            jsonify(
+                {
+                    "error": "epub_import_timeout",
+                    "message": "导入超过安全处理时间，未保存任何不完整书籍",
+                }
+            ),
+            408,
+        )
+    except object_storage.ObjectStorageBatchError as exc:
+        uploaded_objects = exc.uploaded_paths
+        _cleanup_uploaded_objects(uploaded_objects)
+        _log_import(
+            "failed",
+            filename=filename,
+            size=len(raw),
+            parse_duration=parse_duration,
+            total_duration=_duration(started_at),
+            failure_stage=stage,
+            error_code="storage_upload_failed",
+        )
+        return (
+            jsonify(
+                {
+                    "error": "storage_upload_failed",
+                    "message": "书籍资源保存失败，已撤销本次导入",
+                }
+            ),
+            502,
+        )
+    except UniqueViolation:
+        _cleanup_uploaded_objects(uploaded_objects)
+        existing = db.fetch_one(
+            "select id, title from books where source_sha256 = %s",
+            (parsed.source_sha256,),
+        )
+        if existing:
+            return (
+                jsonify(
+                    {
+                        "error": "book_already_exists",
+                        "book_id": str(existing["id"]),
+                        "title": existing["title"],
+                    }
+                ),
+                409,
+            )
+        return (
+            jsonify(
+                {
+                    "error": "database_write_failed",
+                    "message": "书籍写入失败，已撤销本次导入",
+                }
+            ),
+            500,
+        )
     except Exception:
         _cleanup_uploaded_objects(uploaded_objects)
-        raise
+        logger.exception("book_import database_or_storage_failure stage=%s", stage)
+        error_code = (
+            "storage_upload_failed" if stage == "storage" else "database_write_failed"
+        )
+        status = 502 if stage == "storage" else 500
+        _log_import(
+            "failed",
+            filename=filename,
+            size=len(raw),
+            parse_duration=parse_duration,
+            total_duration=_duration(started_at),
+            failure_stage=stage,
+            error_code=error_code,
+        )
+        return (
+            jsonify(
+                {
+                    "error": error_code,
+                    "message": "书籍导入失败，已撤销本次导入",
+                }
+            ),
+            status,
+        )
+
+    _log_import(
+        "completed",
+        filename=filename,
+        size=len(raw),
+        epub_version=parsed.epub_version,
+        manifest_item_count=parsed.manifest_item_count,
+        spine_item_count=parsed.spine_item_count,
+        chapter_count=len(parsed.chapters),
+        asset_count=len(parsed.assets),
+        parse_duration=parse_duration,
+        storage_duration=storage_duration,
+        database_duration=database_duration,
+        total_duration=_duration(started_at),
+        failure_stage=None,
+        warning_count=len(parsed.warnings),
+    )
 
     return jsonify({"book": _serialize_book(book)}), 201
 
@@ -320,8 +466,27 @@ def get_chapter(book_id: UUID, chapter_id: UUID):
     )
     if not chapter:
         return jsonify({"error": "chapter_not_found"}), 404
+    target_hrefs = _internal_link_hrefs(chapter["content_html"])
+    current_key = _chapter_href_key(str(chapter.get("href") or ""))
+    other_hrefs = sorted(
+        href for href in target_hrefs if _chapter_href_key(href) != current_key
+    )
+    link_targets = [chapter]
+    if other_hrefs:
+        link_targets.extend(
+            db.fetch_all(
+                """
+                select id, href, content_html
+                from chapters
+                where book_id = %s and lower(href) = any(%s)
+                """,
+                (book_id, [_chapter_href_key(href) for href in other_hrefs]),
+            )
+        )
     payload = _json_safe(chapter)
-    payload["content_html"] = _materialize_asset_urls(chapter["content_html"], book_id)
+    payload["content_html"] = _materialize_reader_html(
+        chapter["content_html"], book_id, link_targets
+    )
     return jsonify({"chapter": payload})
 
 
@@ -924,7 +1089,9 @@ def _adjacent_chapters(book_id: UUID, chapter_index: int) -> list[dict[str, Any]
     return [_json_safe(row) for row in rows]
 
 
-def _materialize_asset_urls(fragment: str, book_id: UUID) -> str:
+def _materialize_reader_html(
+    fragment: str, book_id: UUID, chapters: list[dict[str, Any]] | None = None
+) -> str:
     soup = BeautifulSoup(fragment, "html.parser")
     for image in soup.select("img[data-asset-path]"):
         path = image.get("data-asset-path")
@@ -933,7 +1100,77 @@ def _materialize_asset_urls(fragment: str, book_id: UUID) -> str:
                 "reading.get_asset", book_id=book_id, asset_path=path
             )
             image["loading"] = "lazy"
+    targets = {
+        _chapter_href_key(str(row.get("href") or "")): row
+        for row in (chapters or [])
+    }
+    for anchor in soup.select("a[data-epub-target-href]"):
+        target_href = str(anchor.get("data-epub-target-href") or "")
+        fragment_name = unquote(
+            str(anchor.get("data-epub-target-fragment") or "")
+        )
+        link_kind = str(anchor.get("data-epub-link-kind") or "chapter")
+        target = targets.get(_chapter_href_key(target_href))
+        anchor["href"] = "#"
+        anchor["data-rh-internal"] = "true"
+        anchor["data-rh-link-kind"] = link_kind
+        anchor["data-rh-target-fragment"] = fragment_name
+        for attribute in (
+            "data-epub-target-href",
+            "data-epub-target-fragment",
+            "data-epub-link-kind",
+        ):
+            anchor.attrs.pop(attribute, None)
+        if not target:
+            anchor["data-rh-target-missing"] = "true"
+            anchor["data-rh-error-code"] = (
+                "footnote_target_missing"
+                if link_kind == "footnote"
+                else "internal_link_target_missing"
+            )
+            continue
+        block_id = _fragment_block_id(target["content_html"], fragment_name)
+        if fragment_name and not block_id:
+            anchor["data-rh-target-missing"] = "true"
+            anchor["data-rh-error-code"] = (
+                "footnote_target_missing"
+                if link_kind == "footnote"
+                else "internal_link_target_missing"
+            )
+            continue
+        anchor["data-rh-chapter-id"] = str(target["id"])
+        anchor["data-rh-block-id"] = block_id or "b000001"
     return str(soup)
+
+
+def _internal_link_hrefs(fragment: str) -> set[str]:
+    soup = BeautifulSoup(fragment, "html.parser")
+    return {
+        str(anchor.get("data-epub-target-href"))
+        for anchor in soup.select("a[data-epub-target-href]")
+        if anchor.get("data-epub-target-href")
+    }
+
+
+def _fragment_block_id(fragment: str, fragment_name: str) -> str | None:
+    soup = BeautifulSoup(fragment, "html.parser")
+    if not fragment_name:
+        first = soup.select_one("[data-block-id]")
+        return str(first.get("data-block-id")) if first else None
+    marker = soup.find(
+        lambda tag: isinstance(tag, Tag)
+        and str(tag.get("data-epub-fragment") or "") == fragment_name
+    )
+    if marker is None:
+        return None
+    block = marker if marker.get("data-block-id") else marker.find_parent(attrs={"data-block-id": True})
+    if block is None:
+        block = marker.find_next(attrs={"data-block-id": True})
+    return str(block.get("data-block-id")) if block else None
+
+
+def _chapter_href_key(href: str) -> str:
+    return unquote(href).replace("\\", "/").lstrip("/").lower()
 
 
 def _cleanup_uploaded_objects(object_paths: list[str]) -> None:
@@ -942,7 +1179,30 @@ def _cleanup_uploaded_objects(object_paths: list[str]) -> None:
     except object_storage.ObjectStorageError:
         # Preserve the original upload/database error. A failed rollback cleanup
         # is visible in Supabase Storage and can be removed by book UUID prefix.
-        pass
+        logger.exception(
+            "book_import_cleanup_failed object_count=%s", len(object_paths)
+        )
+
+
+def _bulk_execute(conn: Any, query: str, rows: list[tuple[Any, ...]]) -> None:
+    """Use psycopg pipeline-backed executemany; keep simple test doubles usable."""
+    if not rows:
+        return
+    executemany = getattr(conn, "executemany", None)
+    if callable(executemany):
+        executemany(query, rows)
+        return
+    for row in rows:
+        conn.execute(query, row)
+
+
+def _duration(started_at: float) -> float:
+    return round(time.perf_counter() - started_at, 4)
+
+
+def _log_import(event: str, **fields: Any) -> None:
+    payload = {"event": f"book_import_{event}", **fields}
+    logger.info("book_import %s", json.dumps(payload, ensure_ascii=False, default=str))
 
 
 def _serialize_book(row: dict[str, Any]) -> dict[str, Any]:

@@ -2,7 +2,7 @@
 
 一间私人双人 AI 共读空间。Supabase PostgreSQL 只保存结构化数据、正文文本和稳定锚点；原始 EPUB/TXT、封面及 EPUB 正文图片保存在私有 Supabase Storage。服务器只提供书籍事实、文本、状态与持久化能力，不生成林知夏人格内容。
 
-V2 以已验收的 V1.1 为唯一基础，不改解析、章节、Storage、批注、Reply、Undo、进度或现有 Action 契约；只在书籍读完以后增加私人记忆层：双盲最终评价、共同停留处、双向读后信、克制共读时间线与封底印章。它们保存共同记忆，不做评分社区、统计、排行榜、成就或自动总结。
+V2 以已验收的 V1.1 为唯一基础，保留章节/block、批注、Reply、Undo、进度与现有 Action 契约；在书籍读完以后增加私人记忆层。当前可靠性返修只加强“不同 EPUB → 既有 normalized chapter/block 模型”的入口，不改变稳定锚点或历史阅读数据。
 
 ## 项目目录
 
@@ -50,6 +50,8 @@ xiaxia-reading-house/
 │       └── annotations-management.js
 └── tests/
     ├── test_epub_parser.py
+    ├── test_epub_compatibility.py
+    ├── test_import_pipeline.py
     ├── test_api_auth.py
     ├── test_co_reading_api.py
     ├── test_v1_experience_api.py
@@ -67,7 +69,7 @@ xiaxia-reading-house/
 - `books.source_object_path` 与 `book_assets.object_path` 只保存 Storage object path；`book_assets` 另存 MIME type 和 byte size，不存在长期 `bytea`。
 - 私有 bucket `xiaxia-reading-house-private` 保存原始上传文件、封面与 EPUB 图片。所有对象保持 `public=false`，且不向 `anon`/`authenticated` 提供对象 policy。
 - 浏览器通过鉴权后的 Flask 资源代理读取封面和正文图片，不接触 service role/Secret key，也不获得永久公开 URL。
-- Render 临时磁盘只由 EbookLib 在上传解析期间短暂使用；解析结束即释放，绝不承担持久化。
+- importer 直接按 ZIP container → OPF → NAV/NCX → spine/manifest fallback 分阶段读取；不会整本解压到磁盘或内存，也不会读取字体、CSS 与未使用图片。
 - 用户批注保存 `chapter_id + start/end block_id + start/end offset`。正常定位只使用这些稳定坐标；`selected_text + prefix/suffix` 仅在出版方 DOM 异常时作为恢复 fallback。
 - 四类阅读痕迹在数据层明确分开：`owner=user/content_type=user_annotation`、`owner=xiaxia/content_type=xiaxia_thought`、`owner=xiaxia/content_type=xiaxia_reply`、`owner=user/content_type=user_reply`。独立想法支持 `range`、`block`、`chapter` 与可扩展 `mark_type`，没有扩展复杂颜色 UI。
 
@@ -75,10 +77,23 @@ xiaxia-reading-house/
 
 - EPUB3 优先识别 manifest item 的 `properties="cover-image"`。
 - EPUB2 识别 `<meta name="cover" content="manifest-id">` 指向的图片 item。
-- 之后依次使用 EbookLib cover item、常见 cover ID/文件名、单图和最大图片 fallback。
+- 之后尝试 EPUB2 guide 中的封面页与常见 cover ID/文件名；损坏或缺失时采用“无封面”，不会误把任意最大图片当封面。
 - 命中的封面继续上传到私有 Storage，PostgreSQL 只保存资源元数据。
 - metadata title 非空且不超过 160 个字符时使用 metadata；为空或明显异常过长时回退到上传文件名去扩展名。
 - 不从正文首段或宣传文案猜书名。书架“编辑信息”可手动修改 title 和 author，并持久化到 PostgreSQL。
+
+## EPUB 导入可靠性
+
+- EPUB2/EPUB3 同时支持 `toc.ncx`、`nav.xhtml`、spine 与 manifest 正文 fallback。NAV/NCX、guide、metadata、cover、CSS、font 或单张图片损坏时降级，不阻断其余正文。
+- href 会统一处理 fragment、URL encoding、相对路径、反斜杠与大小写差异；重复 spine item、空章节和不存在的 TOC 目标会跳过并写入轻量 warning。
+- 只把正文实际引用的图片与有效封面写入 private Storage；source 与必要图片使用最多 4 路有界并发上传，不保存未使用图片、字体或 CSS。
+- 全书先解析并验证出有效 normalized chapters，之后才上传 Storage 和写数据库。chapters/assets 使用批量写入；数据库异常会回滚事务，Storage 或数据库任一阶段失败都会按本次 book UUID 清理已确认上传的对象。
+- Gunicorn hard timeout 保持 120 秒；应用在 105 秒设置协作式安全截止，能够在 worker hard kill 前返回 `epub_import_timeout` 并清理本次导入。
+- 导入日志只记录 filename、byte size、EPUB version、manifest/spine/chapter/asset 数量、parse/storage/database/total duration、warning count 与 failure stage，不记录正文。
+
+稳定错误码包括：`unsupported_archive`、`invalid_epub`、`no_readable_content`、`epub_parse_failed`、`epub_import_timeout`、`storage_upload_failed` 与 `database_write_failed`。响应只返回用户可理解的短消息，不暴露 traceback、连接串或数据库细节。
+
+EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading House `chapter_id + block_id + fragment`。同页/跨页脚注会在当前页打开轻量注释纸片；普通章节链接和 backlink 在阅读器内部跳转。缺失脚注显示 `footnote_target_missing`，浏览器不会导航到原 EPUB 相对路径或 404。
 
 ## 数据库安装与迁移
 
@@ -147,6 +162,8 @@ xiaxia-reading-house/
 3. Start Command：`gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120 app:app`
 4. Health Check Path：`/health`
 5. 配置上表七个必填环境变量后部署。
+
+本次 EPUB 可靠性返修没有数据库 migration。已运行 V2 的实例只需部署新代码；不重跑 `schema.sql`，不重新导入既有书籍。
 
 健康检查结果：
 
@@ -316,7 +333,7 @@ node --check static/js/after-reading.js
 ruff check .
 ```
 
-测试覆盖 EPUB2/EPUB3 cover、异常 title fallback、书籍信息编辑、批注 CRUD/cascade/补写、四类 owner/content_type、Thought 与双方 Reply CRUD、Preview 不落正式表、批量 Commit/Delete、anchor validation、Undo/冲突、全局筛选与跳转字段、长短章节 chunk、annotation 所属 chunk、Thought 后 checkpoint、中途/最终/完成/跨章进度、删书与 Storage 清理、多书路径隔离、原有用户进度、自动同步、私有 Storage、身份边界，以及 OpenAPI/Flask/SQL/JS/README 一致性。V2 专项覆盖完成门槛、逐章 AI 完成、exact/overlap/same-block 匹配、稳定锚点、双盲裁剪、身份隔离、增量 migration、Action Schema 冻结与封底 UI 接线。
+测试覆盖 EPUB2/EPUB3 NAV/NCX、TOC/spine/manifest fallback、编码与大小写路径、异常 metadata/cover/image、可恢复 XHTML、ruby/poem/table、100/300/500 小章节压力、批量 DB 写入、Storage/DB/timeout 回滚、同页/跨页脚注、backlink、缺失目标与稳定 block regression；同时保留书籍管理、批注、Thought/Reply、Preview/Commit、Undo、进度、V2 completion/back-cover/shared stops/reflection/letter 和冻结 Action 契约的完整回归。
 
 ## V1.1 UI / UX Refresh
 

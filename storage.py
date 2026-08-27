@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID
@@ -13,6 +14,14 @@ from supabase import Client, create_client
 
 class ObjectStorageError(RuntimeError):
     """Raised when a private Storage operation cannot be completed."""
+
+
+class ObjectStorageBatchError(ObjectStorageError):
+    """A bounded batch failed after some objects may already have uploaded."""
+
+    def __init__(self, message: str, uploaded_paths: list[str]) -> None:
+        super().__init__(message)
+        self.uploaded_paths = uploaded_paths
 
 
 _client: Client | None = None
@@ -52,6 +61,42 @@ def upload_bytes(object_path: str, data: bytes, media_type: str) -> None:
         )
     except Exception as exc:
         raise ObjectStorageError("Supabase Storage upload failed") from exc
+
+
+def upload_many(
+    objects: list[tuple[str, bytes, str]], *, max_workers: int = 4
+) -> list[str]:
+    """Upload distinct required objects with small bounded concurrency.
+
+    Supabase Storage has no multi-object upload endpoint.  Concurrency removes
+    needless serial network latency while the caller retains exact rollback
+    knowledge if any individual upload fails.
+    """
+    unique: dict[str, tuple[bytes, str]] = {}
+    for path, data, media_type in objects:
+        unique.setdefault(path, (data, media_type))
+    if not unique:
+        return []
+    uploaded: list[str] = []
+    worker_count = max(1, min(max_workers, len(unique)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(upload_bytes, path, data, media_type): path
+            for path, (data, media_type) in unique.items()
+        }
+        failure: Exception | None = None
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                future.result()
+                uploaded.append(path)
+            except Exception as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise ObjectStorageBatchError(
+                "Supabase Storage batch upload failed", sorted(uploaded)
+            ) from failure
+    return sorted(uploaded)
 
 
 def download_bytes(object_path: str) -> bytes:

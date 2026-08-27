@@ -1,4 +1,9 @@
-"""EPUB2/EPUB3 and TXT parsing with stable annotation block IDs."""
+"""Fault-tolerant EPUB2/EPUB3 and TXT parsing with stable block IDs.
+
+The EPUB path parses the ZIP container and OPF directly. Broken NAV/NCX files
+therefore cannot abort an otherwise readable book, and fonts, stylesheets, and
+unused images are never materialised in memory.
+"""
 
 from __future__ import annotations
 
@@ -7,21 +12,25 @@ import html
 import mimetypes
 import posixpath
 import re
-import tempfile
+import time
+import zipfile
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import PurePosixPath
-from typing import Any
-from urllib.parse import unquote, urldefrag
+from typing import Any, Iterable
+from urllib.parse import unquote, urldefrag, urlsplit
 
 import bleach
-import ebooklib
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, NavigableString, Tag
 from charset_normalizer import from_bytes
-from ebooklib import epub
 
 
 class BookParseError(ValueError):
     """Raised when an upload cannot be converted into readable chapters."""
+
+    def __init__(self, message: str, code: str = "epub_parse_failed") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(slots=True)
@@ -52,402 +61,561 @@ class ParsedBook:
     chapters: list[ParsedChapter] = field(default_factory=list)
     assets: list[ParsedAsset] = field(default_factory=list)
     cover_asset_path: str | None = None
+    epub_version: str | None = None
+    manifest_item_count: int = 0
+    spine_item_count: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _ManifestItem:
+    item_id: str
+    href: str
+    archive_path: str
+    media_type: str
+    properties: set[str]
 
 
 ALLOWED_TAGS = {
-    "p",
-    "div",
-    "section",
-    "article",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
-    "blockquote",
-    "pre",
-    "code",
-    "strong",
-    "b",
-    "em",
-    "i",
-    "u",
-    "s",
-    "sub",
-    "sup",
-    "small",
-    "span",
-    "br",
-    "hr",
-    "ul",
-    "ol",
-    "li",
-    "dl",
-    "dt",
-    "dd",
-    "table",
-    "thead",
-    "tbody",
-    "tfoot",
-    "tr",
-    "th",
-    "td",
-    "caption",
-    "img",
-    "a",
+    "p", "div", "section", "article", "aside", "figure", "figcaption",
+    "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "code",
+    "strong", "b", "em", "i", "u", "s", "sub", "sup", "small", "span",
+    "ruby", "rt", "rp", "br", "hr", "ul", "ol", "li", "dl", "dt", "dd",
+    "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption", "img", "a",
 }
 ALLOWED_ATTRIBUTES = {
-    "a": ["href", "title"],
+    "a": [
+        "href", "title", "data-epub-target-href", "data-epub-target-fragment",
+        "data-epub-link-kind",
+    ],
     "img": ["alt", "title", "data-asset-path"],
     "th": ["colspan", "rowspan"],
     "td": ["colspan", "rowspan"],
+    "*": ["data-epub-fragment", "data-epub-note"],
 }
 BLOCK_TAGS = {
-    "p",
-    "div",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
-    "blockquote",
-    "pre",
-    "li",
-    "dt",
-    "dd",
-    "th",
-    "td",
-    "caption",
+    "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote",
+    "pre", "li", "dt", "dd", "th", "td", "caption", "figcaption",
 }
 UNSAFE_TAGS = {
-    "script",
-    "style",
-    "iframe",
-    "object",
-    "embed",
-    "form",
-    "input",
-    "button",
-    "textarea",
-    "select",
-    "link",
-    "meta",
-    "svg",
-    "math",
+    "script", "style", "iframe", "object", "embed", "form", "input",
+    "button", "textarea", "select", "link", "meta", "svg", "math",
 }
+DOCUMENT_MEDIA_TYPES = {"application/xhtml+xml", "text/html"}
+IMAGE_MEDIA_PREFIX = "image/"
 MAX_AUTOMATIC_TITLE_LENGTH = 160
+MAX_ARCHIVE_ENTRIES = 20_000
+MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_ENTRY_BYTES = 128 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 300
 
 
-def parse_uploaded_book(filename: str, data: bytes) -> ParsedBook:
+def parse_uploaded_book(
+    filename: str, data: bytes, deadline: float | None = None
+) -> ParsedBook:
     extension = PurePosixPath(filename).suffix.lower()
     if extension == ".epub":
-        return _parse_epub(filename, data)
+        return _parse_epub(filename, data, deadline=deadline)
     if extension == ".txt":
         return _parse_txt(filename, data)
-    raise BookParseError("V1 仅支持 EPUB 和 TXT 文件")
+    raise BookParseError(
+        "仅支持 EPUB 和 TXT 文件；上传内容不是受支持的书籍 archive",
+        "unsupported_archive",
+    )
 
 
-def _parse_epub(filename: str, data: bytes) -> ParsedBook:
+def _parse_epub(
+    filename: str, data: bytes, *, deadline: float | None = None
+) -> ParsedBook:
     if not data:
-        raise BookParseError("文件为空")
+        raise BookParseError("EPUB 文件为空", "invalid_epub")
+    _check_deadline(deadline)
     try:
-        # EbookLib 0.19 requires a filesystem path. Render's temporary disk is
-        # used only during parsing; durable binaries go to private Storage and
-        # PostgreSQL keeps only structured data, text, and object metadata.
-        with tempfile.NamedTemporaryFile(suffix=".epub") as temporary:
-            temporary.write(data)
-            temporary.flush()
-            book = epub.read_epub(temporary.name, options={"ignore_ncx": False})
-    except Exception as exc:
+        archive = zipfile.ZipFile(BytesIO(data))
+    except (zipfile.BadZipFile, OSError) as exc:
         raise BookParseError(
-            "无法解析 EPUB；文件可能损坏、带 DRM 或不是标准 EPUB"
+            "文件不是有效的 EPUB archive，可能已损坏或格式不受支持",
+            "unsupported_archive",
         ) from exc
 
-    title = _preferred_book_title(_metadata_value(book, "title"), filename)
-    author = _metadata_value(book, "creator") or "未知作者"
-    toc, toc_titles = _extract_toc(book.toc)
-    assets = _extract_assets(book)
-    asset_paths = {asset.path for asset in assets}
-    cover_path = _find_cover_path(book, assets)
+    warnings: list[str] = []
+    try:
+        archive_names = _validate_archive(archive)
+        opf_path = _find_opf_path(archive, archive_names, warnings)
+        opf = _parse_markup(
+            _read_archive_entry(archive, archive_names, opf_path), xml=True
+        )
+        package = opf.find(
+            lambda tag: isinstance(tag, Tag) and _local_name(tag.name) == "package"
+        ) or opf
+        epub_version = str(package.get("version") or "unknown").strip()[:32]
+        opf_dir = posixpath.dirname(opf_path)
 
-    chapters: list[ParsedChapter] = []
-    for idref, _linear in book.spine:
-        item = book.get_item_with_id(idref)
+        manifest = _parse_manifest(package, opf_dir, archive_names, warnings)
+        spine_ids, spine_toc_id = _parse_spine(package)
+        metadata_title = _metadata_text(package, "title")
+        author = _metadata_text(package, "creator") or "未知作者"
+
+        nav_toc: list[dict[str, Any]] = []
+        nav_item = next(
+            (item for item in manifest.values() if "nav" in item.properties), None
+        )
+        if nav_item:
+            nav_toc = _parse_nav_toc(archive, archive_names, nav_item, warnings)
+
+        ncx_toc: list[dict[str, Any]] = []
+        ncx_item = manifest.get(spine_toc_id or "") or next(
+            (
+                item
+                for item in manifest.values()
+                if item.media_type == "application/x-dtbncx+xml"
+            ),
+            None,
+        )
+        if ncx_item:
+            ncx_toc = _parse_ncx_toc(archive, archive_names, ncx_item, warnings)
+
+        toc = nav_toc or ncx_toc
+        if nav_toc and ncx_toc:
+            warnings.append("both_nav_and_ncx_present")
+        title_map = _toc_title_map(toc)
+        toc_hrefs = list(_flatten_toc_hrefs(toc))
+
+        document_items = {
+            item.href: item
+            for item in manifest.values()
+            if _is_document_item(item) and "nav" not in item.properties
+        }
+        ordered_hrefs = _chapter_order(
+            toc_hrefs, spine_ids, manifest, document_items, archive_names, opf_dir
+        )
+
+        chapters: list[ParsedChapter] = []
+        referenced_assets: set[str] = set()
+        for href in ordered_hrefs:
+            _check_deadline(deadline)
+            item = document_items.get(href)
+            archive_path = (
+                item.archive_path
+                if item
+                else _package_to_archive_path(opf_dir, href)
+            )
+            try:
+                raw = _read_archive_entry(archive, archive_names, archive_path)
+                clean_html, plain_text, chapter_assets = _sanitize_chapter(raw, href)
+            except Exception:
+                warnings.append(f"chapter_parse_skipped:{href}")
+                continue
+            has_image = "data-asset-path=" in clean_html
+            if not plain_text.strip() and not has_image:
+                warnings.append(f"empty_chapter_skipped:{href}")
+                continue
+            referenced_assets.update(chapter_assets)
+            chapter_title = (
+                title_map.get(_href_key(href)) or _title_from_html(clean_html)
+            )
+            if not chapter_title:
+                chapter_title = f"第 {len(chapters) + 1} 章"
+            chapters.append(
+                ParsedChapter(
+                    chapter_index=len(chapters),
+                    title=chapter_title,
+                    href=href,
+                    content_html=clean_html,
+                    content_text=plain_text,
+                    word_count=_count_words(plain_text),
+                )
+            )
+
+        if not chapters:
+            raise BookParseError(
+                "EPUB 中没有找到可阅读正文；目录、spine 与 manifest fallback 均无有效内容",
+                "no_readable_content",
+            )
+
+        cover_path = _find_cover_path(
+            package, manifest, archive, archive_names, warnings, opf_dir
+        )
+        wanted_assets = set(referenced_assets)
+        if cover_path:
+            wanted_assets.add(cover_path)
+        assets = _extract_used_assets(
+            archive,
+            archive_names,
+            manifest,
+            wanted_assets,
+            warnings,
+            deadline,
+            opf_dir,
+        )
+        available_assets = {asset.path for asset in assets}
+        if cover_path not in available_assets:
+            cover_path = None
+        chapters = _drop_missing_image_references(
+            chapters, available_assets, warnings
+        )
+        chapters = _prune_empty_after_asset_cleanup(chapters, warnings)
+        if not chapters:
+            raise BookParseError(
+                "EPUB 中没有可阅读正文；唯一内容为缺失或损坏的图片",
+                "no_readable_content",
+            )
+
+        return ParsedBook(
+            title=_preferred_book_title(metadata_title, filename),
+            author=_clean_metadata(author),
+            format="epub",
+            source_filename=filename,
+            source_sha256=hashlib.sha256(data).hexdigest(),
+            toc=toc,
+            chapters=chapters,
+            assets=assets,
+            cover_asset_path=cover_path,
+            epub_version=epub_version,
+            manifest_item_count=len(manifest),
+            spine_item_count=len(spine_ids),
+            warnings=_dedupe(warnings),
+        )
+    except BookParseError:
+        raise
+    except Exception as exc:
+        raise BookParseError(
+            "无法解析 EPUB；容器、OPF 或正文结构不可恢复",
+            "epub_parse_failed",
+        ) from exc
+    finally:
+        archive.close()
+
+
+def _validate_archive(archive: zipfile.ZipFile) -> dict[str, str]:
+    infos = archive.infolist()
+    if not infos or len(infos) > MAX_ARCHIVE_ENTRIES:
+        raise BookParseError("EPUB archive 条目数量异常", "unsupported_archive")
+    total = 0
+    names: dict[str, str] = {}
+    for info in infos:
+        normalized = _normalize_archive_path(info.filename)
+        if not normalized or info.is_dir():
+            continue
+        if info.file_size > MAX_ENTRY_BYTES:
+            raise BookParseError(
+                "EPUB 中存在异常大的单个资源", "unsupported_archive"
+            )
+        total += info.file_size
+        if total > MAX_UNCOMPRESSED_BYTES:
+            raise BookParseError(
+                "EPUB 解压后体积异常，已拒绝处理", "unsupported_archive"
+            )
         if (
-            item is None
-            or item.get_type() != ebooklib.ITEM_DOCUMENT
-            or isinstance(item, epub.EpubNav)
+            info.compress_size
+            and info.file_size / info.compress_size > MAX_COMPRESSION_RATIO
         ):
-            continue
-        properties = set(getattr(item, "properties", []) or [])
-        if "nav" in properties:
-            continue
-        href = _normalize_asset_path(item.get_name())
-        clean_html, plain_text = _sanitize_chapter(
-            item.get_content(), href, asset_paths
-        )
-        if not plain_text.strip():
-            continue
-        chapter_title = toc_titles.get(_href_key(href)) or _title_from_html(clean_html)
-        if not chapter_title:
-            chapter_title = f"第 {len(chapters) + 1} 章"
-        chapters.append(
-            ParsedChapter(
-                chapter_index=len(chapters),
-                title=chapter_title,
-                href=href,
-                content_html=clean_html,
-                content_text=plain_text,
-                word_count=_count_words(plain_text),
+            raise BookParseError(
+                "EPUB 压缩比例异常，已拒绝处理", "unsupported_archive"
             )
-        )
-
-    if not chapters:
-        raise BookParseError("EPUB 中没有找到可阅读的正文篇章")
-
-    return ParsedBook(
-        title=title,
-        author=_clean_metadata(author),
-        format="epub",
-        source_filename=filename,
-        source_sha256=hashlib.sha256(data).hexdigest(),
-        toc=toc,
-        chapters=chapters,
-        assets=assets,
-        cover_asset_path=cover_path,
-    )
+        names.setdefault(normalized.lower(), info.filename)
+    return names
 
 
-def _parse_txt(filename: str, data: bytes) -> ParsedBook:
-    if not data:
-        raise BookParseError("文件为空")
-    best = from_bytes(data).best()
-    if best is None:
-        raise BookParseError("无法识别 TXT 编码")
-    text = str(best).replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not text:
-        raise BookParseError("TXT 中没有正文")
-
-    heading_re = re.compile(
-        r"(?im)^\s*((?:第[0-9一二三四五六七八九十百千万零〇两]+[章节卷回部].*)|(?:chapter\s+\d+.*))\s*$"
-    )
-    matches = list(heading_re.finditer(text))
-    sections: list[tuple[str, str]] = []
-    if matches:
-        preface = text[: matches[0].start()].strip()
-        if preface:
-            sections.append(("前言", preface))
-        for index, match in enumerate(matches):
-            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-            title = match.group(1).strip()
-            body = text[match.end() : end].strip()
-            sections.append((title, body or title))
+def _find_opf_path(
+    archive: zipfile.ZipFile, names: dict[str, str], warnings: list[str]
+) -> str:
+    container_name = names.get("meta-inf/container.xml")
+    if container_name:
+        try:
+            container = _parse_markup(archive.read(container_name), xml=True)
+            rootfile = container.find(
+                lambda tag: isinstance(tag, Tag)
+                and _local_name(tag.name) == "rootfile"
+                and tag.get("full-path")
+            )
+            if rootfile:
+                candidate = _normalize_archive_path(rootfile.get("full-path"))
+                if candidate.lower() in names:
+                    return candidate
+            warnings.append("broken_container_fallback")
+        except Exception:
+            warnings.append("broken_container_fallback")
     else:
-        sections.append(("正文", text))
-
-    chapters: list[ParsedChapter] = []
-    toc: list[dict[str, Any]] = []
-    for index, (chapter_title, body) in enumerate(sections):
-        chapter_html = _txt_to_html(body)
-        stable_html, plain_text = _assign_block_ids(chapter_html)
-        href = f"txt/chapter-{index + 1}.xhtml"
-        chapters.append(
-            ParsedChapter(
-                chapter_index=index,
-                title=chapter_title,
-                href=href,
-                content_html=stable_html,
-                content_text=plain_text,
-                word_count=_count_words(plain_text),
-            )
-        )
-        toc.append({"label": chapter_title, "href": href, "children": []})
-
-    return ParsedBook(
-        title=PurePosixPath(filename).stem,
-        author="未知作者",
-        format="txt",
-        source_filename=filename,
-        source_sha256=hashlib.sha256(data).hexdigest(),
-        toc=toc,
-        chapters=chapters,
+        warnings.append("missing_container_fallback")
+    candidates = sorted(
+        (
+            _normalize_archive_path(name)
+            for name in names.values()
+            if name.lower().endswith(".opf")
+        ),
+        key=lambda value: (value.count("/"), len(value), value.lower()),
     )
+    if not candidates:
+        raise BookParseError("EPUB 缺少可用的 content.opf", "invalid_epub")
+    return candidates[0]
 
 
-def _metadata_value(book: epub.EpubBook, field: str) -> str | None:
-    values = book.get_metadata("DC", field)
-    if not values:
-        return None
-    value = values[0][0]
-    return str(value).strip() if value else None
+def _parse_manifest(
+    package: Tag, opf_dir: str, names: dict[str, str], warnings: list[str]
+) -> dict[str, _ManifestItem]:
+    result: dict[str, _ManifestItem] = {}
+    for tag in package.find_all(
+        lambda node: isinstance(node, Tag) and _local_name(node.name) == "item"
+    ):
+        item_id = str(tag.get("id") or "").strip()
+        raw_href = str(tag.get("href") or "").strip()
+        if not item_id or not raw_href:
+            continue
+        archive_path = _resolve_archive_href(opf_dir, raw_href)
+        canonical = _archive_to_package_path(opf_dir, archive_path)
+        media_type = str(
+            tag.get("media-type")
+            or mimetypes.guess_type(canonical)[0]
+            or "application/octet-stream"
+        ).lower()
+        properties = {
+            value.lower() for value in str(tag.get("properties") or "").split()
+        }
+        if archive_path.lower() not in names:
+            warnings.append(f"missing_manifest_resource:{canonical}")
+        result[item_id] = _ManifestItem(
+            item_id, canonical, archive_path, media_type, properties
+        )
+    return result
 
 
-def _clean_metadata(value: str) -> str:
-    return re.sub(
-        r"\s+", " ", BeautifulSoup(value, "html.parser").get_text(" ")
-    ).strip()
+def _parse_spine(package: Tag) -> tuple[list[str], str | None]:
+    spine = package.find(
+        lambda tag: isinstance(tag, Tag) and _local_name(tag.name) == "spine"
+    )
+    if not spine:
+        return [], None
+    ids: list[str] = []
+    for itemref in spine.find_all(
+        lambda tag: isinstance(tag, Tag) and _local_name(tag.name) == "itemref"
+    ):
+        item_id = str(itemref.get("idref") or "").strip()
+        if item_id and item_id not in ids:
+            ids.append(item_id)
+    return ids, str(spine.get("toc") or "").strip() or None
 
 
-def _preferred_book_title(metadata_title: str | None, filename: str) -> str:
-    """Use sane metadata, otherwise the filename; never guess from body text."""
-    cleaned = _clean_metadata(metadata_title or "")
-    if cleaned and len(cleaned) <= MAX_AUTOMATIC_TITLE_LENGTH:
-        return cleaned
-    fallback = _clean_metadata(PurePosixPath(filename).stem)
-    return (fallback or "未命名书籍")[:MAX_AUTOMATIC_TITLE_LENGTH]
+def _parse_nav_toc(
+    archive: zipfile.ZipFile,
+    names: dict[str, str],
+    item: _ManifestItem,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    try:
+        soup = _parse_markup(
+            _read_archive_entry(archive, names, item.archive_path), xml=False
+        )
+        navs = soup.find_all("nav")
+        nav = next((node for node in navs if _is_toc_nav(node)), None) or (
+            navs[0] if navs else None
+        )
+        if not nav:
+            warnings.append("nav_without_toc")
+            return []
+        root_list = nav.find(["ol", "ul"])
+        return _parse_html_toc_list(root_list, item.href) if root_list else []
+    except Exception:
+        warnings.append("broken_nav_fallback")
+        return []
 
 
-def _extract_toc(raw_toc: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    title_map: dict[str, str] = {}
+def _parse_html_toc_list(
+    node: Tag | None, base_href: str
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    if node is None:
+        return result
+    for li in node.find_all("li", recursive=False):
+        anchor = li.find("a", href=True)
+        nested = li.find(["ol", "ul"], recursive=False)
+        if not anchor:
+            continue
+        raw_href, fragment = urldefrag(str(anchor.get("href") or ""))
+        href = _resolve_internal_href(base_href, raw_href)
+        result.append(
+            {
+                "label": _clean_metadata(anchor.get_text(" "))
+                or "未命名章节",
+                "href": href,
+                "fragment": unquote(fragment),
+                "children": _parse_html_toc_list(nested, base_href),
+            }
+        )
+    return result
 
-    def walk(items: Any) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        for item in items or []:
-            children: Any = []
-            node = item
-            if isinstance(item, tuple):
-                node = item[0]
-                children = item[1]
-            label = getattr(node, "title", None) or str(node)
-            href = getattr(node, "href", "") or ""
-            normalized_href = _normalize_asset_path(urldefrag(href)[0]) if href else ""
-            if normalized_href:
-                title_map[_href_key(normalized_href)] = _clean_metadata(label)
+
+def _parse_ncx_toc(
+    archive: zipfile.ZipFile,
+    names: dict[str, str],
+    item: _ManifestItem,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    try:
+        soup = _parse_markup(
+            _read_archive_entry(archive, names, item.archive_path), xml=True
+        )
+        nav_map = soup.find(
+            lambda tag: isinstance(tag, Tag)
+            and _local_name(tag.name) == "navmap"
+        )
+        return _parse_ncx_points(nav_map, item.href) if nav_map else []
+    except Exception:
+        warnings.append("broken_ncx_fallback")
+        return []
+
+
+def _parse_ncx_points(
+    node: Tag | None, base_href: str
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    if node is None:
+        return result
+    points = node.find_all(
+        lambda tag: isinstance(tag, Tag) and _local_name(tag.name) == "navpoint",
+        recursive=False,
+    )
+    for point in points:
+        content = point.find(
+            lambda tag: isinstance(tag, Tag)
+            and _local_name(tag.name) == "content"
+        )
+        label_node = point.find(
+            lambda tag: isinstance(tag, Tag) and _local_name(tag.name) == "text"
+        )
+        raw = str(content.get("src") or "") if content else ""
+        raw_href, fragment = urldefrag(raw)
+        href = _resolve_internal_href(base_href, raw_href)
+        if href:
             result.append(
                 {
-                    "label": _clean_metadata(label),
-                    "href": normalized_href,
-                    "children": walk(children),
+                    "label": _clean_metadata(
+                        label_node.get_text(" ") if label_node else ""
+                    )
+                    or "未命名章节",
+                    "href": href,
+                    "fragment": unquote(fragment),
+                    "children": _parse_ncx_points(point, base_href),
                 }
             )
-        return result
-
-    return walk(raw_toc), title_map
+    return result
 
 
-def _extract_assets(book: epub.EpubBook) -> list[ParsedAsset]:
-    assets: list[ParsedAsset] = []
-    for item in book.get_items():
-        if item.get_type() not in {ebooklib.ITEM_IMAGE, ebooklib.ITEM_COVER}:
-            continue
-        path = _normalize_asset_path(item.get_name())
-        media_type = (
-            item.media_type
-            or mimetypes.guess_type(path)[0]
-            or "application/octet-stream"
+def _chapter_order(
+    toc_hrefs: list[str],
+    spine_ids: list[str],
+    manifest: dict[str, _ManifestItem],
+    documents: dict[str, _ManifestItem],
+    archive_names: dict[str, str],
+    opf_dir: str,
+) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(href: str) -> None:
+        normalized = _normalize_asset_path(href)
+        key = _href_key(normalized)
+        if not normalized or key in seen:
+            return
+        item = documents.get(normalized)
+        archive_path = (
+            item.archive_path
+            if item
+            else _package_to_archive_path(opf_dir, normalized)
         )
-        assets.append(
-            ParsedAsset(path=path, media_type=media_type, data=item.get_content())
-        )
-    return assets
+        if item or (
+            archive_path.lower() in archive_names
+            and PurePosixPath(normalized).suffix.lower()
+            in {".xhtml", ".html", ".htm"}
+        ):
+            seen.add(key)
+            ordered.append(normalized)
 
-
-def _find_cover_path(book: epub.EpubBook, assets: list[ParsedAsset]) -> str | None:
-    """Resolve EPUB3, EPUB2, and common publisher cover conventions."""
-    asset_paths = {asset.path for asset in assets}
-    image_items = [
-        item
-        for item in book.get_items()
-        if item.get_type() in {ebooklib.ITEM_IMAGE, ebooklib.ITEM_COVER}
-    ]
-
-    # EPUB3: <item properties="cover-image">.
-    for item in image_items:
-        properties = {
-            str(value).strip().lower()
-            for value in (getattr(item, "properties", None) or [])
-        }
-        if "cover-image" in properties:
-            candidate = _item_asset_path(item, asset_paths)
-            if candidate:
-                return candidate
-
-    # EPUB2: <meta name="cover" content="manifest-id">. EbookLib exposes
-    # this as OPF metadata, but publisher files vary in the stored key shape.
-    for value, attributes in book.get_metadata("OPF", "cover") or []:
-        cover_id = (attributes or {}).get("content") or value
-        item = book.get_item_with_id(str(cover_id)) if cover_id else None
-        candidate = _item_asset_path(item, asset_paths)
-        if candidate:
-            return candidate
-    for metadata_values in (getattr(book, "metadata", {}) or {}).values():
-        for metadata_name, entries in (metadata_values or {}).items():
-            for value, attributes in entries or []:
-                attributes = attributes or {}
-                if str(attributes.get("name") or metadata_name).lower() != "cover":
-                    continue
-                cover_id = attributes.get("content") or value
-                item = book.get_item_with_id(str(cover_id)) if cover_id else None
-                candidate = _item_asset_path(item, asset_paths)
-                if candidate:
-                    return candidate
-
-    for item in book.get_items_of_type(ebooklib.ITEM_COVER):
-        candidate = _item_asset_path(item, asset_paths)
-        if candidate:
-            return candidate
-
-    # Common manifest IDs and filenames, ranked deterministically.
-    scored: list[tuple[int, int, str]] = []
-    size_by_path = {asset.path: len(asset.data) for asset in assets}
-    for item in image_items:
-        candidate = _item_asset_path(item, asset_paths)
-        if not candidate:
-            continue
-        identifier = str(getattr(item, "id", "") or "").lower()
-        stem = PurePosixPath(candidate).stem.lower()
-        compact = re.sub(r"[^a-z0-9]", "", f"{identifier} {stem}")
-        score = 0
-        if compact in {"cover", "coverimage", "frontcover", "bookcover"}:
-            score += 100
-        if any(token in compact for token in ("cover", "frontcover", "bookcover")):
-            score += 50
-        if PurePosixPath(candidate).parent == PurePosixPath("."):
-            score += 2
-        scored.append((score, size_by_path.get(candidate, 0), candidate))
-    named = [entry for entry in scored if entry[0] > 0]
-    if named:
-        return max(named)[2]
-    if len(scored) == 1:
-        return scored[0][2]
-    if scored:
-        # Last-resort manifest-image fallback: covers are commonly the largest
-        # raster. This is used only when the EPUB supplies no cover semantics.
-        return max(scored, key=lambda entry: (entry[1], entry[2]))[2]
-    return None
-
-
-def _item_asset_path(item: Any, asset_paths: set[str]) -> str | None:
-    if item is None:
-        return None
-    candidate = _normalize_asset_path(item.get_name())
-    return candidate if candidate in asset_paths else None
+    for href in toc_hrefs:
+        add(href)
+    for item_id in spine_ids:
+        item = manifest.get(item_id)
+        if item and _is_document_item(item) and "nav" not in item.properties:
+            add(item.href)
+    # Manifest is the final fallback, not an unconditional appendix.  Many
+    # valid EPUBs contain cover/title XHTML outside the reading spine.
+    if not ordered:
+        for item in manifest.values():
+            if _is_document_item(item) and "nav" not in item.properties:
+                add(item.href)
+    return ordered
 
 
 def _sanitize_chapter(
-    raw: bytes, chapter_href: str, asset_paths: set[str]
-) -> tuple[str, str]:
-    soup = BeautifulSoup(raw, "html.parser")
+    raw: bytes, chapter_href: str
+) -> tuple[str, str, set[str]]:
+    soup = _parse_markup(raw, xml=False)
     for tag_name in UNSAFE_TAGS:
         for tag in soup.find_all(tag_name):
             tag.decompose()
     root = soup.body or soup
+    referenced_assets: set[str] = set()
+
+    for target in root.find_all(True):
+        original_id = str(
+            target.get("id") or target.get("name") or ""
+        ).strip()
+        if original_id:
+            target["data-epub-fragment"] = unquote(original_id)
+        target.attrs.pop("id", None)
+        target.attrs.pop("name", None)
+        type_values = " ".join(
+            str(target.get(name) or "")
+            for name in ("epub:type", "type", "role", "class")
+        ).lower()
+        if any(
+            token in type_values
+            for token in (
+                "footnote",
+                "endnote",
+                "doc-footnote",
+                "doc-endnote",
+            )
+        ):
+            target["data-epub-note"] = "true"
+
     for image in root.find_all("img"):
-        source = image.get("src", "")
-        resolved = _resolve_asset_href(chapter_href, source)
+        source = str(image.get("src") or "")
+        resolved = _resolve_internal_href(chapter_href, source)
         image.attrs = {
-            key: value for key, value in image.attrs.items() if key in {"alt", "title"}
+            key: value
+            for key, value in image.attrs.items()
+            if key in {"alt", "title"}
         }
-        if resolved in asset_paths:
+        if resolved:
             image["data-asset-path"] = resolved
+            referenced_assets.add(resolved)
         else:
             image.decompose()
+
     for anchor in root.find_all("a"):
-        href = anchor.get("href", "")
-        if href.lower().startswith(("javascript:", "data:")):
-            anchor.attrs.pop("href", None)
+        raw_href = str(anchor.get("href") or "").strip()
+        link_kind = _link_kind(anchor, raw_href)
+        anchor.attrs = {
+            key: value
+            for key, value in anchor.attrs.items()
+            if key in {"title", "data-epub-fragment"}
+        }
+        if not raw_href:
+            continue
+        split = urlsplit(raw_href)
+        if split.scheme.lower() in {"http", "https", "mailto"}:
+            anchor["href"] = raw_href
+            continue
+        if split.scheme or raw_href.lower().startswith(("javascript:", "data:")):
+            continue
+        target_path, fragment = urldefrag(raw_href)
+        resolved = _resolve_internal_href(chapter_href, target_path)
+        anchor["href"] = "#"
+        anchor["data-epub-target-href"] = resolved or chapter_href
+        anchor["data-epub-target-fragment"] = unquote(fragment)
+        anchor["data-epub-link-kind"] = link_kind
+
     cleaned = bleach.clean(
         "".join(str(child) for child in root.children),
         tags=ALLOWED_TAGS,
@@ -456,15 +624,22 @@ def _sanitize_chapter(
         strip=True,
         strip_comments=True,
     )
-    return _assign_block_ids(cleaned)
+    stable_html, plain_text = _assign_block_ids(cleaned)
+    return stable_html, plain_text, referenced_assets
 
 
 def _assign_block_ids(fragment: str) -> tuple[str, str]:
     soup = BeautifulSoup(fragment, "html.parser")
-    # Publisher EPUBs often wrap the entire chapter in one or more generic
-    # containers. Removing those wrappers keeps IDs paragraph-sized instead
-    # of accidentally turning a whole chapter into one annotation block.
     for container in soup.find_all(["div", "section", "article"]):
+        fragment_name = container.get("data-epub-fragment")
+        note = container.get("data-epub-note")
+        if fragment_name or note:
+            marker = soup.new_tag("span")
+            if fragment_name:
+                marker["data-epub-fragment"] = fragment_name
+            if note:
+                marker["data-epub-note"] = note
+            container.insert(0, marker)
         container.unwrap()
     if not soup.find(BLOCK_TAGS):
         wrapper = soup.new_tag("p")
@@ -476,8 +651,6 @@ def _assign_block_ids(fragment: str) -> tuple[str, str]:
     plain_blocks: list[str] = []
     for tag in soup.find_all(BLOCK_TAGS):
         if tag.find_parent(BLOCK_TAGS):
-            # The nearest semantic block owns character offsets; nested block
-            # containers would make one text position ambiguous.
             continue
         block_number += 1
         block_id = f"b{block_number:06d}"
@@ -487,8 +660,6 @@ def _assign_block_ids(fragment: str) -> tuple[str, str]:
         if plain:
             plain_blocks.append(plain)
 
-    # Images or nested structures can leave unowned text nodes. Wrap them so
-    # every selectable character belongs to one stable block.
     for child in list(soup.contents):
         if isinstance(child, NavigableString) and child.strip():
             block_number += 1
@@ -501,40 +672,354 @@ def _assign_block_ids(fragment: str) -> tuple[str, str]:
             plain_blocks.append(
                 re.sub(r"\s+", " ", wrapper.get_text("", strip=False)).strip()
             )
-
     return str(soup), "\n\n".join(plain_blocks)
 
 
-def _txt_to_html(text: str) -> str:
-    paragraphs = re.split(r"\n\s*\n", text)
-    rendered: list[str] = []
-    for paragraph in paragraphs:
-        value = paragraph.strip()
-        if not value:
+def _find_cover_path(
+    package: Tag,
+    manifest: dict[str, _ManifestItem],
+    archive: zipfile.ZipFile,
+    names: dict[str, str],
+    warnings: list[str],
+    opf_dir: str,
+) -> str | None:
+    for item in manifest.values():
+        if (
+            "cover-image" in item.properties
+            and item.media_type.startswith(IMAGE_MEDIA_PREFIX)
+        ):
+            return item.href
+    for meta in package.find_all(
+        lambda tag: isinstance(tag, Tag) and _local_name(tag.name) == "meta"
+    ):
+        if str(meta.get("name") or "").lower() == "cover":
+            item = manifest.get(str(meta.get("content") or ""))
+            if item and item.media_type.startswith(IMAGE_MEDIA_PREFIX):
+                return item.href
+    guide = package.find(
+        lambda tag: isinstance(tag, Tag) and _local_name(tag.name) == "guide"
+    )
+    if guide:
+        reference = guide.find(
+            lambda tag: isinstance(tag, Tag)
+            and _local_name(tag.name) == "reference"
+            and "cover" in str(tag.get("type") or "").lower()
+        )
+        if reference and reference.get("href"):
+            cover_doc = _archive_to_package_path(
+                opf_dir,
+                _resolve_archive_href(opf_dir, str(reference.get("href"))),
+            )
+            item = next(
+                (
+                    value
+                    for value in manifest.values()
+                    if _href_key(value.href) == _href_key(cover_doc)
+                ),
+                None,
+            )
+            if item:
+                try:
+                    soup = _parse_markup(
+                        _read_archive_entry(archive, names, item.archive_path),
+                        xml=False,
+                    )
+                    image = soup.find("img", src=True)
+                    if image:
+                        return _resolve_internal_href(
+                            item.href, str(image.get("src"))
+                        )
+                except Exception:
+                    warnings.append("broken_guide_cover")
+    named = [
+        item.href
+        for item in manifest.values()
+        if item.media_type.startswith(IMAGE_MEDIA_PREFIX)
+        and "cover"
+        in re.sub(
+            r"[^a-z0-9]",
+            "",
+            f"{item.item_id} {PurePosixPath(item.href).stem}".lower(),
+        )
+    ]
+    return sorted(named)[0] if named else None
+
+
+def _extract_used_assets(
+    archive: zipfile.ZipFile,
+    names: dict[str, str],
+    manifest: dict[str, _ManifestItem],
+    wanted: set[str],
+    warnings: list[str],
+    deadline: float | None,
+    opf_dir: str,
+) -> list[ParsedAsset]:
+    by_href = {_href_key(item.href): item for item in manifest.values()}
+    assets: list[ParsedAsset] = []
+    for path in sorted(wanted, key=str.lower):
+        _check_deadline(deadline)
+        item = by_href.get(_href_key(path))
+        archive_path = (
+            item.archive_path
+            if item
+            else _package_to_archive_path(opf_dir, path)
+        )
+        media_type = (
+            item.media_type
+            if item
+            else (mimetypes.guess_type(path)[0] or "application/octet-stream")
+        )
+        if not media_type.startswith(IMAGE_MEDIA_PREFIX):
+            warnings.append(f"unsupported_asset_skipped:{path}")
             continue
-        escaped = html.escape(value).replace("\n", "<br>")
-        rendered.append(f"<p>{escaped}</p>")
-    return "".join(rendered)
+        try:
+            payload = _read_archive_entry(archive, names, archive_path)
+        except Exception:
+            warnings.append(f"missing_image_skipped:{path}")
+            continue
+        if not payload:
+            warnings.append(f"broken_image_skipped:{path}")
+            continue
+        assets.append(
+            ParsedAsset(_normalize_asset_path(path), media_type, payload)
+        )
+    return assets
 
 
-def _resolve_asset_href(chapter_href: str, source: str) -> str:
-    source = unquote(urldefrag(source or "")[0]).strip()
-    if not source or source.startswith(("http://", "https://", "data:")):
-        return ""
-    return _normalize_asset_path(
-        posixpath.join(posixpath.dirname(chapter_href), source)
+def _drop_missing_image_references(
+    chapters: list[ParsedChapter], available: set[str], warnings: list[str]
+) -> list[ParsedChapter]:
+    for chapter in chapters:
+        soup = BeautifulSoup(chapter.content_html, "html.parser")
+        changed = False
+        for image in soup.select("img[data-asset-path]"):
+            if image.get("data-asset-path") not in available:
+                warnings.append(
+                    f"missing_image_removed:{image.get('data-asset-path')}"
+                )
+                image.decompose()
+                changed = True
+        if changed:
+            chapter.content_html = str(soup)
+    return chapters
+
+
+def _prune_empty_after_asset_cleanup(
+    chapters: list[ParsedChapter], warnings: list[str]
+) -> list[ParsedChapter]:
+    retained: list[ParsedChapter] = []
+    for chapter in chapters:
+        if chapter.content_text.strip() or BeautifulSoup(
+            chapter.content_html, "html.parser"
+        ).find("img"):
+            chapter.chapter_index = len(retained)
+            retained.append(chapter)
+        else:
+            warnings.append(f"empty_chapter_after_asset_cleanup:{chapter.href}")
+    return retained
+
+
+def _parse_txt(filename: str, data: bytes) -> ParsedBook:
+    if not data:
+        raise BookParseError("文件为空", "no_readable_content")
+    best = from_bytes(data).best()
+    if best is None:
+        raise BookParseError("无法识别 TXT 编码", "book_parse_failed")
+    text = str(best).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        raise BookParseError("TXT 中没有正文", "no_readable_content")
+    heading_re = re.compile(
+        r"(?im)^\s*((?:第[0-9一二三四五六七八九十百千万零〇两]+[章节卷回部].*)|(?:chapter\s+\d+.*))\s*$"
+    )
+    matches = list(heading_re.finditer(text))
+    sections: list[tuple[str, str]] = []
+    if matches:
+        preface = text[: matches[0].start()].strip()
+        if preface:
+            sections.append(("前言", preface))
+        for index, match in enumerate(matches):
+            end = (
+                matches[index + 1].start()
+                if index + 1 < len(matches)
+                else len(text)
+            )
+            title = match.group(1).strip()
+            body = text[match.end() : end].strip()
+            sections.append((title, body or title))
+    else:
+        sections.append(("正文", text))
+    chapters: list[ParsedChapter] = []
+    toc: list[dict[str, Any]] = []
+    for index, (chapter_title, body) in enumerate(sections):
+        stable_html, plain_text = _assign_block_ids(_txt_to_html(body))
+        href = f"txt/chapter-{index + 1}.xhtml"
+        chapters.append(
+            ParsedChapter(
+                index,
+                chapter_title,
+                href,
+                stable_html,
+                plain_text,
+                _count_words(plain_text),
+            )
+        )
+        toc.append({"label": chapter_title, "href": href, "children": []})
+    return ParsedBook(
+        title=PurePosixPath(filename).stem,
+        author="未知作者",
+        format="txt",
+        source_filename=filename,
+        source_sha256=hashlib.sha256(data).hexdigest(),
+        toc=toc,
+        chapters=chapters,
     )
 
 
+def _metadata_text(package: Tag, local_name: str) -> str | None:
+    node = package.find(
+        lambda tag: isinstance(tag, Tag) and _local_name(tag.name) == local_name
+    )
+    return node.get_text(" ", strip=True) if node else None
+
+
+def _clean_metadata(value: str) -> str:
+    return re.sub(
+        r"\s+", " ", BeautifulSoup(value, "html.parser").get_text(" ")
+    ).strip()
+
+
+def _preferred_book_title(metadata_title: str | None, filename: str) -> str:
+    cleaned = _clean_metadata(metadata_title or "")
+    if cleaned and len(cleaned) <= MAX_AUTOMATIC_TITLE_LENGTH:
+        return cleaned
+    fallback = _clean_metadata(PurePosixPath(filename).stem)
+    return (fallback or "未命名书籍")[:MAX_AUTOMATIC_TITLE_LENGTH]
+
+
+def _parse_markup(raw: bytes | str, *, xml: bool) -> BeautifulSoup:
+    return BeautifulSoup(raw, "xml" if xml else "html.parser")
+
+
+def _read_archive_entry(
+    archive: zipfile.ZipFile, names: dict[str, str], path: str
+) -> bytes:
+    normalized = _normalize_archive_path(path)
+    actual = names.get(normalized.lower())
+    if not actual:
+        raise KeyError(path)
+    return archive.read(actual)
+
+
+def _normalize_archive_path(path: str) -> str:
+    normalized = posixpath.normpath(
+        unquote(str(path or "")).replace("\\", "/")
+    ).lstrip("/")
+    if (
+        normalized in {"", "."}
+        or normalized == ".."
+        or normalized.startswith("../")
+    ):
+        return ""
+    return normalized
+
+
 def _normalize_asset_path(path: str) -> str:
-    normalized = posixpath.normpath(unquote(path).replace("\\", "/")).lstrip("/")
+    normalized = posixpath.normpath(
+        unquote(str(path or "")).replace("\\", "/")
+    ).lstrip("/")
     while normalized.startswith("../"):
         normalized = normalized[3:]
-    return normalized
+    return "" if normalized in {"", "."} else normalized
+
+
+def _resolve_archive_href(base_dir: str, href: str) -> str:
+    raw = urldefrag(unquote(str(href or "")))[0]
+    return _normalize_archive_path(posixpath.join(base_dir, raw))
+
+
+def _resolve_internal_href(base_href: str, href: str) -> str:
+    raw = urldefrag(unquote(str(href or "")))[0].strip()
+    if not raw:
+        return _normalize_asset_path(base_href)
+    if urlsplit(raw).scheme or raw.startswith("//"):
+        return ""
+    return _normalize_asset_path(
+        posixpath.join(posixpath.dirname(base_href), raw)
+    )
+
+
+def _archive_to_package_path(opf_dir: str, archive_path: str) -> str:
+    relative = posixpath.relpath(archive_path, opf_dir or ".")
+    return _normalize_asset_path(
+        relative if not relative.startswith("../") else archive_path
+    )
+
+
+def _package_to_archive_path(opf_dir: str, package_path: str) -> str:
+    return _normalize_archive_path(posixpath.join(opf_dir, package_path))
 
 
 def _href_key(href: str) -> str:
     return _normalize_asset_path(urldefrag(href)[0]).lower()
+
+
+def _is_document_item(item: _ManifestItem) -> bool:
+    return item.media_type in DOCUMENT_MEDIA_TYPES or PurePosixPath(
+        item.href
+    ).suffix.lower() in {".xhtml", ".html", ".htm"}
+
+
+def _is_toc_nav(nav: Tag) -> bool:
+    values = " ".join(
+        str(nav.get(name) or "") for name in ("epub:type", "type", "role")
+    ).lower()
+    return "toc" in values or "doc-toc" in values
+
+
+def _local_name(name: str | None) -> str:
+    return str(name or "").split(":")[-1].lower()
+
+
+def _flatten_toc_hrefs(toc: list[dict[str, Any]]) -> Iterable[str]:
+    for node in toc:
+        if node.get("href"):
+            yield str(node["href"])
+        yield from _flatten_toc_hrefs(node.get("children") or [])
+
+
+def _toc_title_map(toc: list[dict[str, Any]]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for node in toc:
+        href = str(node.get("href") or "")
+        label = _clean_metadata(str(node.get("label") or ""))
+        if href and label:
+            result.setdefault(_href_key(href), label)
+        for key, value in _toc_title_map(node.get("children") or []).items():
+            result.setdefault(key, value)
+    return result
+
+
+def _link_kind(anchor: Tag, raw_href: str) -> str:
+    values = " ".join(
+        [
+            str(anchor.get(name) or "")
+            for name in ("epub:type", "type", "role", "class")
+        ]
+        + [raw_href, anchor.get_text(" ", strip=True)]
+    ).lower()
+    if any(
+        token in values
+        for token in ("backlink", "backref", "doc-backlink", "↩", "返回")
+    ):
+        return "backlink"
+    if any(
+        token in values
+        for token in ("noteref", "footnote", "endnote", "doc-noteref")
+    ):
+        return "footnote"
+    if re.search(r"(?:^|[#/_-])(?:fn|footnote|note)[-_]?\d*", values):
+        return "footnote"
+    return "chapter"
 
 
 def _title_from_html(fragment: str) -> str | None:
@@ -543,7 +1028,32 @@ def _title_from_html(fragment: str) -> str | None:
     return _clean_metadata(heading.get_text(" ")) if heading else None
 
 
+def _txt_to_html(text: str) -> str:
+    rendered: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", text):
+        value = paragraph.strip()
+        if value:
+            rendered.append(
+                f"<p>{html.escape(value).replace(chr(10), '<br>')}</p>"
+            )
+    return "".join(rendered)
+
+
 def _count_words(text: str) -> int:
     cjk = len(re.findall(r"[\u3400-\u9fff]", text))
-    latin = len(re.findall(r"\b[\w'-]+\b", re.sub(r"[\u3400-\u9fff]", " ", text)))
+    latin = len(
+        re.findall(r"\b[\w'-]+\b", re.sub(r"[\u3400-\u9fff]", " ", text))
+    )
     return cjk + latin
+
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.perf_counter() >= deadline:
+        raise BookParseError(
+            "EPUB 导入超过安全处理时间，请检查书籍结构",
+            "epub_import_timeout",
+        )
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))

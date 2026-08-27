@@ -43,6 +43,10 @@
   const traceActionsMenu = document.querySelector("#trace-actions-menu");
   const thoughtActions = document.querySelector("#thought-actions");
   const annotationActions = document.querySelector("#annotation-actions");
+  const footnoteDialog = document.querySelector("#footnote-dialog");
+  const footnoteContent = document.querySelector("#footnote-content");
+  const footnoteOpenFull = document.querySelector("#footnote-open-full");
+  const footnoteClose = document.querySelector("#footnote-close");
   const toast = document.querySelector("#reader-toast");
   const query = new URLSearchParams(location.search);
 
@@ -848,6 +852,81 @@
     if (flash) flashTargets([block]);
   }
 
+  async function followInternalLink(anchor) {
+    if (anchor.dataset.rhTargetMissing === "true") {
+      const code = anchor.dataset.rhErrorCode || "internal_link_target_missing";
+      showToast(code === "footnote_target_missing" ? "脚注目标不存在（footnote_target_missing）" : "书内链接目标不可用。");
+      return;
+    }
+    const chapterId = anchor.dataset.rhChapterId;
+    const blockId = anchor.dataset.rhBlockId || "b000001";
+    const fragment = anchor.dataset.rhTargetFragment || "";
+    if (!chapterId) {
+      showToast("书内链接目标不可用。");
+      return;
+    }
+    if (anchor.dataset.rhLinkKind === "footnote") {
+      await openFootnote(chapterId, blockId, fragment);
+      return;
+    }
+    await goToInternalTarget(chapterId, blockId);
+  }
+
+  async function openFootnote(chapterId, blockId, fragment) {
+    try {
+      let sourceHtml = state.pristineHtml;
+      if (state.chapters[state.currentIndex]?.id !== chapterId) {
+        const result = await api(`/api/books/${bookId}/chapters/${chapterId}`);
+        sourceHtml = result.chapter.content_html;
+      }
+      const documentNode = new DOMParser().parseFromString(sourceHtml, "text/html");
+      const marker = findFragmentNode(documentNode, fragment)
+        || documentNode.querySelector(`#${cssEscape(blockId)}`);
+      if (!marker) {
+        showToast("脚注目标不存在（footnote_target_missing）");
+        return;
+      }
+      const note = marker.closest("aside, li, section, div, p, blockquote")
+        || marker.querySelector?.("[data-block-id]")
+        || marker;
+      const clone = note.cloneNode(true);
+      for (const backLink of clone.querySelectorAll('a[data-rh-link-kind="backlink"]')) backLink.remove();
+      for (const element of clone.querySelectorAll("[id], [data-block-id]")) {
+        element.removeAttribute("id");
+        element.removeAttribute("data-block-id");
+      }
+      if (!normalizeText(clone.textContent) && !clone.querySelector("img")) {
+        showToast("脚注目标不存在（footnote_target_missing）");
+        return;
+      }
+      footnoteContent.replaceChildren(clone);
+      footnoteOpenFull.hidden = false;
+      footnoteOpenFull.dataset.chapterId = chapterId;
+      footnoteOpenFull.dataset.blockId = blockId;
+      if (!footnoteDialog.open) footnoteDialog.showModal();
+    } catch (error) {
+      showToast(`脚注暂时无法打开：${error.message}`);
+    }
+  }
+
+  function findFragmentNode(root, fragment) {
+    if (!fragment) return null;
+    return [...root.querySelectorAll("[data-epub-fragment]")]
+      .find((element) => element.dataset.epubFragment === fragment) || null;
+  }
+
+  async function goToInternalTarget(chapterId, blockId) {
+    if (footnoteDialog?.open) footnoteDialog.close();
+    const index = state.chapters.findIndex((chapter) => chapter.id === chapterId);
+    if (index < 0) {
+      showToast("书内链接目标不可用。");
+      return;
+    }
+    if (index !== state.currentIndex) await loadChapter(index);
+    await nextFrame(1);
+    jumpToBlock(blockId || "b000001", true);
+  }
+
   function restoreReadingPosition(position) {
     requestAnimationFrame(() => {
       const blockId = position?.block_id;
@@ -1085,6 +1164,12 @@
   });
 
   content.addEventListener("click", (event) => {
+    const internalLink = event.target.closest("a[data-rh-internal]");
+    if (internalLink) {
+      event.preventDefault();
+      followInternalLink(internalLink);
+      return;
+    }
     const mark = event.target.closest(
       "mark[data-annotation-id], mark[data-thought-id]",
     );
@@ -1114,6 +1199,13 @@
   annotationDialog.addEventListener("close", () => {
     state.openRecord = null;
     closeTraceActions();
+  });
+  footnoteClose?.addEventListener("click", () => footnoteDialog.close());
+  footnoteOpenFull?.addEventListener("click", () => {
+    goToInternalTarget(
+      footnoteOpenFull.dataset.chapterId,
+      footnoteOpenFull.dataset.blockId,
+    );
   });
   for (const button of document.querySelectorAll("[data-close-note]")) button.addEventListener("click", () => noteDialog.close());
   editAnnotationButton.addEventListener("click", () => state.openRecord?.kind === "user" && openEditAnnotation(state.openRecord.id));

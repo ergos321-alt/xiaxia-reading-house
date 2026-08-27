@@ -63,6 +63,33 @@ def test_storage_wrapper_uploads_downloads_and_removes_private_objects(monkeypat
     assert storage.ping() is True
 
 
+def test_storage_batch_deduplicates_paths_and_reports_partial_success(monkeypatch):
+    uploaded = []
+
+    def fake_upload(path, data, media_type):
+        if path.endswith("broken.png"):
+            raise storage.ObjectStorageError("forced")
+        uploaded.append((path, data, media_type))
+
+    monkeypatch.setattr(storage, "upload_bytes", fake_upload)
+    objects = [
+        ("books/id/source/source.epub", b"epub", "application/epub+zip"),
+        ("books/id/source/source.epub", b"duplicate", "application/epub+zip"),
+        ("books/id/assets/good.png", b"good", "image/png"),
+        ("books/id/assets/broken.png", b"bad", "image/png"),
+    ]
+    try:
+        storage.upload_many(objects, max_workers=2)
+    except storage.ObjectStorageBatchError as exc:
+        assert sorted(exc.uploaded_paths) == [
+            "books/id/assets/good.png",
+            "books/id/source/source.epub",
+        ]
+    else:
+        raise AssertionError("the failed object must surface a batch error")
+    assert len(uploaded) == 2
+
+
 def test_storage_health_rejects_public_bucket(monkeypatch):
     configure_fake_storage(monkeypatch, public=True)
     assert storage.ping() is False

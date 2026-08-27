@@ -122,6 +122,17 @@
     </form>
   </dialog>
 
+  <dialog id="footnote-dialog" class="footnote-dialog" aria-labelledby="footnote-title">
+    <div class="footnote-paper">
+      <div class="dialog-heading">
+        <h2 id="footnote-title">书页注释</h2>
+        <button id="footnote-close" class="icon-button" type="button" aria-label="关闭脚注">×</button>
+      </div>
+      <div id="footnote-content" class="footnote-content"></div>
+      <button id="footnote-open-full" class="secondary-button" type="button" hidden>前往完整注释位置</button>
+    </div>
+  </dialog>
+
   <div id="reader-toast" class="toast" role="status" aria-live="polite" hidden></div>
   <script src="{{ url_for('static', filename='js/reader-utils.js') }}" defer></script>
   <script src="{{ url_for('static', filename='js/reader.js') }}" defer></script>
