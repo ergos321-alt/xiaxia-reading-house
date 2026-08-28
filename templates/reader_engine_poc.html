@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f3ecdf">
+  <title>共读小屋 · 阅读引擎实验</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/reader-engine-poc.css') }}">
+</head>
+<body class="poc-page" data-book-id="{{ book_id }}">
+  <header class="poc-header">
+    <a class="icon-button" href="{{ url_for('library_page') }}" aria-label="返回书架">←</a>
+    <div>
+      <p class="eyebrow">foliate-js · controlled POC</p>
+      <h1 id="poc-book-title">阅读引擎实验</h1>
+      <p id="poc-source-facts" class="muted">默认关闭 · 不写生产批注</p>
+    </div>
+    <label class="upload-button poc-file-button" for="poc-file-input">Choose EPUB File</label>
+    <input id="poc-file-input" type="file" accept=".epub,application/epub+zip" hidden>
+  </header>
+
+  <main class="poc-layout">
+    <aside class="poc-sidebar">
+      <h2>目录</h2>
+      <nav id="poc-toc-list" aria-label="EPUB 目录"></nav>
+    </aside>
+
+    <section class="poc-stage" aria-label="foliate-js 阅读区域">
+      <div class="poc-controls">
+        <button id="poc-prev" type="button">Prev</button>
+        <button id="poc-next" type="button">Next</button>
+        <button id="poc-history-back" type="button">Link Back</button>
+        <label>模式
+          <select id="poc-flow">
+            <option value="paginated">Pagination</option>
+            <option value="scrolled">Scroll</option>
+          </select>
+        </label>
+        <button id="poc-font-down" type="button">A−</button>
+        <button id="poc-font-up" type="button">A＋</button>
+        <button id="poc-restore-cfi" type="button">Restore CFI</button>
+        <button id="poc-highlight" type="button">Memory Highlight</button>
+        <button id="poc-memory" type="button">Memory Sample</button>
+        <button id="poc-close" type="button">Close</button>
+        <button id="poc-export" type="button">Export Result</button>
+      </div>
+      <p id="poc-status" class="poc-status" role="status">选择本地 EPUB，或用带 book_id 的 POC 地址打开 Storage 原书。</p>
+      <div id="poc-reader-host" class="poc-reader-host"></div>
+    </section>
+
+    <aside class="poc-debug">
+      <h2>Locator / CFI</h2>
+      <pre id="poc-cfi"></pre>
+      <h2>Selection</h2>
+      <pre id="poc-selection"></pre>
+      <h2>Engine Events</h2>
+      <div id="poc-event-log" class="poc-event-log" aria-live="polite"></div>
+      <p class="poc-warning">实验页只保存 local debug state；不调用 annotation / Thought / progress API。</p>
+    </aside>
+  </main>
+
+  <script type="module" src="{{ url_for('static', filename='js/foliate-poc.js') }}"></script>
+</body>
+</html>
