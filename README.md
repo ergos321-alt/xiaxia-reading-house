@@ -393,6 +393,47 @@ ruff check .
 4. 根据返回 block 和 offsets 创建 range thought，再在网页确认精确位置。
 5. 写入用户 annotation reply，等待不超过 12–15 秒，确认网页不刷新整页即出现。
 
+## foliate-js Controlled POC（默认关闭）
+
+这是 Phase 0 / Phase 1 的独立只读实验，不替换 `/reader/<book_id>`，不写
+annotation、Thought、reading progress 或 V2 memory。生产默认配置下两个 POC
+入口都返回 404。
+
+固定版本：
+
+- upstream：`https://github.com/johnfactotum/foliate-js`
+- commit：`78914aef4466eb960965702401634c2cb348e9b1`
+- commit date：`2026-05-01T19:24:25Z`
+- license：MIT；内含 zip.js 2.8.22（BSD-3-Clause）
+- upstream patch：0
+
+部署后临时启用：
+
+```text
+READER_ENGINE_POC_ENABLED=true
+READER_ENGINE_POC_SIGNED_URL_TTL=180
+```
+
+访问：
+
+- `/reader-engine-poc`：本地 File → foliate-js，完全绕过 importer / DB / Storage。
+- `/reader-engine-poc/<book_id>`：Web session → 短时 private Storage signed URL →
+  Range capability probe → Full Blob fallback → foliate-js。
+
+固定 foliate-js 的 URL open 路径本身会整本下载，vendored zip bundle 不包含远程
+`HttpReader`，因此 POC 不把 Range header probe 冒充为 Range 渲染。未来若需要真
+随机读取，必须单独评估完整 zip.js HttpReader adapter 或 Flask Range proxy。
+
+POC 页面提供 TOC、Prev/Next、pagination/scroll、字号、CFI debug、CFI restore、
+内存 highlight、engine events、近似浏览器 memory sampling 与 JSON 导出。页面有
+专用 CSP；adapter 阻断 manifest script、inline script、事件属性、iframe/object 和
+`javascript:` URL。signed URL 只由服务端生成，TTL 强制为 60–300 秒并返回
+`Cache-Control: no-store`，service-role key 不会进入 HTML/JS/JSON。
+
+本轮不需要 migration、npm build 或 Render build command 变更。Node + Playwright
+只用于可选浏览器验收脚本，不是运行时依赖。完整工程结论、真实 corpus 状态和
+设备清单见 `FOLIATE_POC_REPORT.md` 与 `FOLIATE_POC_TEST_MATRIX.md`。
+
 ## V1 边界
 
 没有增加 PDF、Kindle、用户注册、公共书库、社交、全文搜索、标签、统计 Dashboard、语音朗读、推荐算法、AI 自动总结、服务器人格生成、AI 后台自主阅读、多 AI 角色、复杂主题或多色管理。DRM EPUB 不处理。

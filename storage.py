@@ -206,6 +206,29 @@ def download_bytes(object_path: str) -> bytes:
         raise ObjectStorageError("Supabase Storage download failed") from exc
 
 
+def create_signed_download_url(object_path: str, expires_in: int) -> str:
+    """Create a short-lived browser download URL without exposing credentials."""
+    if not 60 <= expires_in <= 300:
+        raise ValueError("signed URL TTL must be between 60 and 300 seconds")
+    try:
+        result = _bucket().create_signed_url(object_path, expires_in)
+        if isinstance(result, dict):
+            signed_url = (
+                result.get("signedURL")
+                or result.get("signedUrl")
+                or result.get("signed_url")
+            )
+        else:
+            signed_url = getattr(result, "signed_url", None)
+        if not isinstance(signed_url, str) or not signed_url.startswith("https://"):
+            raise ValueError("Storage did not return a valid signed URL")
+        return signed_url
+    except ObjectStorageError:
+        raise
+    except Exception as exc:
+        raise ObjectStorageError("Supabase Storage signed URL failed") from exc
+
+
 def delete_objects(object_paths: list[str]) -> None:
     """Remove objects during rollback cleanup."""
     if not object_paths:

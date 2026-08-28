@@ -15,6 +15,7 @@ from auth import web_required
 from reading import reading_bp
 from management import management_bp
 from memories import memories_bp
+from reader_engine_poc import reader_engine_poc_bp
 
 
 REQUIRED_SETTINGS = (
@@ -53,6 +54,10 @@ def create_app(test_config: dict | None = None) -> Flask:
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
         SESSION_COOKIE_SECURE=_env_bool("COOKIE_SECURE", True),
+        READER_ENGINE_POC_ENABLED=_env_bool("READER_ENGINE_POC_ENABLED", False),
+        READER_ENGINE_POC_SIGNED_URL_TTL=int(
+            os.getenv("READER_ENGINE_POC_SIGNED_URL_TTL", "180")
+        ),
     )
     if test_config:
         app.config.update(test_config)
@@ -63,6 +68,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.register_blueprint(annotations_bp)
     app.register_blueprint(management_bp)
     app.register_blueprint(memories_bp)
+    app.register_blueprint(reader_engine_poc_bp)
 
     @app.before_request
     def require_complete_configuration():
