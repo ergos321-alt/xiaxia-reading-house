@@ -1,0 +1,91 @@
+.poc-page {
+  min-height: 100dvh;
+  overflow: hidden;
+  background: #eee5d5;
+}
+
+.poc-header {
+  min-height: 70px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1rem;
+  padding: max(.65rem, env(safe-area-inset-top)) 1rem .65rem;
+  border-bottom: 1px solid rgba(92, 76, 62, .18);
+  background: #f4ecdf;
+}
+
+.poc-header h1 { margin: .08rem 0; font-size: 1rem; }
+.poc-header p { margin: 0; }
+.poc-file-button { white-space: nowrap; }
+
+.poc-layout {
+  height: calc(100dvh - 70px - env(safe-area-inset-top));
+  display: grid;
+  grid-template-columns: minmax(180px, 240px) minmax(360px, 1fr) minmax(230px, 320px);
+}
+
+.poc-sidebar,
+.poc-debug {
+  min-width: 0;
+  overflow: auto;
+  padding: 1rem;
+  background: rgba(248, 242, 231, .76);
+}
+
+.poc-sidebar { border-right: 1px solid rgba(92, 76, 62, .14); }
+.poc-debug { border-left: 1px solid rgba(92, 76, 62, .14); }
+.poc-sidebar h2,
+.poc-debug h2 { margin: .35rem 0 .65rem; font-size: .78rem; letter-spacing: .08em; }
+
+.poc-toc-item {
+  width: 100%;
+  padding: .48rem .4rem .48rem calc(.4rem + var(--toc-depth, 0) * .8rem);
+  border: 0;
+  border-bottom: 1px solid rgba(92, 76, 62, .08);
+  background: transparent;
+  color: #514941;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+
+.poc-stage { min-width: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); }
+.poc-controls { display: flex; flex-wrap: wrap; gap: .35rem; padding: .55rem; background: #e7dccb; }
+.poc-controls button,
+.poc-controls select { min-height: 34px; padding: .35rem .55rem; }
+.poc-controls label { display: flex; align-items: center; gap: .3rem; font-size: .8rem; }
+.poc-status { margin: 0; padding: .45rem .7rem; background: #faf4e9; color: #786f66; font-size: .78rem; }
+.poc-status[data-state="success"] { color: #52654f; }
+.poc-status[data-state="error"] { color: #994d45; }
+
+.poc-reader-host { min-height: 0; background: #f8f2e7; }
+.poc-reader-host foliate-view { display: block; width: 100%; height: 100%; }
+.poc-reader-host:empty::before {
+  content: "原始 EPUB 将在这里由 foliate-js 打开";
+  height: 100%;
+  display: grid;
+  place-items: center;
+  color: #9a8f82;
+}
+
+.poc-debug pre { max-height: 9rem; overflow: auto; white-space: pre-wrap; word-break: break-all; font-size: .68rem; }
+.poc-event-log { display: grid; gap: .35rem; font: .64rem/1.45 ui-monospace, monospace; word-break: break-all; }
+.poc-event-log > div { padding: .4rem; background: rgba(255, 255, 255, .42); }
+.poc-warning { margin-top: 1rem; color: #8d5c45; font-size: .72rem; }
+
+@media (max-width: 980px) {
+  .poc-layout { grid-template-columns: minmax(150px, 210px) minmax(0, 1fr); }
+  .poc-debug { display: none; }
+}
+
+@media (max-width: 680px) {
+  .poc-page { overflow: auto; }
+  .poc-header { grid-template-columns: auto minmax(0, 1fr); }
+  .poc-file-button { grid-column: 1 / -1; text-align: center; }
+  .poc-layout { height: calc(100dvh - 118px - env(safe-area-inset-top)); display: block; }
+  .poc-sidebar { display: none; }
+  .poc-stage { height: 100%; }
+  .poc-controls { max-height: 84px; overflow-x: auto; flex-wrap: nowrap; }
+  .poc-controls > * { flex: 0 0 auto; }
+}
