@@ -6,8 +6,13 @@
   <meta name="theme-color" content="#f3ecdf">
   <title>共读小屋 · 阅读</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/reader-engine.css') }}">
 </head>
-<body class="reader-page" data-book-id="{{ book_id }}">
+<body class="reader-page"
+      data-book-id="{{ book_id }}"
+      data-reader-engine="pending"
+      data-reader-engine-enabled="{{ 'true' if reader_engine_enabled else 'false' }}"
+      data-text-index-ready="false">
   <header class="reader-toolbar">
     <a class="icon-button reader-back" href="{{ url_for('library_page') }}" aria-label="返回书架">←</a>
     <div class="reader-heading">
@@ -59,6 +64,7 @@
       <span id="chapter-position"></span>
       <button id="next-chapter" type="button">下一章 →</button>
     </nav>
+    <p id="foliate-readonly-note" class="foliate-readonly-note" hidden>新书页已可阅读；划线与留句仍由旧书页系统保管</p>
   </main>
 
   <div id="selection-menu" class="selection-menu" role="toolbar" aria-label="选中文字后的操作" hidden>
@@ -134,7 +140,7 @@
   </dialog>
 
   <div id="reader-toast" class="toast" role="status" aria-live="polite" hidden></div>
-  <script src="{{ url_for('static', filename='js/reader-utils.js') }}" defer></script>
-  <script src="{{ url_for('static', filename='js/reader.js') }}" defer></script>
+  <!-- Legacy fallback remains static/js/reader.js; the loader only selects an engine. -->
+  <script type="module" src="{{ url_for('static', filename='js/reader-engine-loader.js') }}"></script>
 </body>
 </html>

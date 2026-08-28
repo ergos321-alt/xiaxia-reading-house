@@ -85,6 +85,31 @@ class ParsedBook:
 
 
 @dataclass(slots=True)
+class PublicationInspection:
+    """Minimal source-first facts; no chapter DOM or asset collection retained."""
+
+    title: str
+    author: str
+    source_filename: str
+    source_sha256: str
+    epub_version: str
+    manifest_item_count: int
+    spine_item_count: int
+    readable_section_count: int
+    archive_compressed_size: int
+    archive_uncompressed_size: int
+    archive_item_count: int
+    xhtml_item_count: int
+    image_item_count: int
+    font_item_count: int
+    cover_asset_path: str | None = None
+    cover_archive_path: str | None = None
+    cover_media_type: str | None = None
+    cover_byte_size: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class _ManifestItem:
     item_id: str
     href: str
@@ -151,6 +176,7 @@ def parse_uploaded_book_path(
     *,
     source_sha256: str | None = None,
     stage_observer: StageObserver | None = None,
+    include_assets: bool = True,
 ) -> ParsedBook:
     """Parse a spooled upload without retaining the compressed book in RAM."""
     path = Path(source_path)
@@ -163,6 +189,7 @@ def parse_uploaded_book_path(
             source_sha256=digest,
             archive_compressed_size=path.stat().st_size,
             materialize_assets=False,
+            include_assets=include_assets,
             deadline=deadline,
             stage_observer=stage_observer,
         )
@@ -177,6 +204,138 @@ def parse_uploaded_book_path(
     )
 
 
+def inspect_epub_publication_path(
+    filename: str,
+    source_path: str | Path,
+    *,
+    source_sha256: str | None = None,
+) -> PublicationInspection:
+    """Validate only the EPUB container/package needed for browser reading.
+
+    This intentionally does not sanitize chapters, build blocks, parse the
+    complete TOC or extract every referenced resource. The mature browser
+    engine owns publication rendering; the legacy text pipeline runs later.
+    """
+    path = Path(source_path)
+    if PurePosixPath(filename).suffix.lower() != ".epub":
+        raise BookParseError("文件不是 EPUB publication", "unsupported_archive")
+    compressed_size = path.stat().st_size
+    if compressed_size <= 0:
+        raise BookParseError("EPUB 文件为空", "invalid_epub")
+    try:
+        archive = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise BookParseError(
+            "文件不是有效的 EPUB archive，可能已损坏或格式不受支持",
+            "unsupported_archive",
+        ) from exc
+
+    warnings: list[str] = []
+    opf: BeautifulSoup | None = None
+    try:
+        archive_names, stats = _validate_archive(archive)
+        opf_path = _find_opf_path(archive, archive_names, warnings)
+        opf = _parse_markup(
+            _read_archive_entry(archive, archive_names, opf_path), xml=True
+        )
+        package = opf.find(
+            lambda tag: isinstance(tag, Tag)
+            and _local_name(tag.name) == "package"
+        ) or opf
+        opf_dir = posixpath.dirname(opf_path)
+        manifest = _parse_manifest(package, opf_dir, archive_names, warnings)
+        spine_ids, _spine_toc_id = _parse_spine(package)
+
+        documents = [
+            item
+            for item in manifest.values()
+            if _is_document_item(item) and "nav" not in item.properties
+        ]
+        spine_documents = [
+            manifest[item_id]
+            for item_id in spine_ids
+            if item_id in manifest
+            and _is_document_item(manifest[item_id])
+            and "nav" not in manifest[item_id].properties
+        ]
+        candidates = spine_documents or documents
+        readable = [
+            item
+            for item in candidates
+            if item.archive_path.lower() in archive_names
+            and archive.getinfo(archive_names[item.archive_path.lower()]).file_size > 0
+        ]
+        if not readable:
+            raise BookParseError(
+                "EPUB package 中没有可供阅读引擎打开的正文 section",
+                "invalid_epub",
+            )
+        if not spine_documents:
+            warnings.append("minimal_validation_manifest_fallback")
+
+        title = _preferred_book_title(_metadata_text(package, "title"), filename)
+        author = _clean_metadata(
+            _metadata_text(package, "creator") or "未知作者"
+        )
+        cover_path = _find_cover_path(
+            package, manifest, archive, archive_names, warnings, opf_dir
+        )
+        cover_item = next(
+            (
+                item
+                for item in manifest.values()
+                if cover_path and _href_key(item.href) == _href_key(cover_path)
+            ),
+            None,
+        )
+        cover_archive_path = None
+        cover_media_type = None
+        cover_byte_size = 0
+        if cover_item and cover_item.archive_path.lower() in archive_names:
+            actual = archive_names[cover_item.archive_path.lower()]
+            info = archive.getinfo(actual)
+            if cover_item.media_type.startswith(IMAGE_MEDIA_PREFIX) and info.file_size:
+                cover_archive_path = actual
+                cover_media_type = cover_item.media_type
+                cover_byte_size = info.file_size
+            else:
+                cover_path = None
+        else:
+            cover_path = None
+
+        return PublicationInspection(
+            title=title,
+            author=author,
+            source_filename=filename,
+            source_sha256=source_sha256 or _sha256_path(path),
+            epub_version=str(package.get("version") or "unknown").strip()[:32],
+            manifest_item_count=len(manifest),
+            spine_item_count=len(spine_ids),
+            readable_section_count=len(readable),
+            archive_compressed_size=compressed_size,
+            archive_uncompressed_size=stats["uncompressed_size"],
+            archive_item_count=stats["item_count"],
+            xhtml_item_count=stats["xhtml_count"],
+            image_item_count=stats["image_count"],
+            font_item_count=stats["font_count"],
+            cover_asset_path=cover_path,
+            cover_archive_path=cover_archive_path,
+            cover_media_type=cover_media_type,
+            cover_byte_size=cover_byte_size,
+            warnings=_dedupe(warnings),
+        )
+    except BookParseError:
+        raise
+    except Exception as exc:
+        raise BookParseError(
+            "无法识别 EPUB publication package", "invalid_epub"
+        ) from exc
+    finally:
+        if opf is not None:
+            opf.decompose()
+        archive.close()
+
+
 def _parse_epub(
     filename: str, data: bytes, *, deadline: float | None = None
 ) -> ParsedBook:
@@ -186,6 +345,7 @@ def _parse_epub(
         source_sha256=hashlib.sha256(data).hexdigest(),
         archive_compressed_size=len(data),
         materialize_assets=True,
+        include_assets=True,
         deadline=deadline,
     )
 
@@ -197,6 +357,7 @@ def _parse_epub_source(
     source_sha256: str,
     archive_compressed_size: int,
     materialize_assets: bool,
+    include_assets: bool,
     deadline: float | None = None,
     stage_observer: StageObserver | None = None,
 ) -> ParsedBook:
@@ -311,27 +472,33 @@ def _parse_epub_source(
         cover_path = _find_cover_path(
             package, manifest, archive, archive_names, warnings, opf_dir
         )
-        wanted_assets = set(referenced_assets)
-        if cover_path:
-            wanted_assets.add(cover_path)
-        _observe(stage_observer, "asset_extraction_before")
-        assets = _extract_used_assets(
-            archive,
-            archive_names,
-            manifest,
-            wanted_assets,
-            warnings,
-            deadline,
-            opf_dir,
-            materialize=materialize_assets,
-        )
-        _observe(stage_observer, "asset_extraction_after")
-        available_assets = {asset.path for asset in assets}
-        if cover_path not in available_assets:
+        assets: list[ParsedAsset] = []
+        if include_assets:
+            wanted_assets = set(referenced_assets)
+            if cover_path:
+                wanted_assets.add(cover_path)
+            _observe(stage_observer, "asset_extraction_before")
+            assets = _extract_used_assets(
+                archive,
+                archive_names,
+                manifest,
+                wanted_assets,
+                warnings,
+                deadline,
+                opf_dir,
+                materialize=materialize_assets,
+            )
+            _observe(stage_observer, "asset_extraction_after")
+            available_assets = {asset.path for asset in assets}
+            if cover_path not in available_assets:
+                cover_path = None
+            chapters = _drop_missing_image_references(
+                chapters, available_assets, warnings
+            )
+        else:
+            _observe(stage_observer, "asset_extraction_skipped")
             cover_path = None
-        chapters = _drop_missing_image_references(
-            chapters, available_assets, warnings
-        )
+            chapters = _drop_missing_image_references(chapters, set(), warnings)
         chapters = _prune_empty_after_asset_cleanup(chapters, warnings)
         if not chapters:
             raise BookParseError(

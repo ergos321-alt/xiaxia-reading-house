@@ -86,6 +86,22 @@
       }
       fragment.querySelector(".book-title").textContent = book.title;
       fragment.querySelector(".book-author").textContent = book.author || "未知作者";
+      const readinessNote = fragment.querySelector(".book-readiness-note");
+      const indexButton = fragment.querySelector(".text-index-button");
+      const indexStatus = book.text_index_status || "ready";
+      if (indexStatus === "pending" || indexStatus === "processing") {
+        readinessNote.hidden = false;
+        readinessNote.textContent = "夏夏正在整理这本书";
+        indexButton.hidden = false;
+        indexButton.disabled = indexStatus === "processing";
+        indexButton.textContent = indexStatus === "processing" ? "正在整理" : "让夏夏整理";
+      } else if (indexStatus === "failed") {
+        readinessNote.hidden = false;
+        readinessNote.textContent = "这本书可以阅读，但夏夏暂时还不能完整读取。";
+        indexButton.hidden = false;
+        indexButton.textContent = "重新整理";
+      }
+      indexButton.addEventListener("click", () => buildTextIndex(book, indexButton));
       const percentage = clamp(Number(book.progress_percentage || 0), 0, 100);
       const track = fragment.querySelector(".progress-track");
       track.setAttribute("aria-valuenow", percentage.toFixed(1));
@@ -100,7 +116,7 @@
   }
 
   function renderSharedReadingNote(books) {
-    const recent = books.find((book) => book.progress_chapter_id) || null;
+    const recent = books.find((book) => book.progress_chapter_id || Number(book.publication_progression || 0) > 0) || null;
     sharedNote.hidden = !recent;
     if (!recent) return;
     const percentage = clamp(Number(recent.progress_percentage || 0), 0, 100);
@@ -120,13 +136,15 @@
     const file = fileInput.files?.[0];
     if (!file) return;
     uploadStatus.classList.remove("error");
-    uploadStatus.textContent = `正在解析《${file.name}》…`;
+    uploadStatus.textContent = `正在把《${file.name}》放上书架…`;
     fileInput.disabled = true;
     const body = new FormData();
     body.append("file", file);
     try {
       const result = await api("/api/books", { method: "POST", body });
-      uploadStatus.textContent = `《${result.book.title}》已经放上书架。`;
+      uploadStatus.textContent = result.book.text_index_status === "pending"
+        ? `《${result.book.title}》已加入书架，可以立即阅读；夏夏的正文整理可稍后进行。`
+        : `《${result.book.title}》已经放上书架。`;
       await loadBooks();
     } catch (error) {
       uploadStatus.classList.add("error");
@@ -140,6 +158,22 @@
       fileInput.disabled = false;
     }
   });
+
+  async function buildTextIndex(book, button) {
+    button.disabled = true;
+    button.textContent = "正在整理";
+    uploadStatus.classList.remove("error");
+    uploadStatus.textContent = `夏夏正在整理《${book.title}》；书仍然可以正常打开。`;
+    try {
+      await api(`/api/books/${book.id}/text-index`, { method: "POST" });
+      uploadStatus.textContent = `《${book.title}》已经整理好，夏夏可以按章节读取了。`;
+    } catch (error) {
+      uploadStatus.classList.add("error");
+      uploadStatus.textContent = `《${book.title}》仍可阅读；${error.message}`;
+    } finally {
+      await loadBooks();
+    }
+  }
 
   function openBookEditor(book) {
     editId.value = book.id;

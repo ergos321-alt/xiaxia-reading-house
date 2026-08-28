@@ -144,7 +144,7 @@ def test_five_hundred_chapters_use_two_bulk_database_calls(monkeypatch):
     install_pipeline(monkeypatch, connection, parsed_book(500), uploaded, deleted)
     response = client().post(
         "/api/books",
-        data={"file": (BytesIO(b"epub"), "poems.epub")},
+        data={"file": (BytesIO(b"epub"), "poems.txt")},
         content_type="multipart/form-data",
     )
     assert response.status_code == 201
@@ -159,7 +159,7 @@ def test_second_concurrent_import_is_rejected_before_reading_upload(monkeypatch)
     try:
         response = client().post(
             "/api/books",
-            data={"file": (BytesIO(b"epub"), "poems.epub")},
+            data={"file": (BytesIO(b"epub"), "poems.txt")},
             content_type="multipart/form-data",
         )
     finally:
@@ -176,7 +176,7 @@ def test_database_failure_rolls_back_storage_and_returns_stable_error(monkeypatc
     install_pipeline(monkeypatch, connection, parsed_book(), uploaded, deleted)
     response = client().post(
         "/api/books",
-        data={"file": (BytesIO(b"epub"), "book.epub")},
+        data={"file": (BytesIO(b"epub"), "book.txt")},
         content_type="multipart/form-data",
     )
     assert response.status_code == 500
@@ -217,7 +217,7 @@ def test_partial_storage_failure_cleans_only_confirmed_uploads(monkeypatch):
     )
     response = client().post(
         "/api/books",
-        data={"file": (BytesIO(b"epub"), "book.epub")},
+        data={"file": (BytesIO(b"epub"), "book.txt")},
         content_type="multipart/form-data",
     )
     assert response.status_code == 502
@@ -251,7 +251,7 @@ def test_timeout_like_parse_interruption_returns_408_without_persistence(monkeyp
     monkeypatch.setattr(reading.db, "transaction", transaction)
     response = client().post(
         "/api/books",
-        data={"file": (BytesIO(b"epub"), "book.epub")},
+        data={"file": (BytesIO(b"epub"), "book.txt")},
         content_type="multipart/form-data",
     )
     assert response.status_code == 408
@@ -267,7 +267,7 @@ def test_deadline_after_storage_upload_cleans_objects_before_database(monkeypatc
     monkeypatch.setattr(reading, "IMPORT_DEADLINE_SECONDS", -1)
     response = client().post(
         "/api/books",
-        data={"file": (BytesIO(b"epub"), "book.epub")},
+        data={"file": (BytesIO(b"epub"), "book.txt")},
         content_type="multipart/form-data",
     )
     assert response.status_code == 408

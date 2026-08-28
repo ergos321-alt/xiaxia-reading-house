@@ -193,6 +193,11 @@ a { color: inherit; }
 .book-info { min-width: 0; display: flex; flex-direction: column; }
 .book-title { margin: .1rem 0 .25rem; font: 650 1.04rem/1.4 Georgia, "Noto Serif SC", serif; text-decoration: none; overflow-wrap: anywhere; }
 .book-author { margin: 0 0 auto; color: var(--muted); font-size: .78rem; }
+.book-readiness-note {
+  margin: -.15rem 0 .5rem;
+  color: rgba(92, 79, 67, .68);
+  font: 400 .72rem/1.55 Georgia, "Noto Serif SC", serif;
+}
 .progress-track { height: 3px; margin-top: .85rem; overflow: hidden; border-radius: 9px; background: rgba(117,91,64,.12); }
 .progress-track span { display: block; height: 100%; width: 0; background: var(--accent); }
 .book-progress { min-height: 2.2em; margin: .4rem 0 .55rem; color: var(--muted); font-size: .73rem; line-height: 1.45; }

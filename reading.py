@@ -11,13 +11,14 @@ import resource
 import tempfile
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 from urllib.parse import unquote
 from uuid import UUID, uuid4
 
 from bs4 import BeautifulSoup, Tag
-from flask import Blueprint, Response, jsonify, request, url_for
+from flask import Blueprint, Response, current_app, jsonify, request, url_for
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
@@ -25,6 +26,7 @@ import database as db
 import storage as object_storage
 from auth import action_required, api_or_session_required, web_api_required
 from epub_parser import BookParseError, parse_uploaded_book_path
+from source_first import SourceFirstFailure, build_text_index, create_epub_publication
 
 
 reading_bp = Blueprint("reading", __name__)
@@ -33,7 +35,10 @@ logger = logging.getLogger(__name__)
 
 BOOK_FIELDS = """
     b.id, b.title, b.author, b.format, b.source_filename,
-    b.cover_asset_path, b.chapter_count, b.toc, b.created_at, b.updated_at
+    b.cover_asset_path, b.chapter_count, b.toc,
+    b.publication_ready, b.reader_engine, b.text_index_status,
+    b.text_index_failure_code, b.publication_validated_at,
+    b.text_index_updated_at, b.created_at, b.updated_at
 """
 
 ACTION_CHUNK_TARGET_CHARS = 6000
@@ -55,12 +60,19 @@ def list_books():
         select {BOOK_FIELDS},
                rp.chapter_id as progress_chapter_id,
                rp.chapter_index as progress_chapter_index,
-               rp.percentage as progress_percentage,
-               c.title as current_chapter
+               coalesce(rp.percentage, ppr.progression * 100) as progress_percentage,
+               c.title as current_chapter,
+               ppr.locator as publication_locator,
+               ppr.progression as publication_progression
         from books b
         left join reading_progress rp on rp.book_id = b.id
+        left join publication_reading_progress ppr on ppr.book_id = b.id
         left join chapters c on c.id = rp.chapter_id
-        order by coalesce(rp.updated_at, b.created_at) desc
+        order by greatest(
+            coalesce(rp.updated_at, '-infinity'::timestamptz),
+            coalesce(ppr.updated_at, '-infinity'::timestamptz),
+            b.created_at
+        ) desc
         """
     )
     return jsonify({"books": [_serialize_book(row) for row in rows]})
@@ -96,6 +108,20 @@ def upload_book():
 
 
 def _upload_book_locked(upload: Any, filename: str):
+    if (
+        PurePosixPath(filename).suffix.lower() == ".epub"
+        and current_app.config["READER_ENGINE_ENABLED"]
+    ):
+        try:
+            book = create_epub_publication(upload, filename)
+        except SourceFirstFailure as exc:
+            payload = {"error": exc.code, "message": exc.message, **exc.data}
+            return jsonify(payload), exc.status
+        return jsonify({"book": _serialize_book(book)}), 201
+    return _upload_legacy_book_locked(upload, filename)
+
+
+def _upload_legacy_book_locked(upload: Any, filename: str):
     started_at = time.perf_counter()
     deadline = started_at + IMPORT_DEADLINE_SECONDS
     memory = _ImportMemoryProbe()
@@ -248,10 +274,18 @@ def _upload_book_locked(upload: Any, filename: str):
                     insert into books (
                         id, title, author, format, source_filename, source_sha256,
                         source_object_path, source_media_type, source_byte_size,
-                        cover_asset_path, chapter_count, toc
-                    ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        cover_asset_path, chapter_count, toc,
+                        publication_ready, reader_engine, text_index_status,
+                        publication_validated_at, text_index_updated_at
+                    ) values (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        true, 'legacy', 'ready', now(), now()
+                    )
                     returning id, title, author, format, source_filename,
-                              cover_asset_path, chapter_count, toc, created_at, updated_at
+                              cover_asset_path, chapter_count, toc,
+                              publication_ready, reader_engine, text_index_status,
+                              text_index_failure_code, publication_validated_at,
+                              text_index_updated_at, created_at, updated_at
                     """,
                     (
                         book_id,
@@ -511,10 +545,162 @@ def get_book(book_id: UUID):
         """,
         (book_id,),
     )
+    publication_progress = db.fetch_one(
+        """
+        select engine, locator, progression, updated_at
+        from publication_reading_progress where book_id = %s
+        """,
+        (book_id,),
+    )
     payload = _serialize_book(book)
     payload["chapters"] = [_json_safe(row) for row in chapters]
     payload["progress"] = _json_safe(progress) if progress else None
+    payload["publication_progress"] = (
+        _json_safe(publication_progress) if publication_progress else None
+    )
     return jsonify({"book": payload})
+
+
+@reading_bp.get("/api/books/<uuid:book_id>/source-access")
+@web_api_required
+def get_publication_source_access(book_id: UUID):
+    book = db.fetch_one(
+        """
+        select id, title, format, source_filename, source_object_path,
+               publication_ready
+        from books where id = %s
+        """,
+        (book_id,),
+    )
+    if not book:
+        return jsonify({"error": "book_not_found"}), 404
+    if (
+        book["format"] != "epub"
+        or not book["publication_ready"]
+        or not book.get("source_object_path")
+    ):
+        return (
+            jsonify(
+                {
+                    "error": "publication_not_ready",
+                    "message": "这本书没有可供新阅读引擎打开的原始 EPUB",
+                }
+            ),
+            409,
+        )
+    ttl = int(current_app.config["READER_SOURCE_SIGNED_URL_TTL"])
+    if not 60 <= ttl <= 300:
+        return jsonify({"error": "reader_source_configuration_invalid"}), 503
+    try:
+        signed_url = object_storage.create_signed_download_url(
+            book["source_object_path"], ttl
+        )
+    except object_storage.ObjectStorageError:
+        logger.exception("publication source access failed book_id=%s", book_id)
+        return jsonify({"error": "publication_source_unavailable"}), 502
+    response = jsonify(
+        {
+            "book": {
+                "id": str(book["id"]),
+                "title": book["title"],
+                "filename": book["source_filename"],
+            },
+            "signed_url": signed_url,
+            "expires_in": ttl,
+            "expires_at": (
+                datetime.now(UTC) + timedelta(seconds=ttl)
+            ).isoformat(),
+        }
+    )
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@reading_bp.post("/api/books/<uuid:book_id>/text-index")
+@web_api_required
+def retry_text_index(book_id: UUID):
+    try:
+        book = build_text_index(book_id)
+    except SourceFirstFailure as exc:
+        return jsonify({"error": exc.code, "message": exc.message, **exc.data}), exc.status
+    payload = _serialize_book(book)
+    if book.get("text_index_status") != "failed":
+        return jsonify({"book": payload})
+    code = str(book.get("text_index_failure_code") or "text_index_internal_error")
+    messages = {
+        "text_index_parse_failed": "这本书可以阅读，但夏夏暂时无法解析正文",
+        "text_index_timeout": "这本书可以阅读，但夏夏整理正文的时间过长",
+        "text_index_resource_limit": "这本书可以阅读，但本次整理超出服务器资源",
+        "text_index_no_readable_text": "这本书可以阅读，但没有提取到可供夏夏读取的文字",
+        "text_index_mapping_failed": "这本书可以阅读，但现有书页锚点阻止了安全重建",
+        "text_index_internal_error": "这本书可以阅读，但夏夏暂时无法完成整理",
+    }
+    status = {
+        "text_index_timeout": 408,
+        "text_index_resource_limit": 503,
+        "text_index_internal_error": 500,
+    }.get(code, 422)
+    return (
+        jsonify(
+            {
+                "error": code,
+                "message": messages.get(code, messages["text_index_internal_error"]),
+                "retryable": code != "text_index_mapping_failed",
+                "publication_ready": True,
+                "book": payload,
+            }
+        ),
+        status,
+    )
+
+
+@reading_bp.put("/api/books/<uuid:book_id>/publication-progress")
+@web_api_required
+def save_publication_progress(book_id: UUID):
+    payload = request.get_json(silent=True) or {}
+    locator = payload.get("locator")
+    try:
+        progression = max(0.0, min(1.0, float(payload.get("progression", 0))))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid_publication_progress"}), 400
+    if not isinstance(locator, dict):
+        return jsonify({"error": "invalid_publication_locator"}), 400
+    book = db.fetch_one(
+        "select id from books where id = %s and publication_ready = true",
+        (book_id,),
+    )
+    if not book:
+        return jsonify({"error": "publication_not_ready"}), 409
+    sanitized = {
+        "engine": "foliate-js",
+        "href": str(locator.get("href") or "")[:2048],
+        "cfi": str(locator.get("cfi") or "")[:8192],
+        "progression": progression,
+    }
+    if locator.get("section_index") is not None:
+        try:
+            sanitized["section_index"] = max(0, int(locator["section_index"]))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid_publication_locator"}), 400
+    if not sanitized["cfi"] and not sanitized["href"]:
+        return jsonify({"error": "invalid_publication_locator"}), 400
+    row = db.execute(
+        """
+        insert into publication_reading_progress (
+            book_id, engine, locator, progression
+        ) values (%s, 'foliate-js', %s, %s)
+        on conflict (book_id) do update set
+            engine = excluded.engine,
+            locator = excluded.locator,
+            progression = excluded.progression,
+            updated_at = now()
+        returning engine, locator, progression, updated_at
+        """,
+        (book_id, Jsonb(sanitized), progression),
+    )
+    return jsonify({"publication_progress": _json_safe(row)})
 
 
 @reading_bp.get("/api/books/<uuid:book_id>/chapters")
@@ -527,8 +713,20 @@ def list_book_chapters(book_id: UUID):
         """,
         (book_id,),
     )
-    if not rows and not db.fetch_one("select id from books where id = %s", (book_id,)):
-        return jsonify({"error": "book_not_found"}), 404
+    if not rows:
+        book = db.fetch_one(
+            """
+            select id, publication_ready, text_index_status,
+                   text_index_failure_code
+            from books where id = %s
+            """,
+            (book_id,),
+        )
+        if not book:
+            return jsonify({"error": "book_not_found"}), 404
+        readiness = _text_readiness_response(book)
+        if readiness:
+            return readiness
     return jsonify(
         {"book_id": str(book_id), "chapters": [_json_safe(row) for row in rows]}
     )
@@ -556,7 +754,10 @@ def update_book(book_id: UUID):
         update books set {", ".join(updates)}, updated_at = now()
         where id = %s
         returning id, title, author, format, source_filename,
-                  cover_asset_path, chapter_count, toc, created_at, updated_at
+                  cover_asset_path, chapter_count, toc,
+                  publication_ready, reader_engine, text_index_status,
+                  text_index_failure_code, publication_validated_at,
+                  text_index_updated_at, created_at, updated_at
         """,
         values,
     )
@@ -578,7 +779,14 @@ def delete_book(book_id: UUID):
         "select object_path from book_assets where book_id = %s order by object_path",
         (book_id,),
     )
-    object_paths = [book["source_object_path"]] + [row["object_path"] for row in assets]
+    object_paths = [
+        path
+        for path in (
+            [book.get("source_object_path")]
+            + [row["object_path"] for row in assets]
+        )
+        if path
+    ]
     try:
         object_storage.delete_objects(object_paths)
     except object_storage.ObjectStorageError:
@@ -611,6 +819,17 @@ def get_chapter(book_id: UUID, chapter_id: UUID):
         (chapter_id, book_id),
     )
     if not chapter:
+        book = db.fetch_one(
+            """
+            select id, publication_ready, text_index_status,
+                   text_index_failure_code
+            from books where id = %s
+            """,
+            (book_id,),
+        )
+        readiness = _text_readiness_response(book) if book else None
+        if readiness:
+            return readiness
         return jsonify({"error": "chapter_not_found"}), 404
     target_hrefs = _internal_link_hrefs(chapter["content_html"])
     current_key = _chapter_href_key(str(chapter.get("href") or ""))
@@ -749,6 +968,21 @@ def get_reading_state():
 @reading_bp.get("/api/reading/context")
 @api_or_session_required
 def get_reading_context():
+    requested_book_id = _uuid_or_none(request.args.get("book_id"))
+    if requested_book_id:
+        requested_book = db.fetch_one(
+            """
+            select id, publication_ready, text_index_status,
+                   text_index_failure_code
+            from books where id = %s
+            """,
+            (requested_book_id,),
+        )
+        if not requested_book:
+            return jsonify({"error": "book_not_found"}), 404
+        readiness = _text_readiness_response(requested_book)
+        if readiness:
+            return readiness
     annotation_id = _uuid_or_none(request.args.get("annotation_id"))
     chapter_id = _uuid_or_none(request.args.get("chapter_id"))
     include_adjacent = request.args.get("include_adjacent", "false").lower() == "true"
@@ -924,7 +1158,32 @@ def save_ai_progress():
             (chapter_id, book_id),
         )
         if not checkpoint_chapter:
+            readiness_book = db.fetch_one(
+                """
+                select id, publication_ready, text_index_status,
+                       text_index_failure_code
+                from books where id = %s
+                """,
+                (book_id,),
+            )
+            readiness = _text_readiness_response(readiness_book)
+            if readiness:
+                return readiness
             return jsonify({"error": "chapter_not_found"}), 404
+    else:
+        readiness_book = db.fetch_one(
+            """
+            select id, publication_ready, text_index_status,
+                   text_index_failure_code
+            from books where id = %s
+            """,
+            (book_id,),
+        )
+        if not readiness_book:
+            return jsonify({"error": "book_not_found"}), 404
+        readiness = _text_readiness_response(readiness_book)
+        if readiness:
+            return readiness
     if annotation_id and not db.fetch_one(
         "select id from annotations where id = %s and book_id = %s",
         (annotation_id, book_id),
@@ -1217,6 +1476,37 @@ def _anchor_chunk_index(
     return boundary_candidate
 
 
+def _text_readiness_response(book: dict[str, Any] | None):
+    if not book or book.get("text_index_status") == "ready":
+        return None
+    status = str(book.get("text_index_status") or "pending")
+    if status in {"pending", "processing"}:
+        return (
+            jsonify(
+                {
+                    "error": "text_index_not_ready",
+                    "status": status,
+                    "publication_ready": bool(book.get("publication_ready")),
+                    "retryable": status == "pending",
+                }
+            ),
+            409,
+        )
+    return (
+        jsonify(
+            {
+                "error": "text_index_failed",
+                "status": "failed",
+                "failure_code": book.get("text_index_failure_code"),
+                "publication_ready": bool(book.get("publication_ready")),
+                "retryable": book.get("text_index_failure_code")
+                != "text_index_mapping_failed",
+            }
+        ),
+        409,
+    )
+
+
 def _clean_book_field(value: Any) -> str:
     cleaned = " ".join(str(value or "").replace("\x00", "").split())
     return cleaned[:1000]
@@ -1439,12 +1729,20 @@ def _serialize_book(row: dict[str, Any]) -> dict[str, Any]:
         "source_filename",
         "chapter_count",
         "toc",
+        "publication_ready",
+        "reader_engine",
+        "text_index_status",
+        "text_index_failure_code",
+        "publication_validated_at",
+        "text_index_updated_at",
         "created_at",
         "updated_at",
         "progress_chapter_id",
         "progress_chapter_index",
         "progress_percentage",
         "current_chapter",
+        "publication_locator",
+        "publication_progression",
     )
     result = _json_safe({name: row[name] for name in field_names if name in row})
     book_id = row["id"]
@@ -1457,6 +1755,13 @@ def _serialize_book(row: dict[str, Any]) -> dict[str, Any]:
         if row.get("cover_asset_path")
         else None
     )
+    status = str(row.get("text_index_status") or "ready")
+    result["text_index_ready"] = status == "ready"
+    result["ai_reading_note"] = {
+        "pending": "夏夏正在整理这本书",
+        "processing": "夏夏正在整理这本书",
+        "failed": "这本书可以阅读，但夏夏暂时还不能完整读取",
+    }.get(status, "")
     return result
 
 

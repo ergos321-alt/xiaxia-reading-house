@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from urllib.parse import urlsplit
 
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, jsonify, make_response, redirect, render_template, request, session, url_for
 from werkzeug.exceptions import RequestEntityTooLarge
 
 import database
@@ -55,6 +55,13 @@ def create_app(test_config: dict | None = None) -> Flask:
         SESSION_COOKIE_SAMESITE="Strict",
         SESSION_COOKIE_SECURE=_env_bool("COOKIE_SECURE", True),
         READER_ENGINE_POC_ENABLED=_env_bool("READER_ENGINE_POC_ENABLED", False),
+        READER_ENGINE_ENABLED=_env_bool("READER_ENGINE_ENABLED", False),
+        READER_SOURCE_SIGNED_URL_TTL=int(
+            os.getenv(
+                "READER_SOURCE_SIGNED_URL_TTL",
+                os.getenv("READER_ENGINE_POC_SIGNED_URL_TTL", "180"),
+            )
+        ),
         READER_ENGINE_POC_SIGNED_URL_TTL=int(
             os.getenv("READER_ENGINE_POC_SIGNED_URL_TTL", "180")
         ),
@@ -135,7 +142,41 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.get("/reader/<uuid:book_id>")
     @web_required
     def reader_page(book_id):
-        return render_template("reader.html", book_id=str(book_id))
+        response = make_response(
+            render_template(
+                "reader.html",
+                book_id=str(book_id),
+                reader_engine_enabled=app.config["READER_ENGINE_ENABLED"],
+            )
+        )
+        supabase = urlsplit(app.config.get("SUPABASE_URL", ""))
+        storage_origin = (
+            f"{supabase.scheme}://{supabase.netloc}"
+            if supabase.scheme == "https" and supabase.netloc
+            else ""
+        )
+        connect_sources = "'self' blob:"
+        if storage_origin:
+            connect_sources += f" {storage_origin}"
+        response.headers["Content-Security-Policy"] = "; ".join(
+            (
+                "default-src 'self'",
+                "base-uri 'none'",
+                "object-src 'none'",
+                "frame-ancestors 'self'",
+                "script-src 'self'",
+                "style-src 'self' 'unsafe-inline' blob:",
+                "img-src 'self' data: blob:",
+                "font-src 'self' data: blob:",
+                f"connect-src {connect_sources}",
+                "frame-src blob:",
+                "worker-src 'none'",
+                "form-action 'self'",
+            )
+        )
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     @app.get("/reader/<uuid:book_id>/annotations")
     @web_required

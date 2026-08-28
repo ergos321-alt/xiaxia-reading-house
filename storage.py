@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import threading
 import time
+import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
@@ -203,6 +204,30 @@ def download_bytes(object_path: str) -> bytes:
         response = _bucket().download(object_path)
         return bytes(response)
     except Exception as exc:
+        raise ObjectStorageError("Supabase Storage download failed") from exc
+
+
+def download_to_file(object_path: str, file_path: str | Path) -> int:
+    """Stream one private object to disk without retaining EPUB bytes in RAM."""
+    target = Path(file_path)
+    try:
+        signed_url = create_signed_download_url(object_path, 300)
+        request = urllib.request.Request(
+            signed_url,
+            headers={
+                "Accept": "application/epub+zip, application/octet-stream",
+                "User-Agent": "Xiaxia-Reading-House/2",
+            },
+        )
+        total = 0
+        with urllib.request.urlopen(request, timeout=60) as response:
+            with target.open("wb") as output:
+                while chunk := response.read(256 * 1024):
+                    output.write(chunk)
+                    total += len(chunk)
+        return total
+    except Exception as exc:
+        target.unlink(missing_ok=True)
         raise ObjectStorageError("Supabase Storage download failed") from exc
 
 

@@ -234,8 +234,8 @@ def test_upload_persists_binaries_in_storage_and_only_metadata_in_postgres(monke
     parsed = ParsedBook(
         title="测试之书",
         author="测试作者",
-        format="epub",
-        source_filename="book.epub",
+        format="txt",
+        source_filename="book.txt",
         source_sha256="a" * 64,
         chapters=[
             ParsedChapter(
@@ -302,12 +302,12 @@ def test_upload_persists_binaries_in_storage_and_only_metadata_in_postgres(monke
     client.post("/login", data={"password": "private-test-password"})
     response = client.post(
         "/api/books",
-        data={"file": (BytesIO(b"RAW-EPUB"), "book.epub")},
+        data={"file": (BytesIO(b"RAW-TXT"), "book.txt")},
         content_type="multipart/form-data",
     )
 
     assert response.status_code == 201
-    assert [item[1] for item in uploads] == [b"RAW-EPUB", b"COVER"]
+    assert [item[1] for item in uploads] == [b"RAW-TXT"]
     query, params = connection.asset_insert
     assert "object_path" in query
     assert " data" not in query.lower()

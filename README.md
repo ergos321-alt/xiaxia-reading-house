@@ -114,7 +114,7 @@ EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading H
 
 完成后到 Storage 页面再次确认 bucket 显示为 **Private**，且没有为浏览器角色添加读、写、更新或删除 policy。
 
-### 已部署并已有真实数据的 V1 / V1.1
+### 已部署并已有真实数据的 V1 / V1.1 / V2
 
 不需要清库，也不需要重新导入书籍。执行顺序：
 
@@ -122,10 +122,13 @@ EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading H
 2. 若尚未运行过，先运行 `migrations/003_v1_experience_refactor.sql`。
 3. 运行 `migrations/004_v1_1_management.sql`。
 4. 运行 `migrations/005_v2_reading_memories.sql`。
-5. 确认事务成功提交，再部署本项目新代码。
-6. 运行下文网页、Action 与 Android 手工验收。
+5. 运行 `migrations/006_reader_engine_source_first.sql`。
+6. 确认事务成功提交，再部署本项目新代码。
+7. 先保持 `READER_ENGINE_ENABLED=false` 做 legacy smoke test，再设为 `true`
+   启用 source-first EPUB 与正式 foliate renderer。
+8. 运行下文网页、Action 与 Android 手工验收。
 
-`004` 是可重复执行的 V1.1 增量事务。`005` 也是可重复执行的增量事务，只新增 V2 表、索引、触发器、RLS 和保守里程碑回填：它不会删除或改写现有 books、chapters、progress、annotations、Thought、Reply 或 Storage metadata。不要重新运行 `schema.sql` 代替 migration。
+`004`、`005` 与 `006` 都是可重复执行的增量事务。`006` 只增加 publication/text-index readiness 字段与独立的 foliate locator progress 表；现有书固定为 `legacy`，有真实章节的书回填为 text index ready，没有 `source_object_path` 的旧书不会伪造 publication ready。它不删除或改写任何书、章节、稳定 anchor、Thought、Reply 或 V2 memory。不要重新运行 `schema.sql` 代替 migration。
 
 `005` 只把现有 `percentage=100` 的用户进度认作已完成；林知夏方面只回填旧 checkpoint 能证明的那一个已完成章节，不会用“最后一次停在末章”冒充读完整本。后续每个 `chapter_completed=true` 的最终 chunk 会写入 `ai_chapter_completions`，只有真实章节全部齐全才标记整本完成。若封底 API 返回 `v2_migration_required`，表示部署代码已更新但此 migration 尚未成功提交；既有用户/AI 进度仍会保存，执行 `005` 后重新访问即可，不要清库或重跑 `schema.sql`。
 
@@ -136,7 +139,7 @@ EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading H
 3. 配置全部 Supabase/Storage 环境变量。
 4. 运行 `python scripts/migrate_legacy_bytea_to_storage.py`。
 5. 成功后运行 `migrations/002_finalize_storage_refactor.sql`。
-6. 再按顺序运行 `003_v1_experience_refactor.sql`、`004_v1_1_management.sql` 与 `005_v2_reading_memories.sql`。
+6. 再按顺序运行 `003_v1_experience_refactor.sql`、`004_v1_1_management.sql`、`005_v2_reading_memories.sql` 与 `006_reader_engine_source_first.sql`。
 7. 部署新代码。
 
 `002` 只有在每条旧资产都已有 `object_path` 后才删除旧 `data` 列；未迁移记录会使脚本中止，不会静默丢失图片。旧架构没有原始文件可迁移；新上传书籍会正常保留原始 EPUB/TXT。
@@ -158,6 +161,8 @@ EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading H
 | `DB_POOL_MIN` | 否 | 默认 1，免费实例可设 0 |
 | `DB_POOL_MAX` | 否 | 默认 2，与单 worker / 2 threads 对齐 |
 | `COOKIE_SECURE` | 否 | Render HTTPS 保持 true |
+| `READER_ENGINE_ENABLED` | 否 | Phase 2 总开关；默认 false，验收后设 true |
+| `READER_SOURCE_SIGNED_URL_TTL` | 否 | private EPUB signed URL 秒数，60–300，默认 180 |
 
 `SUPABASE_SERVICE_ROLE_KEY` 只能存在于 Render 后端环境变量或本地未提交 `.env`；不得写进 Git、HTML、JavaScript、OpenAPI 或聊天正文。本轮没有新增外部服务，也没有新增必填环境变量。
 
@@ -169,7 +174,7 @@ EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading H
 4. Health Check Path：`/health`
 5. 配置上表七个必填环境变量后部署。
 
-本次 EPUB 可靠性返修没有数据库 migration。已运行 V2 的实例只需部署新代码；不重跑 `schema.sql`，不重新导入既有书籍。
+Phase 2 必须先执行 `006_reader_engine_source_first.sql`，再部署代码。Build 与 Start Command 不变，不需要 Node runtime、新服务或 Supabase bucket 改动。旧书无需重新导入。
 
 健康检查结果：
 
@@ -226,6 +231,9 @@ Schema 采用 Actions 兼容的保守写法：路径参数在每个 operation �
 | 章节批注与 12 秒同步数据 | `GET /api/books/{book_id}/chapters/{chapter_id}/annotations` | 网页 |
 | 本书批注总览/筛选 | `GET /api/books/{book_id}/annotations` | 网页 / Action |
 | 用户阅读进度 | `PUT /api/books/{book_id}/progress` | 网页 |
+| foliate publication locator | `PUT /api/books/{book_id}/publication-progress` | 网页 |
+| private EPUB 短时访问 | `GET /api/books/{book_id}/source-access` | 网页 |
+| 重试夏夏正文索引 | `POST /api/books/{book_id}/text-index` | 网页 |
 | 新建用户划线/批注 | `POST /api/annotations` | 网页 |
 | 编辑/补写用户批注 | `PATCH /api/annotations/{annotation_id}` | 网页 |
 | 删除批注及关联 reply | `DELETE /api/annotations/{annotation_id}` | 网页 |
@@ -329,13 +337,16 @@ flask --app app run
 
 ```bash
 pytest
-python -m py_compile app.py annotations.py auth.py database.py epub_parser.py reading.py management.py memories.py operations.py storage.py
+python -m py_compile app.py annotations.py auth.py database.py epub_parser.py reading.py source_first.py management.py memories.py operations.py storage.py
 node --check static/js/reader-utils.js
 node --check static/js/reader.js
 node --check static/js/library.js
 node --check static/js/annotations-overview.js
 node --check static/js/annotations-management.js
 node --check static/js/after-reading.js
+node --check static/js/reader-engine-loader.js
+node --check static/js/foliate-reader-adapter.js
+node --check static/js/foliate-reader.js
 ruff check .
 ```
 
@@ -392,6 +403,28 @@ ruff check .
 3. 新开聊天调用 `getReadingState`，检查 chapter/chunk/last_block/completed 恢复。
 4. 根据返回 block 和 offsets 创建 range thought，再在网页确认精确位置。
 5. 写入用户 annotation reply，等待不超过 12–15 秒，确认网页不刷新整页即出现。
+
+## Phase 2 Source-first EPUB（生产总开关默认关闭）
+
+当 `READER_ENGINE_ENABLED=true` 时，新 EPUB 上传只执行有界流式接收、ZIP/OPF/
+spine 最小安全校验、raw source 私有保存、可选封面和 book 创建。成功响应表示“已加入
+书架”，初始 `text_index_status=pending`，不再等待完整 XHTML normalization 或图片
+复制。Web 阅读通过同一个 `/reader/<book_id>` shell、短时 signed URL 与固定版本
+foliate-js 打开原 EPUB。
+
+夏夏正文整理由书架上的轻量按钮显式触发。它从已有 `source_object_path` 下载原书，
+使用保留的 `epub_parser.py` 生成 chapters/blocks，并在独立事务中一次提交。失败只将
+`text_index_status` 记为 `failed`；raw EPUB、book 与 Web 阅读能力都保留。重试不重新
+上传，并在事务内清理上一次无 anchor 的不完整 index；一旦检测到 annotation 或
+Thought，自动重建会停止并返回 `text_index_mapping_failed`。
+
+现有书和 TXT 继续使用 legacy reader。新 foliate 书在 Phase 3 前是只读引擎：正文
+选择可被检测，但不会写 annotation/Thought，避免产生现有 shared stops 与 Xiaxia
+Actions 无法理解的单 CFI 数据。foliate runtime 出错且 text index 已 ready 时可用
+`?engine=legacy` 回退；关闭总开关后，新 EPUB 上传也恢复原 legacy importer。
+
+完整状态机、事务边界、三本真实失败 EPUB 结果和限制见
+`PHASE2_SOURCE_FIRST_REPORT.md`。
 
 ## foliate-js Controlled POC（默认关闭）
 
