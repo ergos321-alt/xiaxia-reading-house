@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import atexit
 from contextlib import contextmanager
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -71,6 +71,21 @@ def execute(query: str, params: Sequence[Any] | None = None) -> dict[str, Any] |
     with transaction() as conn:
         cursor = conn.execute(query, params or ())
         return cursor.fetchone() if cursor.description else None
+
+
+def execute_many(
+    conn: Any,
+    query: str,
+    params: Iterable[Sequence[Any]],
+) -> None:
+    """Execute one batch through a psycopg3 Cursor inside caller's transaction.
+
+    psycopg3 Connection supports execute(), but executemany() belongs to Cursor.
+    Keeping the cursor lifetime here prevents callers from depending on a
+    psycopg2/SQLite-style Connection API while preserving the outer rollback.
+    """
+    with conn.cursor() as cursor:
+        cursor.executemany(query, params)
 
 
 def ping() -> bool:

@@ -167,11 +167,33 @@ full asset extraction。
 复制 123/181 张图片。三本 text index 也成功，但即使其中任何一本失败，publication
 结果仍为 PASS。
 
+## Production hotfix：psycopg3 batch compatibility
+
+生产 traceback 证明 Phase 2 首版在 text-index DB 阶段错误调用了
+`Connection.executemany()`。项目使用 psycopg3：`Connection.execute()` 是受支持的
+便捷 API，但批量 `executemany()` 属于 `Cursor`。
+
+Hotfix 在 `database.py` 增加单一 `execute_many()` 边界，内部使用：
+
+```python
+with conn.cursor() as cursor:
+    cursor.executemany(query, params)
+```
+
+`source_first.py` 的 chapter batch 在既有 `db.transaction()` 内调用该边界。cursor
+异常继续向外传播，由外层 transaction rollback；随后只更新 text-index failure
+状态，不删除 publication 或 raw EPUB。其余 `conn.execute()`、pool connection 与
+transaction pattern 已核对为合法 psycopg3 用法，没有机械替换。
+
+兼容性测试直接检查安装中的 `psycopg.Connection` 没有 `executemany`、
+`psycopg.Cursor` 提供 `executemany`；完整 text-index 测试使用一个明确没有
+`executemany` 的 Connection contract，通过 `cursor.executemany` 完成批量章节写入。
+
 ## 自动化与静态验证
 
 执行结果：
 
-- `pytest`: **139 passed, 0 failed**
+- `pytest`: **140 passed, 0 failed**
 - Python `py_compile`: PASS
 - 所有项目/测试/vendored `.js` 的 `node --check`: PASS
 - 三本真实失败 EPUB source-first validation: **3/3 PASS**
@@ -235,7 +257,7 @@ full asset extraction。
 
 局部修改：
 
-- `app.py`、`reading.py`、`epub_parser.py`、`storage.py`
+- `app.py`、`reading.py`、`epub_parser.py`、`storage.py`、`database.py`
 - `schema.sql`、`.env.example`、`README.md`
 - `templates/reader.html`、`templates/library.html`
 - `static/js/library.js`、`static/css/style.css`

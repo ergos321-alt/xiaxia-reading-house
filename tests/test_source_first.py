@@ -6,8 +6,10 @@ from io import BytesIO
 from pathlib import Path
 from uuid import UUID
 
+import psycopg
 from werkzeug.datastructures import FileStorage
 
+import database
 import reading
 import source_first
 from app import create_app
@@ -357,6 +359,20 @@ class TextIndexConnection:
             return Cursor(dict(self.state.book))
         return Cursor(None)
 
+    def cursor(self):
+        return TextIndexCursor(self.state)
+
+
+class TextIndexCursor:
+    def __init__(self, state):
+        self.state = state
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        return False
+
     def executemany(self, _query, rows):
         self.state.chapters.extend(list(rows))
 
@@ -376,11 +392,47 @@ def install_text_index_state(monkeypatch, state):
 def test_text_index_success_is_independent_and_atomic(monkeypatch):
     state = TextIndexState(make_epub())
     install_text_index_state(monkeypatch, state)
+    assert not hasattr(TextIndexConnection, "executemany")
     result = source_first.build_text_index(BOOK_ID)
     assert result["text_index_status"] == "ready"
     assert result["publication_ready"] is True
     assert len(state.chapters) == 1
     assert state.book["chapter_count"] == 1
+
+
+def test_psycopg3_batch_contract_uses_cursor_not_connection():
+    assert not hasattr(psycopg.Connection, "executemany")
+    assert hasattr(psycopg.Cursor, "executemany")
+
+    class ContractCursor:
+        def __init__(self):
+            self.rows = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            return False
+
+        def executemany(self, query, rows):
+            self.query = query
+            self.rows = list(rows)
+
+    class ContractConnection:
+        def __init__(self):
+            self.batch_cursor = ContractCursor()
+
+        def cursor(self):
+            return self.batch_cursor
+
+    connection = ContractConnection()
+    database.execute_many(
+        connection,
+        "insert into chapters (id) values (%s)",
+        [("chapter-1",), ("chapter-2",)],
+    )
+    assert connection.batch_cursor.rows == [("chapter-1",), ("chapter-2",)]
+    assert "insert into chapters" in connection.batch_cursor.query
 
 
 def test_text_index_failure_keeps_publication_and_source(monkeypatch):
@@ -398,6 +450,10 @@ def test_text_index_database_failure_rolls_back_index_only(monkeypatch):
     install_text_index_state(monkeypatch, state)
 
     class FailedConnection(TextIndexConnection):
+        def cursor(self):
+            return FailedCursor(self.state)
+
+    class FailedCursor(TextIndexCursor):
         def executemany(self, _query, _rows):
             raise RuntimeError("forced index insert failure")
 

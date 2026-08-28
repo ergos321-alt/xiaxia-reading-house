@@ -375,7 +375,8 @@ def build_text_index(book_id: UUID) -> dict[str, Any]:
                     conn.execute("delete from reading_progress where book_id = %s", (book_id,))
                     conn.execute("delete from ai_reading_state where book_id = %s", (book_id,))
                     conn.execute("delete from chapters where book_id = %s", (book_id,))
-                    conn.executemany(
+                    db.execute_many(
+                        conn,
                         """
                         insert into chapters (
                             id, book_id, chapter_index, title, href,
