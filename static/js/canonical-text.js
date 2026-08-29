@@ -14,6 +14,19 @@ export const normalizeTextV1 = value => String(value ?? '')
     .replace(/\s+/g, ' ')
     .trim()
 
+export const canonicalHref = value => {
+    const raw = String(value ?? '').split('#', 1)[0].replaceAll('\\', '/').trim()
+    let decoded = raw
+    try { decoded = decodeURIComponent(raw) } catch { /* malformed escapes fail at comparison */ }
+    const parts = []
+    for (const part of decoded.split('/')) {
+        if (!part || part === '.') continue
+        if (part === '..') parts.pop()
+        else parts.push(part)
+    }
+    return parts.join('/')
+}
+
 const buildIndex = root => {
     let text = ''
     let pendingSpace = false
@@ -83,6 +96,8 @@ export const selectionContext = (doc, range, contextLength = 120) => {
         after: start >= 0 ? index.text.slice(start + quote.length, start + quote.length + contextLength) : '',
     }
 }
+
+export const textFromRange = (doc, range) => selectionContext(doc, range).highlight
 
 export const rangeFromCanonicalOffsets = (doc, start, end) => {
     const index = buildIndex(doc.body || doc.documentElement)

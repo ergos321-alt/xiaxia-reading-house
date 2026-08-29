@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,6 +29,32 @@ def make_epub(path: Path, body: str) -> None:
           <item id='c1' href='Text/chapter.xhtml' media-type='application/xhtml+xml'/>
           </manifest><spine><itemref idref='c1'/></spine></package>""")
         archive.writestr("OEBPS/Text/chapter.xhtml", f"<html><body>{body}</body></html>")
+
+
+def make_browser_epub(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        archive.writestr("META-INF/container.xml", """<?xml version='1.0'?>
+          <container xmlns='urn:oasis:names:tc:opendocument:xmlns:container'>
+          <rootfiles><rootfile full-path='OEBPS/content.opf'
+          media-type='application/oebps-package+xml'/></rootfiles></container>""")
+        archive.writestr("OEBPS/content.opf", """<?xml version='1.0'?>
+          <package xmlns='http://www.idpf.org/2007/opf' version='3.0' unique-identifier='id'>
+          <metadata xmlns:dc='http://purl.org/dc/elements/1.1/'>
+          <dc:identifier id='id'>phase3-browser</dc:identifier><dc:title>Locator Test</dc:title>
+          <dc:language>zh-CN</dc:language></metadata><manifest>
+          <item id='c1' href='Text/chapter.xhtml' media-type='application/xhtml+xml'/>
+          <item id='c2' href='Text/other.xhtml' media-type='application/xhtml+xml'/>
+          </manifest><spine><itemref idref='c1'/><itemref idref='c2'/></spine></package>""")
+        archive.writestr(
+            "OEBPS/Text/chapter.xhtml",
+            """<html xmlns='http://www.w3.org/1999/xhtml'><head><title>A</title></head><body>
+            <p>此时相望不相闻，愿逐月华流照君</p><p>后来选择的那一句话</p></body></html>""",
+        )
+        archive.writestr(
+            "OEBPS/Text/other.xhtml",
+            "<html xmlns='http://www.w3.org/1999/xhtml'><body><p>另一章</p></body></html>",
+        )
 
 
 def chapter(content: str) -> dict:
@@ -67,6 +95,12 @@ def locator(quote: str, *, before: str = "", after: str = "") -> dict:
         "spine_index": 0,
         "cfi": "epubcfi(/6/2!/4/2/1:0)",
         "text": {"highlight": quote, "before": before, "after": after},
+        "locator_integrity_version": 1,
+        "browser_truth": {
+            "href": "Text/chapter.xhtml",
+            "section_index": 0,
+            "text": quote,
+        },
     }
 
 
@@ -144,12 +178,89 @@ def test_source_and_version_mismatch_are_rejected(tmp_path, monkeypatch):
     assert exc.value.code == "locator_version_mismatch"
 
 
+def test_browser_truth_and_section_identity_are_mandatory(tmp_path, monkeypatch):
+    epub = tmp_path / "book.epub"
+    make_epub(epub, "<p>正文</p>")
+    payload = bridge.build_bridge_payload(
+        epub, book_id=BOOK_ID, source_sha256=SOURCE_HASH,
+        chapters=[chapter('<p data-block-id="b000001">正文</p>')],
+    )
+    install_payload(monkeypatch, payload)
+    no_truth = locator("正文")
+    no_truth.pop("browser_truth")
+    with pytest.raises(bridge.LocatorBridgeError) as exc:
+        bridge.map_engine_selection(BOOK_ID, no_truth)
+    assert exc.value.code == "locator_mapping_validation_failed"
+    wrong_index = locator("正文")
+    wrong_index["spine_index"] = 4
+    wrong_index["browser_truth"]["section_index"] = 4
+    with pytest.raises(bridge.LocatorBridgeError) as exc:
+        bridge.map_engine_selection(BOOK_ID, wrong_index)
+    assert exc.value.code == "locator_mapping_validation_failed"
+
+
+def test_xiaxia_thought_offset_slip_is_corrected_only_when_unique_and_nearby():
+    content = '<p data-block-id="b000001">甲此时相望不相闻，愿逐月华流照君乙</p>'
+    payload = {
+        "start_block_id": "b000001",
+        "end_block_id": "b000001",
+        "start_offset": 0,
+        "end_offset": 17,
+        "selected_text": "此时相望不相闻，愿逐月华流照君",
+        "prefix_text": "甲",
+        "suffix_text": "乙",
+    }
+    anchor = annotations._thought_anchor("range", payload, content)
+    assert anchor["start_offset"] == 1
+    assert anchor["selected_text"] == payload["selected_text"]
+
+    duplicate = '<p data-block-id="b000001">甲重复乙，甲重复乙</p>'
+    with pytest.raises(ValueError):
+        annotations._thought_anchor("range", {
+            "start_block_id": "b000001", "end_block_id": "b000001",
+            "start_offset": 0, "end_offset": 2, "selected_text": "重复",
+        }, duplicate)
+
+
+def test_live_chromium_locator_identity_and_truth(tmp_path):
+    epub = tmp_path / "browser.epub"
+    make_browser_epub(epub)
+    root = Path(__file__).resolve().parents[1]
+    probe = subprocess.run(
+        ["node", "-e", "process.stdout.write(require('playwright').chromium.executablePath())"],
+        cwd=root, capture_output=True, text=True,
+    )
+    if probe.returncode != 0 or not Path(probe.stdout).is_file():
+        pytest.skip("Playwright Chromium binary is not installed")
+    env = {**os.environ, "PHASE3_BROWSER_EPUB": str(epub)}
+    result = subprocess.run(
+        ["node", "tests/phase3_locator_integrity_browser.mjs"],
+        cwd=root, env=env, capture_output=True, text=True, timeout=90,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    text_a = "此时相望不相闻，愿逐月华流照君"
+    text_b = "后来选择的那一句话"
+    assert payload["locatorAText"] == payload["verifiedAText"] == text_a
+    assert payload["locatorBText"] == payload["verifiedBText"] == text_b
+    assert payload["hits"][0] == ["thought:A"]
+    assert payload["hits"][1] == ["annotation:B"]
+    assert payload["hits"][2] == ["annotation:C", "thought:A"]
+    assert payload["keys"] == ["annotation:B", "annotation:C", "thought:A"]
+    assert payload["wrongTextError"] == "locator_mapping_validation_failed"
+    assert payload["wrongSectionError"] == "locator_mapping_missing"
+
+
 class Cursor:
-    def __init__(self, row=None):
+    def __init__(self, row=None, rows=None):
         self.row = row
+        self.rows = rows or []
 
     def fetchone(self):
         return self.row
+
+    def fetchall(self):
+        return self.rows
 
 
 class Connection:
@@ -228,6 +339,43 @@ def test_foliate_annotation_transaction_stores_both_anchors(monkeypatch):
     assert insert[1][-2] == 1
 
 
+def test_revalidate_clears_only_unverified_locator_and_keeps_legacy_anchor(monkeypatch):
+    annotation_id = UUID("33333333-3333-4333-8333-333333333333")
+    thought_id = UUID("55555555-5555-4555-8555-555555555555")
+    stale = locator("正文")
+    stale.pop("locator_integrity_version")
+    queries = []
+
+    class RevalidationConnection:
+        def execute(self, query, params=()):
+            compact = " ".join(query.split())
+            queries.append((compact, params))
+            if "from annotations" in compact:
+                return Cursor(rows=[{"id": annotation_id, "selected_text": "正文", "engine_locator": stale}])
+            if "from xiaxia_thoughts" in compact:
+                return Cursor(rows=[{"id": thought_id, "selected_text": "正文", "engine_locator": locator("正文")}])
+            return Cursor()
+
+    @contextmanager
+    def transaction():
+        yield RevalidationConnection()
+
+    monkeypatch.setattr(
+        annotations.db, "fetch_one",
+        lambda *_args: {"id": BOOK_ID, "source_sha256": SOURCE_HASH},
+    )
+    monkeypatch.setattr(annotations.db, "transaction", transaction)
+    response = web_client().post(
+        f"/api/books/{BOOK_ID}/engine-traces/revalidate", json={},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["cleared"] == 1
+    updates = [item for item in queries if item[0].startswith("update annotations")]
+    assert len(updates) == 1 and updates[0][1] == (annotation_id,)
+    assert "start_block_id" not in updates[0][0]
+    assert not [item for item in queries if item[0].startswith("update xiaxia_thoughts")]
+
+
 def test_phase3_migration_is_additive_and_actions_schema_unchanged():
     root = Path(__file__).resolve().parents[1]
     migration = (root / "migrations/007_reader_engine_dual_anchor.sql").read_text()
@@ -243,4 +391,8 @@ def test_phase3_migration_is_additive_and_actions_schema_unchanged():
     assert "clearBrowserSelection" in foliate
     assert "removeAllRanges" in adapter
     assert "addDecoration" in adapter and "removeDecoration" in adapter
+    assert "getContents?.()[0]" not in adapter
+    assert "records[records.length - 1]" not in foliate
+    assert "recordKey" in adapter and "trace-record-choices" in foliate
+    assert "browser_truth" in adapter and "verifyLocator" in adapter
     assert "engine_locator" not in (root / "openapi.yaml").read_text()

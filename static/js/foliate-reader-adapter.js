@@ -5,7 +5,13 @@ import {
     downloadAsFile,
 } from './foliate-poc-adapter.js'
 import { Overlayer } from '../vendor/foliate-js/overlayer.js'
-import { rangeFromCanonicalOffsets, selectionContext } from './canonical-text.js'
+import {
+    canonicalHref,
+    normalizeTextV1,
+    rangeFromCanonicalOffsets,
+    selectionContext,
+    textFromRange,
+} from './canonical-text.js'
 
 /** Stable Reading House boundary around the pinned foliate-js internals. */
 export class FoliateReaderAdapter {
@@ -20,6 +26,8 @@ export class FoliateReaderAdapter {
             link: new Set(),
             selection: new Set(),
             annotation: new Set(),
+            sectionLoad: new Set(),
+            locatorInvalid: new Set(),
             error: new Set(),
         }
         this.decorations = new Map()
@@ -116,44 +124,113 @@ export class FoliateReaderAdapter {
     onLink(callback) { return this.#subscribe('link', callback) }
     onSelection(callback) { return this.#subscribe('selection', callback) }
     onAnnotation(callback) { return this.#subscribe('annotation', callback) }
+    onSectionLoad(callback) { return this.#subscribe('sectionLoad', callback) }
+    onLocatorInvalid(callback) { return this.#subscribe('locatorInvalid', callback) }
     onError(callback) { return this.#subscribe('error', callback) }
+
+    recordKey(record) {
+        const type = record?.kind === 'xiaxia' || record?.record_type === 'thought'
+            ? 'thought' : 'annotation'
+        return `${type}:${String(record?.id || '')}`
+    }
+
+    recordsForValue(value) {
+        return [...this.decorations.values()].filter(item => item.value === value)
+    }
 
     async addDecoration(record) {
         const cfi = record?.engine_locator?.cfi
         if (!cfi || !record?.id || !this.view) return false
-        this.decorations.set(String(record.id), {
+        const recordKey = this.recordKey(record)
+        const previous = this.decorations.get(recordKey)
+        if (previous?.value && previous.value !== cfi) {
+            this.decorations.delete(recordKey)
+            await this.view.deleteAnnotation({ value: previous.value })
+            if (this.recordsForValue(previous.value).length) await this.#drawValue(previous.value)
+        }
+        this.decorations.set(recordKey, {
+            recordKey,
+            recordType: record.kind === 'xiaxia' ? 'thought' : 'annotation',
             id: String(record.id),
             value: cfi,
             kind: record.kind === 'xiaxia' ? 'xiaxia' : 'user',
+            expectedText: String(record.selected_text || ''),
+            locator: record.engine_locator,
         })
         await this.#drawValue(cfi)
         return true
     }
 
-    async removeDecoration(recordId) {
-        const old = this.decorations.get(String(recordId))
+    async removeDecoration(recordType, recordId) {
+        const type = recordType === 'xiaxia' || recordType === 'thought' ? 'thought' : 'annotation'
+        const old = this.decorations.get(`${type}:${String(recordId)}`)
         if (!old || !this.view) return
-        this.decorations.delete(String(recordId))
+        this.decorations.delete(old.recordKey)
         await this.view.deleteAnnotation({ value: old.value })
         if ([...this.decorations.values()].some(item => item.value === old.value)) {
             await this.#drawValue(old.value)
         }
     }
 
-    async locatorFromSeed(seed) {
-        if (!this.view || !seed?.href) throw new Error('locator_mapping_missing')
-        await this.goTo(seed.href)
-        const content = this.view.renderer?.getContents?.().find(item =>
-            item.index === Number(seed.spine_index))
-            || this.view.renderer?.getContents?.()[0]
-        if (!content?.doc) throw new Error('locator_mapping_missing')
+    async locatorFromSeed(seed, { navigate = false } = {}) {
+        const expected = this.#expectedSection(seed)
+        if (navigate) {
+            const resolved = await this.goTo(seed.href)
+            if (Number(resolved?.index) !== expected.index) {
+                throw this.#locatorError('locator_mapping_missing')
+            }
+        }
+        const content = this.#loadedContent(expected)
         const range = rangeFromCanonicalOffsets(
             content.doc, seed.original_start, seed.original_end)
-        return {
+        const actualText = textFromRange(content.doc, range)
+        const expectedText = normalizeTextV1(seed?.text?.highlight)
+        if (!expectedText || normalizeTextV1(actualText) !== expectedText) {
+            throw this.#locatorError('locator_mapping_validation_failed')
+        }
+        const cfi = this.view.getCFI(content.index, range)
+        const locator = {
             ...seed,
-            cfi: this.view.getCFI(content.index, range),
+            cfi,
             section_index: content.index,
             progression: this.getCurrentLocator().progression,
+            locator_integrity_version: 1,
+            browser_truth: {
+                href: expected.href,
+                section_index: content.index,
+                text: actualText,
+            },
+        }
+        await this.verifyLocator(locator, expectedText)
+        return locator
+    }
+
+    async verifyLocator(locator, expectedText, { navigate = false } = {}) {
+        if (!this.view || !locator?.cfi) throw this.#locatorError('locator_invalid_cfi')
+        const expected = this.#expectedSection(locator)
+        let resolved
+        try { resolved = this.view.resolveNavigation?.(locator.cfi) }
+        catch { throw this.#locatorError('locator_invalid_cfi') }
+        if (!resolved || Number(resolved.index) !== expected.index) {
+            throw this.#locatorError('locator_mapping_validation_failed')
+        }
+        if (navigate) await this.goTo(locator.cfi)
+        const content = this.#loadedContent(expected)
+        let range
+        try {
+            range = typeof resolved.anchor === 'function'
+                ? resolved.anchor(content.doc) : resolved.anchor
+        } catch { throw this.#locatorError('locator_invalid_cfi') }
+        if (!range) throw this.#locatorError('locator_invalid_cfi')
+        const actualText = textFromRange(content.doc, range)
+        if (normalizeTextV1(actualText) !== normalizeTextV1(expectedText)) {
+            throw this.#locatorError('locator_mapping_validation_failed')
+        }
+        return {
+            href: expected.href,
+            section_index: expected.index,
+            text: actualText,
+            range,
         }
     }
 
@@ -165,15 +242,57 @@ export class FoliateReaderAdapter {
     }
 
     async #drawValue(value) {
-        const records = [...this.decorations.values()].filter(item => item.value === value)
-        const kinds = new Set(records.map(item => item.kind))
-        const kind = kinds.size > 1 ? 'shared' : records[0]?.kind || 'user'
+        const records = this.recordsForValue(value)
+        if (!records.length) return
+        const valid = []
+        for (const record of records) {
+            try {
+                await this.verifyLocator(record.locator, record.expectedText)
+                valid.push(record)
+            } catch (error) {
+                if (error.code !== 'locator_mapping_missing') {
+                    this.#emit('locatorInvalid', { record, error })
+                }
+            }
+        }
+        if (!valid.length) return
+        const kinds = new Set(valid.map(item => item.kind))
+        const kind = kinds.size > 1 ? 'shared' : valid[0]?.kind || 'user'
         await this.view.addAnnotation({
             value,
             kind,
-            recordIds: records.map(item => item.id),
+            recordKeys: valid.map(item => item.recordKey),
             color: kind === 'xiaxia' ? '#6f8795' : kind === 'shared' ? '#776b7b' : '#8b5c45',
         })
+    }
+
+    #expectedSection(locator) {
+        if (!this.view || !locator?.href) throw this.#locatorError('locator_mapping_missing')
+        const index = Number(locator.spine_index ?? locator.section_index)
+        if (!Number.isInteger(index) || index < 0 || index >= (this.book?.sections?.length || 0)) {
+            throw this.#locatorError('locator_mapping_missing')
+        }
+        const expectedHref = canonicalHref(locator.href)
+        const actualHref = canonicalHref(this.book.sections[index]?.id)
+        if (!expectedHref || actualHref !== expectedHref) {
+            throw this.#locatorError('locator_mapping_missing')
+        }
+        return { index, href: expectedHref }
+    }
+
+    #loadedContent(expected) {
+        const content = (this.view.renderer?.getContents?.() || [])
+            .find(item => Number(item.index) === expected.index)
+        if (!content?.doc) throw this.#locatorError('locator_mapping_missing')
+        const sectionHref = canonicalHref(this.book.sections[content.index]?.id)
+        if (sectionHref !== expected.href) throw this.#locatorError('locator_mapping_missing')
+        return content
+    }
+
+    #locatorError(code) {
+        const error = new Error(code)
+        error.code = code
+        return error
     }
 
     #subscribe(name, callback) {
@@ -220,8 +339,7 @@ export class FoliateReaderAdapter {
             })
         })
         this.view.addEventListener('show-annotation', event => {
-            const records = [...this.decorations.values()]
-                .filter(item => item.value === event.detail.value)
+            const records = this.recordsForValue(event.detail.value)
             this.#emit('annotation', { ...event.detail, records })
         })
         this.view.addEventListener('create-overlay', () => {
@@ -247,10 +365,19 @@ export class FoliateReaderAdapter {
                     href: this.book.sections[index]?.id || '',
                     section_index: index,
                     progression: this.getCurrentLocator().progression,
+                    locator_integrity_version: 1,
+                    browser_truth: {
+                        href: canonicalHref(this.book.sections[index]?.id || ''),
+                        section_index: index,
+                        text: quote,
+                    },
                 })
             }
             doc.addEventListener('pointerup', capture)
             doc.addEventListener('keyup', capture)
+            this.#emit('sectionLoad', {
+                href: canonicalHref(this.book.sections[index]?.id || ''), index,
+            })
         })
         attachSafeLinkPolicy(this.view, (kind, detail) => {
             this.#emit('link', { kind, ...detail })

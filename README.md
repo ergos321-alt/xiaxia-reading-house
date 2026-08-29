@@ -469,6 +469,18 @@ POC 页面提供 TOC、Prev/Next、pagination/scroll、字号、CFI debug、CFI 
 只用于可选浏览器验收脚本，不是运行时依赖。完整工程结论、真实 corpus 状态和
 设备清单见 `FOLIATE_POC_REPORT.md` 与 `FOLIATE_POC_TEST_MATRIX.md`。
 
+## Phase 3 Locator Integrity Hotfix
+
+foliate decoration 现在使用 `annotation:<uuid>` / `thought:<uuid>` 作为记录身份，
+CFI 只作为绘制位置，不再决定打开哪条记录。历史 Phase 3 locator 因缺少 live DOM
+验证标记，会在每本书首次打开时只清除 `engine_locator` 并按 legacy anchor 安全重建；
+annotation、Thought、Reply 与 shared-stop anchor 不会删除或改写。
+
+新 locator 必须同时通过 canonical href、runtime section、CFI resolved Range 和
+`selected_text` 的浏览器实文验证。目标 section 未加载或身份不一致时 fail closed，
+不会再回退到当前 `getContents()[0]`。本 hotfix 不需要新 migration 或环境变量。
+详见 `PHASE3_LOCATOR_INTEGRITY_HOTFIX_REPORT.md`。
+
 ## V1 边界
 
 没有增加 PDF、Kindle、用户注册、公共书库、社交、全文搜索、标签、统计 Dashboard、语音朗读、推荐算法、AI 自动总结、服务器人格生成、AI 后台自主阅读、多 AI 角色、复杂主题或多色管理。DRM EPUB 不处理。

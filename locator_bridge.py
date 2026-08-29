@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 BRIDGE_VERSION = 1
 ENGINE_ADAPTER_VERSION = 1
 CANONICAL_TEXT_VERSION = 1
+LOCATOR_INTEGRITY_VERSION = 1
 ENGINE_NAME = "foliate-js"
 _DROP_CHARS = {"\u00ad", "\u200b", "\u200c", "\u200d", "\ufeff"}
 
@@ -321,6 +322,7 @@ def map_engine_selection(book_id: UUID, locator: dict[str, Any]) -> dict[str, An
     after = normalize_text_v1(text.get("after") or "")
     if not quote:
         raise LocatorBridgeError("locator_mapping_missing", "所选文字为空", 422)
+    _validate_browser_truth(locator, chapter, quote)
     match = _unique_match(chapter["normalized_text"], quote, before, after)
     if match is None:
         code = "locator_mapping_ambiguous" if _count_occurrences(chapter["normalized_text"], quote) > 1 else "locator_mapping_missing"
@@ -438,6 +440,52 @@ def validate_backfill_locator(book_id: UUID, record: dict[str, Any], locator: di
     return mapped["engine_locator"]
 
 
+def locator_has_integrity(locator: Any, source_sha256: str, expected_text: str | None = None) -> bool:
+    if not isinstance(locator, dict):
+        return False
+    truth = locator.get("browser_truth")
+    text = locator.get("text")
+    try:
+        integrity_version = int(locator.get("locator_integrity_version") or 0)
+    except (TypeError, ValueError):
+        return False
+    valid = bool(
+        integrity_version == LOCATOR_INTEGRITY_VERSION
+        and locator.get("source_sha256") == source_sha256
+        and isinstance(truth, dict)
+        and isinstance(text, dict)
+        and normalize_text_v1(truth.get("text") or "")
+        == normalize_text_v1(text.get("highlight") or "")
+        and canonical_href(truth.get("href") or "")
+        == canonical_href(locator.get("href") or "")
+        and str(truth.get("section_index"))
+        == str(locator.get("spine_index", locator.get("section_index")))
+    )
+    return valid and (
+        expected_text is None
+        or normalize_text_v1(truth.get("text") or "") == normalize_text_v1(expected_text)
+    )
+
+
+def unique_normalized_span_v1(
+    text: str,
+    quote: str,
+    before: str = "",
+    after: str = "",
+) -> tuple[int, int] | None:
+    """Return a unique canonical span; shared by strict legacy correction."""
+    return _unique_match(
+        normalize_text_v1(text),
+        normalize_text_v1(quote),
+        normalize_text_v1(before),
+        normalize_text_v1(after),
+    )
+
+
+def canonical_offset_to_raw_v1(text: str, offset: int) -> int:
+    return _raw_offset_for_canonical(text, offset)
+
+
 def bridge_state(book_id: UUID) -> dict[str, Any] | None:
     return db.fetch_one(
         """
@@ -541,16 +589,15 @@ def _opf_path(archive: zipfile.ZipFile, names: dict[str, str]) -> str:
 
 def _bridge_chapter(bridge: dict[str, Any], href: str, spine_index: Any) -> dict[str, Any]:
     by_href = [item for item in bridge["chapters"] if canonical_href(item["href"]).lower() == href.lower()]
-    if len(by_href) == 1:
-        return by_href[0]
+    if len(by_href) != 1:
+        raise LocatorBridgeError("locator_mapping_missing", "无法对应到夏夏整理后的章节", 422)
     try:
         index = int(spine_index)
     except (TypeError, ValueError):
-        index = -1
-    by_index = [item for item in bridge["chapters"] if int(item["spine_index"]) == index]
-    if len(by_index) == 1:
-        return by_index[0]
-    raise LocatorBridgeError("locator_mapping_missing", "无法对应到夏夏整理后的章节", 422)
+        raise LocatorBridgeError("locator_mapping_missing", "阅读引擎章节编号缺失", 422) from None
+    if int(by_href[0]["spine_index"]) != index:
+        raise LocatorBridgeError("locator_mapping_validation_failed", "阅读引擎章节身份不一致", 422)
+    return by_href[0]
 
 
 def _unique_match(haystack: str, needle: str, before: str, after: str) -> tuple[int, int] | None:
@@ -635,6 +682,7 @@ def _canonical_boundaries(raw: str) -> tuple[list[int], int]:
 
 
 def _sanitize_locator(locator: dict[str, Any], source_sha256: str, href: str, quote: str, before: str, after: str) -> dict[str, Any]:
+    truth = locator.get("browser_truth") if isinstance(locator.get("browser_truth"), dict) else {}
     result: dict[str, Any] = {
         "engine": ENGINE_NAME,
         "engine_adapter_version": ENGINE_ADAPTER_VERSION,
@@ -643,6 +691,12 @@ def _sanitize_locator(locator: dict[str, Any], source_sha256: str, href: str, qu
         "href": href,
         "cfi": str(locator.get("cfi") or "")[:8192],
         "text": {"highlight": quote[:20_000], "before": before[-500:], "after": after[:500]},
+        "locator_integrity_version": LOCATOR_INTEGRITY_VERSION,
+        "browser_truth": {
+            "href": canonical_href(truth.get("href") or href),
+            "section_index": int(truth.get("section_index", locator.get("spine_index", locator.get("section_index")))),
+            "text": normalize_text_v1(truth.get("text") or "")[:20_000],
+        },
     }
     try:
         result["spine_index"] = max(0, int(locator.get("spine_index", locator.get("section_index"))))
@@ -653,6 +707,31 @@ def _sanitize_locator(locator: dict[str, Any], source_sha256: str, href: str, qu
     except (TypeError, ValueError):
         result["progression"] = 0.0
     return result
+
+
+def _validate_browser_truth(locator: dict[str, Any], chapter: dict[str, Any], quote: str) -> None:
+    truth = locator.get("browser_truth")
+    if int(locator.get("locator_integrity_version") or 0) != LOCATOR_INTEGRITY_VERSION or not isinstance(truth, dict):
+        raise LocatorBridgeError(
+            "locator_mapping_validation_failed",
+            "浏览器尚未验证这处书页定位",
+            422,
+        )
+    expected_href = canonical_href(chapter["href"])
+    if canonical_href(truth.get("href") or "") != expected_href:
+        raise LocatorBridgeError("locator_mapping_validation_failed", "浏览器章节与书页索引不一致", 422)
+    try:
+        truth_index = int(truth.get("section_index"))
+    except (TypeError, ValueError):
+        raise LocatorBridgeError("locator_mapping_validation_failed", "浏览器章节编号无效", 422) from None
+    if truth_index != int(chapter["spine_index"]):
+        raise LocatorBridgeError("locator_mapping_validation_failed", "浏览器章节编号与书页索引不一致", 422)
+    if normalize_text_v1(truth.get("text") or "") != quote:
+        raise LocatorBridgeError(
+            "locator_mapping_validation_failed",
+            "浏览器实际定位文字与所选文字不一致",
+            422,
+        )
 
 
 def _mark_failed(book_id: UUID, code: str) -> None:

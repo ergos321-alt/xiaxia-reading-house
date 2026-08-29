@@ -1,4 +1,5 @@
 import { FoliateReaderAdapter } from './foliate-reader-adapter.js'
+import { canonicalHref, normalizeTextV1 } from './canonical-text.js'
 
 const $ = selector => document.querySelector(selector)
 const body = document.body
@@ -30,6 +31,9 @@ let thoughts = []
 let openRecord = null
 let editingAnnotationId = null
 let tracePoll = null
+let traceRefreshPromise = null
+let traceRevalidated = false
+let initialTraceHandled = false
 
 const api = async (url, options = {}) => {
     const response = await fetch(url, {
@@ -132,30 +136,74 @@ const saveProgress = locator => {
     }).catch(() => showStatus('阅读位置暂时没有保存')), 650)
 }
 
-const validLocator = locator => locator
+const validLocator = (locator, record) => locator
     && locator.engine === 'foliate-js'
     && locator.engine_adapter_version === 1
     && locator.bridge_version === 1
     && locator.source_sha256 === source?.book?.source_sha256
     && String(locator.cfi || '').startsWith('epubcfi(')
+    && locator.locator_integrity_version === 1
+    && canonicalHref(locator.browser_truth?.href) === canonicalHref(locator.href)
+    && Number(locator.browser_truth?.section_index) === Number(locator.spine_index)
+    && normalizeTextV1(locator.browser_truth?.text) === normalizeTextV1(record?.selected_text)
 
 const recordById = (kind, id) => (kind === 'xiaxia' ? thoughts : annotations)
     .find(item => String(item.id) === String(id))
 
+const traceType = kind => kind === 'xiaxia' ? 'thought' : 'annotation'
+
+const persistRecordLocator = async (record, kind, engineLocator) => {
+    const result = await api(
+        `/api/books/${bookId}/engine-traces/${traceType(kind)}/${record.id}/locator`,
+        { method: 'PUT', body: JSON.stringify({ engine_locator: engineLocator }) },
+    )
+    record.engine_locator = result.record.engine_locator
+    record.engine_locator_version = result.record.engine_locator_version
+    record.engine_anchor_verified_at = result.record.engine_anchor_verified_at
+    return record.engine_locator
+}
+
+const invalidateRecordLocator = async (record, kind) => {
+    await api(
+        `/api/books/${bookId}/engine-traces/${traceType(kind)}/${record.id}/locator`,
+        { method: 'DELETE' },
+    )
+    record.engine_locator = null
+    record.engine_locator_version = null
+    record.engine_anchor_verified_at = null
+    await adapter.removeDecoration(traceType(kind), record.id)
+}
+
+const ensureRecordLocator = async (record, kind, { navigate = false } = {}) => {
+    if (validLocator(record.engine_locator, record)) {
+        try {
+            await adapter.verifyLocator(record.engine_locator, record.selected_text, { navigate })
+            return record.engine_locator
+        } catch (error) {
+            if (error.code !== 'locator_mapping_missing' || navigate) {
+                await invalidateRecordLocator(record, kind)
+            } else {
+                throw error
+            }
+        }
+    }
+    if (!record.locator_seed || !bridgeReady) {
+        const error = new Error('locator_mapping_missing')
+        error.code = 'locator_mapping_missing'
+        throw error
+    }
+    const engineLocator = await adapter.locatorFromSeed(record.locator_seed, { navigate })
+    return persistRecordLocator(record, kind, engineLocator)
+}
+
 const addTraceDecoration = async (record, kind) => {
-    if (validLocator(record.engine_locator)) {
+    if (validLocator(record.engine_locator, record)) {
         await adapter.addDecoration({ ...record, kind })
         return
     }
     if (!record.locator_seed || !bridgeReady) return
     try {
-        const engineLocator = await adapter.locatorFromSeed(record.locator_seed)
-        const result = await api(
-            `/api/books/${bookId}/engine-traces/${kind === 'xiaxia' ? 'thought' : 'annotation'}/${record.id}/locator`,
-            { method: 'PUT', body: JSON.stringify({ engine_locator: engineLocator }) },
-        )
-        record.engine_locator = result.record.engine_locator
-        record.engine_locator_version = result.record.engine_locator_version
+        await ensureRecordLocator(record, kind)
         await adapter.addDecoration({ ...record, kind })
     } catch (error) {
         console.info('locator backfill skipped', record.id, error.code || error.message)
@@ -164,14 +212,24 @@ const addTraceDecoration = async (record, kind) => {
 
 const refreshTraces = async () => {
     if (!bridgeReady) return
-    const data = await api(`/api/books/${bookId}/engine-traces`)
-    annotations = data.annotations || []
-    thoughts = data.xiaxia_thoughts || []
-    for (const item of annotations) await addTraceDecoration(item, 'user')
-    for (const item of thoughts.filter(item => item.scope !== 'chapter')) {
-        await addTraceDecoration(item, 'xiaxia')
-    }
-    renderChapterThoughtMarker(lastLocator?.href)
+    if (traceRefreshPromise) return traceRefreshPromise
+    traceRefreshPromise = (async () => {
+        if (!traceRevalidated) {
+            await api(`/api/books/${bookId}/engine-traces/revalidate`, {
+                method: 'POST', body: JSON.stringify({}),
+            })
+            traceRevalidated = true
+        }
+        const data = await api(`/api/books/${bookId}/engine-traces`)
+        annotations = data.annotations || []
+        thoughts = data.xiaxia_thoughts || []
+        for (const item of annotations) await addTraceDecoration(item, 'user')
+        for (const item of thoughts.filter(item => item.scope !== 'chapter')) {
+            await addTraceDecoration(item, 'xiaxia')
+        }
+        renderChapterThoughtMarker(lastLocator?.href)
+    })()
+    try { await traceRefreshPromise } finally { traceRefreshPromise = null }
 }
 
 const renderChapterThoughtMarker = href => {
@@ -226,6 +284,7 @@ const openTrace = (kind, id) => {
     const record = recordById(kind, id)
     if (!record) return
     openRecord = { kind, id: String(id) }
+    $('#trace-record-choices').hidden = true
     $('#annotation-kind').textContent = kind === 'user' ? '我的划线 / 批注' : '林知夏的独立想法'
     $('#annotation-quote').textContent = record.selected_text || '（本章）'
     $('#user-note-section').hidden = kind !== 'user'
@@ -244,6 +303,59 @@ const openTrace = (kind, id) => {
     if (!annotationDialog.open) annotationDialog.showModal()
 }
 
+const openTraceChoices = records => {
+    const choices = $('#trace-record-choices')
+    choices.replaceChildren()
+    choices.hidden = false
+    $('#annotation-kind').textContent = '这处书页有多条共读痕迹'
+    $('#annotation-quote').textContent = records[0]?.expectedText || ''
+    for (const record of records) {
+        const sourceRecord = recordById(record.kind, record.id)
+        const summary = String(sourceRecord?.content || sourceRecord?.comment || '只留下了划线')
+            .replace(/\s+/g, ' ').slice(0, 36)
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.className = 'secondary-button'
+        button.textContent = `${record.kind === 'xiaxia' ? '林知夏' : '我'} · ${summary}`
+        button.dataset.recordKey = record.recordKey
+        button.addEventListener('click', () => openTrace(record.kind, record.id))
+        choices.append(button)
+    }
+    for (const id of [
+        'user-note-section', 'xiaxia-reply-section', 'xiaxia-thought-section',
+        'thought-user-reply-section', 'thought-actions', 'annotation-actions',
+    ]) $(`#${id}`).hidden = true
+    $('#trace-actions-menu').hidden = true
+    if (!annotationDialog.open) annotationDialog.showModal()
+}
+
+const navigateToTrace = async (kind, id, { open = true } = {}) => {
+    const record = recordById(kind, id)
+    if (!record || !record.start_block_id) throw new Error('locator_mapping_missing')
+    try {
+        const locator = await ensureRecordLocator(record, kind, { navigate: true })
+        await adapter.verifyLocator(locator, record.selected_text, { navigate: true })
+        await adapter.addDecoration({ ...record, kind })
+        if (open) openTrace(kind, id)
+        return true
+    } catch (error) {
+        showStatus('这条痕迹暂时无法准确定位，已停止跳转。')
+        console.info('record navigation failed closed', traceType(kind), id, error.code || error.message)
+        return false
+    }
+}
+
+const handleInitialTraceTarget = async () => {
+    if (initialTraceHandled) return
+    initialTraceHandled = true
+    const query = new URLSearchParams(location.search)
+    if (query.get('annotation_id')) {
+        await navigateToTrace('user', query.get('annotation_id'))
+    } else if (query.get('thought_id')) {
+        await navigateToTrace('xiaxia', query.get('thought_id'))
+    }
+}
+
 const editCurrentAnnotation = () => {
     const record = openRecord?.kind === 'user' && recordById('user', openRecord.id)
     if (!record) return
@@ -260,7 +372,7 @@ const deleteCurrentAnnotation = async () => {
     if (!record || !confirm('确定删除这条划线 / 批注吗？')) return
     await api(`/api/annotations/${record.id}`, { method: 'DELETE' })
     annotations = annotations.filter(item => item.id !== record.id)
-    await adapter.removeDecoration(record.id)
+    await adapter.removeDecoration('annotation', record.id)
     annotationDialog.close()
     showStatus('划线与批注已删除。')
 }
@@ -325,6 +437,7 @@ const initialize = async () => {
         applyFlowUI()
         if (bridgeReady) {
             await refreshTraces()
+            await handleInitialTraceTarget()
             tracePoll = setInterval(() => refreshTraces().catch(() => {}), 30000)
         }
         showStatus('原始 EPUB 已打开')
@@ -356,13 +469,22 @@ adapter.onSelection(detail => {
         source_sha256: source.book.source_sha256,
         href: detail.href, spine_index: detail.section_index,
         cfi: detail.cfi, progression: detail.progression, text: detail.text,
+        locator_integrity_version: detail.locator_integrity_version,
+        browser_truth: detail.browser_truth,
     }
     setTimeout(() => { if (epoch === selectionEpoch) showSelectionMenu() }, 40)
 })
 
 adapter.onAnnotation(({ records }) => {
-    const record = records[records.length - 1]
-    if (record) openTrace(record.kind, record.id)
+    if (records.length === 1) openTrace(records[0].kind, records[0].id)
+    else if (records.length > 1) openTraceChoices(records)
+})
+adapter.onLocatorInvalid(({ record }) => {
+    const sourceRecord = recordById(record.kind, record.id)
+    if (sourceRecord) invalidateRecordLocator(sourceRecord, record.kind).catch(() => {})
+})
+adapter.onSectionLoad(() => {
+    if (bridgeReady) setTimeout(() => refreshTraces().catch(() => {}), 40)
 })
 adapter.onError(error => console.error('foliate-reader', error))
 

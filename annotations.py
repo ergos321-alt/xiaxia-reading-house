@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 from uuid import UUID
@@ -15,15 +16,21 @@ from auth import action_required, api_or_session_required, web_api_required
 from reading import _chapter_blocks, _json_safe, _text_across_blocks, _uuid_or_none
 from locator_bridge import (
     BRIDGE_VERSION,
+    LOCATOR_INTEGRITY_VERSION,
     LocatorBridgeError,
     bridge_state,
+    canonical_offset_to_raw_v1,
     legacy_locator_seed,
+    locator_has_integrity,
     map_engine_selection,
+    normalize_text_v1,
+    unique_normalized_span_v1,
     validate_backfill_locator,
 )
 
 
 annotations_bp = Blueprint("annotations", __name__)
+logger = logging.getLogger(__name__)
 
 
 USER_ANNOTATION_FIELDS = """
@@ -280,6 +287,74 @@ def backfill_engine_trace(book_id: UUID, record_type: str, record_id: UUID):
             (Jsonb(sanitized), BRIDGE_VERSION, record_id),
         ).fetchone()
     return jsonify({"record": _json_safe(row)})
+
+
+@annotations_bp.delete("/api/books/<uuid:book_id>/engine-traces/<record_type>/<uuid:record_id>/locator")
+@web_api_required
+def invalidate_engine_trace(book_id: UUID, record_type: str, record_id: UUID):
+    """Discard only a renderer locator; the business anchor remains intact."""
+    table = {"annotation": "annotations", "thought": "xiaxia_thoughts"}.get(record_type)
+    if not table:
+        return jsonify({"error": "locator_backfill_failed"}), 400
+    row = db.execute(
+        f"""
+        update {table} set engine_locator = null,
+            engine_locator_version = null,
+            engine_anchor_verified_at = null,
+            updated_at = now()
+        where id = %s and book_id = %s returning id
+        """,
+        (record_id, book_id),
+    )
+    if not row:
+        return jsonify({"error": "reading_trace_not_found"}), 404
+    logger.info(
+        "locator_invalidated book_id=%s record_type=%s record_id=%s error_code=locator_mapping_validation_failed",
+        book_id, record_type, record_id,
+    )
+    return jsonify({"status": "locator_invalidated", "record_id": str(record_id)})
+
+
+@annotations_bp.post("/api/books/<uuid:book_id>/engine-traces/revalidate")
+@web_api_required
+def revalidate_engine_traces(book_id: UUID):
+    """Clear legacy/unverified renderer locators without touching legacy anchors."""
+    book = db.fetch_one("select id, source_sha256 from books where id = %s", (book_id,))
+    if not book:
+        return jsonify({"error": "book_not_found"}), 404
+    payload = request.get_json(silent=True) or {}
+    invalid = payload.get("invalid_records") or []
+    invalid_keys = {
+        (str(item.get("record_type") or ""), _uuid_or_none(item.get("record_id")))
+        for item in invalid if isinstance(item, dict)
+    }
+    invalid_keys.discard(("", None))
+    cleared = 0
+    with db.transaction() as conn:
+        for record_type, table in (("annotation", "annotations"), ("thought", "xiaxia_thoughts")):
+            rows = conn.execute(
+                f"select id, selected_text, engine_locator from {table} where book_id = %s and engine_locator is not null for update",
+                (book_id,),
+            ).fetchall()
+            for row in rows:
+                explicitly_invalid = (record_type, row["id"]) in invalid_keys
+                if not explicitly_invalid and locator_has_integrity(
+                    row.get("engine_locator"), book["source_sha256"], row.get("selected_text")
+                ):
+                    continue
+                conn.execute(
+                    f"""
+                    update {table} set engine_locator = null,
+                        engine_locator_version = null,
+                        engine_anchor_verified_at = null,
+                        updated_at = now()
+                    where id = %s
+                    """,
+                    (row["id"],),
+                )
+                cleared += 1
+    logger.info("locator_revalidated book_id=%s cleared=%s", book_id, cleared)
+    return jsonify({"status": "revalidated", "cleared": cleared})
 
 
 @annotations_bp.patch("/api/annotations/<uuid:annotation_id>")
@@ -606,7 +681,21 @@ def _thought_anchor(scope: str, payload: dict[str, Any], content_html: str):
         raise ValueError("range is empty or outside the chapter")
     supplied = _clean_selected_text(payload.get("selected_text"), 20_000)
     if supplied and _normalize_text(supplied) != _normalize_text(selected):
-        raise ValueError("selected_text does not match the supplied block offsets")
+        corrected = _correct_thought_anchor(
+            block_map,
+            start_block_id,
+            end_block_id,
+            start_offset,
+            supplied,
+            _clean_text(payload.get("prefix_text"), 500, allow_empty=True),
+            _clean_text(payload.get("suffix_text"), 500, allow_empty=True),
+        )
+        if corrected is None:
+            raise ValueError("selected_text does not match the supplied block offsets")
+        start_offset, end_offset = corrected
+        selected = _text_across_blocks(
+            blocks, start_block_id, start_offset, end_block_id, end_offset
+        )
     start_text = block_map[start_block_id]["text"]
     end_text = block_map[end_block_id]["text"]
     return {
@@ -618,6 +707,41 @@ def _thought_anchor(scope: str, payload: dict[str, Any], content_html: str):
         "prefix_text": start_text[max(0, start_offset - 120) : start_offset],
         "suffix_text": end_text[end_offset : end_offset + 120],
     }
+
+
+def _correct_thought_anchor(
+    block_map: dict[str, dict[str, Any]],
+    start_block_id: str,
+    end_block_id: str,
+    alleged_start: int,
+    supplied: str,
+    prefix: str,
+    suffix: str,
+) -> tuple[int, int] | None:
+    """Correct only a unique, nearby, same-block range; never weaken validation."""
+    if start_block_id != end_block_id:
+        return None
+    block = block_map.get(start_block_id)
+    if not block:
+        return None
+    text = block["text"]
+    match = unique_normalized_span_v1(text, supplied, prefix, suffix)
+    if match is None:
+        return None
+    canonical_start, canonical_end = match
+    raw_start = canonical_offset_to_raw_v1(text, canonical_start)
+    raw_end = canonical_offset_to_raw_v1(text, canonical_end)
+    # A repair is for an offset slip, not a license to relocate across a block.
+    if abs(raw_start - alleged_start) > 32:
+        return None
+    actual = text[raw_start:raw_end]
+    if normalize_text_v1(actual) != normalize_text_v1(supplied):
+        return None
+    if prefix and not normalize_text_v1(text[:raw_start]).endswith(normalize_text_v1(prefix)):
+        return None
+    if suffix and not normalize_text_v1(text[raw_end:]).startswith(normalize_text_v1(suffix)):
+        return None
+    return raw_start, raw_end
 
 
 def _latest_sync_token(*collections: list[dict[str, Any]]) -> str:
@@ -652,7 +776,11 @@ def _annotation_anchor_matches(
 
 def _engine_trace_payload(book_id: UUID, row: dict[str, Any], record_type: str) -> dict[str, Any]:
     payload = _json_safe(row)
-    if row.get("engine_locator") or not row.get("start_block_id"):
+    locator = row.get("engine_locator")
+    if locator and int(locator.get("locator_integrity_version") or 0) != LOCATOR_INTEGRITY_VERSION:
+        payload["engine_locator"] = None
+        payload["engine_locator_status"] = "stale"
+    if not row.get("start_block_id"):
         return payload
     try:
         payload["locator_seed"] = legacy_locator_seed(book_id, row)

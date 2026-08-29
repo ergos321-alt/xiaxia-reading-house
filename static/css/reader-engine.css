@@ -91,6 +91,16 @@
   pointer-events: none;
 }
 
+.trace-record-choices {
+  display: grid;
+  gap: .65rem;
+  margin: .9rem 0 1.2rem;
+}
+
+.trace-record-choices[hidden] {
+  display: none !important;
+}
+
 .foliate-scroll-mode .page-turn { display: none !important; }
 
 @media (max-width: 620px) {
