@@ -419,7 +419,7 @@ def build_text_index(book_id: UUID) -> dict[str, Any]:
                         "insert into ai_reading_state (book_id) values (%s)",
                         (book_id,),
                     )
-                    ready = conn.execute(
+                    conn.execute(
                         """
                         update books
                         set chapter_count = %s, toc = %s,
@@ -464,7 +464,16 @@ def build_text_index(book_id: UUID) -> dict[str, Any]:
                 chapter_count=len(parsed.chapters),
                 block_count=block_count,
             )
-            return dict(ready)
+            if os.getenv("DUAL_ANCHOR_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+                try:
+                    from locator_bridge import persist_locator_bridge
+
+                    persist_locator_bridge(book_id, source_path=source_path)
+                except Exception:
+                    # Bridge readiness is a third independent fact. It must
+                    # never turn a committed text index back into a failure.
+                    logger.exception("locator bridge build deferred book_id=%s", book_id)
+            return _readiness_row(book_id)
     finally:
         gc.collect()
         _TEXT_INDEX_LOCK.release()
@@ -582,7 +591,9 @@ def _readiness_row(book_id: UUID) -> dict[str, Any]:
         """
         select id, title, publication_ready, reader_engine,
                text_index_status, text_index_failure_code,
-               text_index_updated_at, chapter_count
+               text_index_updated_at, chapter_count,
+               locator_bridge_status, locator_bridge_version,
+               locator_bridge_failure_code, locator_bridge_updated_at
         from books where id = %s
         """,
         (book_id,),

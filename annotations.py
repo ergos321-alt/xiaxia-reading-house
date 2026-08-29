@@ -6,12 +6,21 @@ import re
 from typing import Any
 from uuid import UUID
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
+from psycopg.types.json import Jsonb
 
 import database as db
 import operations
 from auth import action_required, api_or_session_required, web_api_required
 from reading import _chapter_blocks, _json_safe, _text_across_blocks, _uuid_or_none
+from locator_bridge import (
+    BRIDGE_VERSION,
+    LocatorBridgeError,
+    bridge_state,
+    legacy_locator_seed,
+    map_engine_selection,
+    validate_backfill_locator,
+)
 
 
 annotations_bp = Blueprint("annotations", __name__)
@@ -128,28 +137,52 @@ def list_book_annotations(book_id: UUID):
 def create_annotation():
     payload = request.get_json(silent=True) or {}
     book_id = _uuid_or_none(payload.get("book_id"))
-    chapter_id = _uuid_or_none(payload.get("chapter_id"))
-    selected_text = _clean_selected_text(payload.get("selected_text"), 20_000)
-    start_block_id = _clean_block_id(payload.get("start_block_id"))
-    end_block_id = _clean_block_id(payload.get("end_block_id"))
     comment = _clean_text(payload.get("comment"), 20_000, allow_empty=True)
-    prefix_text = _clean_text(payload.get("prefix_text"), 500, allow_empty=True)
-    suffix_text = _clean_text(payload.get("suffix_text"), 500, allow_empty=True)
-    try:
-        start_offset = int(payload.get("start_offset"))
-        end_offset = int(payload.get("end_offset"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "invalid_offsets"}), 400
-
-    if not all((book_id, chapter_id, selected_text, start_block_id, end_block_id)):
-        return jsonify({"error": "incomplete_annotation"}), 400
-    if start_offset < 0 or end_offset < 0:
-        return jsonify({"error": "invalid_offsets"}), 400
+    engine_locator = payload.get("engine_locator")
+    if engine_locator is not None:
+        if not current_app.config.get("DUAL_ANCHOR_ENABLED", False):
+            return jsonify({"error": "dual_anchor_disabled"}), 409
+        if not book_id or not isinstance(engine_locator, dict):
+            return jsonify({"error": "incomplete_annotation"}), 400
+        try:
+            mapped = map_engine_selection(book_id, engine_locator)
+        except LocatorBridgeError as exc:
+            return jsonify({"error": exc.code, "message": exc.message}), exc.status
+        chapter_id = mapped["chapter_id"]
+        selected_text = mapped["selected_text"]
+        start_block_id = mapped["start_block_id"]
+        start_offset = mapped["start_offset"]
+        end_block_id = mapped["end_block_id"]
+        end_offset = mapped["end_offset"]
+        prefix_text = mapped["prefix_text"]
+        suffix_text = mapped["suffix_text"]
+        engine_locator = mapped["engine_locator"]
+    else:
+        chapter_id = _uuid_or_none(payload.get("chapter_id"))
+        selected_text = _clean_selected_text(payload.get("selected_text"), 20_000)
+        start_block_id = _clean_block_id(payload.get("start_block_id"))
+        end_block_id = _clean_block_id(payload.get("end_block_id"))
+        prefix_text = _clean_text(payload.get("prefix_text"), 500, allow_empty=True)
+        suffix_text = _clean_text(payload.get("suffix_text"), 500, allow_empty=True)
+        try:
+            start_offset = int(payload.get("start_offset"))
+            end_offset = int(payload.get("end_offset"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid_offsets"}), 400
+        if not all((book_id, chapter_id, selected_text, start_block_id, end_block_id)):
+            return jsonify({"error": "incomplete_annotation"}), 400
+        if start_offset < 0 or end_offset < 0:
+            return jsonify({"error": "invalid_offsets"}), 400
     chapter = db.fetch_one(
-        "select id from chapters where id = %s and book_id = %s", (chapter_id, book_id)
+        "select id, content_html from chapters where id = %s and book_id = %s", (chapter_id, book_id)
     )
     if not chapter:
         return jsonify({"error": "chapter_not_found"}), 404
+    if not _annotation_anchor_matches(
+        chapter["content_html"], selected_text, start_block_id, start_offset,
+        end_block_id, end_offset,
+    ):
+        return jsonify({"error": "locator_mapping_validation_failed"}), 422
 
     with db.transaction() as conn:
         row = conn.execute(
@@ -157,13 +190,18 @@ def create_annotation():
             insert into annotations (
                 book_id, chapter_id, selected_text,
                 start_block_id, start_offset, end_block_id, end_offset,
-                prefix_text, suffix_text, comment, status
-            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
+                prefix_text, suffix_text, comment, status,
+                engine_locator, engine_locator_version, engine_anchor_verified_at
+            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending',
+                      %s, %s, case when %s is null then null else now() end)
             returning *
             """,
             (
                 book_id, chapter_id, selected_text, start_block_id, start_offset,
                 end_block_id, end_offset, prefix_text, suffix_text, comment,
+                Jsonb(engine_locator) if engine_locator else None,
+                BRIDGE_VERSION if engine_locator else None,
+                Jsonb(engine_locator) if engine_locator else None,
             ),
         ).fetchone()
         operations.record(
@@ -175,6 +213,73 @@ def create_annotation():
     result = _json_safe(row)
     result["xiaxia_response"] = None
     return jsonify({"annotation": result}), 201
+
+
+@annotations_bp.get("/api/books/<uuid:book_id>/engine-traces")
+@web_api_required
+def list_engine_traces(book_id: UUID):
+    annotations = db.fetch_all(
+        """
+        select a.*, ar.response as xiaxia_response, c.href as chapter_href
+        from annotations a
+        join chapters c on c.id = a.chapter_id
+        left join annotation_replies ar on ar.annotation_id = a.id
+        where a.book_id = %s order by a.created_at
+        """,
+        (book_id,),
+    )
+    thoughts = db.fetch_all(
+        """
+        select xt.*, tur.response as user_response, c.href as chapter_href
+        from xiaxia_thoughts xt
+        join chapters c on c.id = xt.chapter_id
+        left join thought_user_replies tur on tur.thought_id = xt.id
+        where xt.book_id = %s order by xt.created_at
+        """,
+        (book_id,),
+    )
+    if not annotations and not thoughts and not db.fetch_one("select id from books where id = %s", (book_id,)):
+        return jsonify({"error": "book_not_found"}), 404
+    return jsonify(
+        {
+            "locator_bridge": _json_safe(bridge_state(book_id) or {}),
+            "annotations": [_engine_trace_payload(book_id, row, "annotation") for row in annotations],
+            "xiaxia_thoughts": [_engine_trace_payload(book_id, row, "thought") for row in thoughts],
+        }
+    )
+
+
+@annotations_bp.put("/api/books/<uuid:book_id>/engine-traces/<record_type>/<uuid:record_id>/locator")
+@web_api_required
+def backfill_engine_trace(book_id: UUID, record_type: str, record_id: UUID):
+    if not current_app.config.get("DUAL_ANCHOR_ENABLED", False):
+        return jsonify({"error": "dual_anchor_disabled"}), 409
+    payload = request.get_json(silent=True) or {}
+    locator = payload.get("engine_locator")
+    table = {"annotation": "annotations", "thought": "xiaxia_thoughts"}.get(record_type)
+    if not table or not isinstance(locator, dict):
+        return jsonify({"error": "locator_backfill_failed"}), 400
+    with db.transaction() as conn:
+        record = conn.execute(
+            f"select * from {table} where id = %s and book_id = %s for update",
+            (record_id, book_id),
+        ).fetchone()
+        if not record:
+            return jsonify({"error": "reading_trace_not_found"}), 404
+        try:
+            sanitized = validate_backfill_locator(book_id, record, locator)
+        except LocatorBridgeError as exc:
+            return jsonify({"error": exc.code, "message": exc.message}), exc.status
+        row = conn.execute(
+            f"""
+            update {table} set engine_locator = %s,
+                engine_locator_version = %s,
+                engine_anchor_verified_at = now(), updated_at = now()
+            where id = %s returning *
+            """,
+            (Jsonb(sanitized), BRIDGE_VERSION, record_id),
+        ).fetchone()
+    return jsonify({"record": _json_safe(row)})
 
 
 @annotations_bp.patch("/api/annotations/<uuid:annotation_id>")
@@ -452,7 +557,7 @@ def create_xiaxia_thought():
             book_id=book_id, chapter_id=chapter_id,
             new_records=[operations.snapshot(row, "xiaxia_thought")],
         )
-    return jsonify({"xiaxia_thought": _json_safe(row)}), 201
+    return jsonify({"xiaxia_thought": _action_trace_payload(row)}), 201
 
 
 def _thought_anchor(scope: str, payload: dict[str, Any], content_html: str):
@@ -528,6 +633,40 @@ def _latest_sync_token(*collections: list[dict[str, Any]]) -> str:
                         value.isoformat() if hasattr(value, "isoformat") else str(value)
                     )
     return max(values, default="")
+
+
+def _annotation_anchor_matches(
+    content_html: str,
+    selected_text: str,
+    start_block_id: str,
+    start_offset: int,
+    end_block_id: str,
+    end_offset: int,
+) -> bool:
+    actual = _text_across_blocks(
+        _chapter_blocks(content_html), start_block_id, start_offset,
+        end_block_id, end_offset,
+    )
+    return bool(actual.strip()) and _normalize_text(actual) == _normalize_text(selected_text)
+
+
+def _engine_trace_payload(book_id: UUID, row: dict[str, Any], record_type: str) -> dict[str, Any]:
+    payload = _json_safe(row)
+    if row.get("engine_locator") or not row.get("start_block_id"):
+        return payload
+    try:
+        payload["locator_seed"] = legacy_locator_seed(book_id, row)
+    except LocatorBridgeError as exc:
+        payload["locator_seed_error"] = exc.code
+    return payload
+
+
+def _action_trace_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Keep renderer-only fields out of the unchanged Custom GPT contract."""
+    payload = _json_safe(row)
+    for field in ("engine_locator", "engine_locator_version", "engine_anchor_verified_at"):
+        payload.pop(field, None)
+    return payload
 
 
 def _clean_text(value: Any, max_length: int, allow_empty: bool = False) -> str:

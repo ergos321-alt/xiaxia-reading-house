@@ -38,7 +38,9 @@ BOOK_FIELDS = """
     b.cover_asset_path, b.chapter_count, b.toc,
     b.publication_ready, b.reader_engine, b.text_index_status,
     b.text_index_failure_code, b.publication_validated_at,
-    b.text_index_updated_at, b.created_at, b.updated_at
+    b.text_index_updated_at, b.locator_bridge_status,
+    b.locator_bridge_version, b.locator_bridge_failure_code,
+    b.locator_bridge_updated_at, b.created_at, b.updated_at
 """
 
 ACTION_CHUNK_TARGET_CHARS = 6000
@@ -566,8 +568,8 @@ def get_book(book_id: UUID):
 def get_publication_source_access(book_id: UUID):
     book = db.fetch_one(
         """
-        select id, title, format, source_filename, source_object_path,
-               publication_ready
+        select id, title, format, source_filename, source_sha256,
+               source_object_path, publication_ready
         from books where id = %s
         """,
         (book_id,),
@@ -604,6 +606,7 @@ def get_publication_source_access(book_id: UUID):
                 "id": str(book["id"]),
                 "title": book["title"],
                 "filename": book["source_filename"],
+                "source_sha256": book.get("source_sha256") or "",
             },
             "signed_url": signed_url,
             "expires_in": ttl,
@@ -656,6 +659,23 @@ def retry_text_index(book_id: UUID):
     )
 
 
+@reading_bp.post("/api/books/<uuid:book_id>/locator-bridge")
+@web_api_required
+def rebuild_locator_bridge(book_id: UUID):
+    if not current_app.config.get("DUAL_ANCHOR_ENABLED", False):
+        return jsonify({"error": "dual_anchor_disabled"}), 409
+    from locator_bridge import LocatorBridgeError, persist_locator_bridge
+
+    try:
+        payload = request.get_json(silent=True) or {}
+        bridge = persist_locator_bridge(
+            book_id, promote_legacy=bool(payload.get("promote_legacy", False))
+        )
+    except LocatorBridgeError as exc:
+        return jsonify({"error": exc.code, "message": exc.message}), exc.status
+    return jsonify({"locator_bridge": _json_safe(bridge)})
+
+
 @reading_bp.put("/api/books/<uuid:book_id>/publication-progress")
 @web_api_required
 def save_publication_progress(book_id: UUID):
@@ -668,7 +688,7 @@ def save_publication_progress(book_id: UUID):
     if not isinstance(locator, dict):
         return jsonify({"error": "invalid_publication_locator"}), 400
     book = db.fetch_one(
-        "select id from books where id = %s and publication_ready = true",
+        "select id, source_sha256, locator_bridge_version from books where id = %s and publication_ready = true",
         (book_id,),
     )
     if not book:
@@ -679,6 +699,13 @@ def save_publication_progress(book_id: UUID):
         "cfi": str(locator.get("cfi") or "")[:8192],
         "progression": progression,
     }
+    supplied_hash = str(locator.get("source_sha256") or "")
+    if supplied_hash and supplied_hash != book["source_sha256"]:
+        return jsonify({"error": "locator_source_mismatch"}), 409
+    if supplied_hash:
+        sanitized["source_sha256"] = supplied_hash
+        sanitized["engine_adapter_version"] = 1
+        sanitized["bridge_version"] = int(locator.get("bridge_version") or book.get("locator_bridge_version") or 1)
     if locator.get("section_index") is not None:
         try:
             sanitized["section_index"] = max(0, int(locator["section_index"]))
@@ -771,7 +798,7 @@ def update_book(book_id: UUID):
 def delete_book(book_id: UUID):
     """Delete one private book after removing every persisted Storage object."""
     book = db.fetch_one(
-        "select id, title, source_object_path from books where id = %s", (book_id,)
+        "select id, title, source_object_path, locator_bridge_object_path from books where id = %s", (book_id,)
     )
     if not book:
         return jsonify({"error": "book_not_found"}), 404
@@ -783,6 +810,7 @@ def delete_book(book_id: UUID):
         path
         for path in (
             [book.get("source_object_path")]
+            + [book.get("locator_bridge_object_path")]
             + [row["object_path"] for row in assets]
         )
         if path
@@ -1735,6 +1763,10 @@ def _serialize_book(row: dict[str, Any]) -> dict[str, Any]:
         "text_index_failure_code",
         "publication_validated_at",
         "text_index_updated_at",
+        "locator_bridge_status",
+        "locator_bridge_version",
+        "locator_bridge_failure_code",
+        "locator_bridge_updated_at",
         "created_at",
         "updated_at",
         "progress_chapter_id",

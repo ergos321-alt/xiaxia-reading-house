@@ -4,6 +4,8 @@ import {
     createSecurePublication,
     downloadAsFile,
 } from './foliate-poc-adapter.js'
+import { Overlayer } from '../vendor/foliate-js/overlayer.js'
+import { rangeFromCanonicalOffsets, selectionContext } from './canonical-text.js'
 
 /** Stable Reading House boundary around the pinned foliate-js internals. */
 export class FoliateReaderAdapter {
@@ -17,8 +19,10 @@ export class FoliateReaderAdapter {
             relocate: new Set(),
             link: new Set(),
             selection: new Set(),
+            annotation: new Set(),
             error: new Set(),
         }
+        this.decorations = new Map()
     }
 
     static async downloadPublication(url, filename, signal) {
@@ -55,6 +59,7 @@ export class FoliateReaderAdapter {
         if (this.view) closeSecurePublication(this.view)
         this.view = null
         this.book = null
+        this.decorations.clear()
         this.host.replaceChildren()
     }
 
@@ -88,7 +93,7 @@ export class FoliateReaderAdapter {
     }
 
     getCurrentLocator(detail = this.view?.lastLocation || {}) {
-        const sectionIndex = Number(detail.section ?? detail.index ?? 0)
+        const sectionIndex = Number(detail.section?.current ?? detail.section ?? detail.index ?? 0)
         const section = this.book?.sections?.[sectionIndex]
         const progression = Math.max(
             0,
@@ -110,7 +115,66 @@ export class FoliateReaderAdapter {
     onRelocate(callback) { return this.#subscribe('relocate', callback) }
     onLink(callback) { return this.#subscribe('link', callback) }
     onSelection(callback) { return this.#subscribe('selection', callback) }
+    onAnnotation(callback) { return this.#subscribe('annotation', callback) }
     onError(callback) { return this.#subscribe('error', callback) }
+
+    async addDecoration(record) {
+        const cfi = record?.engine_locator?.cfi
+        if (!cfi || !record?.id || !this.view) return false
+        this.decorations.set(String(record.id), {
+            id: String(record.id),
+            value: cfi,
+            kind: record.kind === 'xiaxia' ? 'xiaxia' : 'user',
+        })
+        await this.#drawValue(cfi)
+        return true
+    }
+
+    async removeDecoration(recordId) {
+        const old = this.decorations.get(String(recordId))
+        if (!old || !this.view) return
+        this.decorations.delete(String(recordId))
+        await this.view.deleteAnnotation({ value: old.value })
+        if ([...this.decorations.values()].some(item => item.value === old.value)) {
+            await this.#drawValue(old.value)
+        }
+    }
+
+    async locatorFromSeed(seed) {
+        if (!this.view || !seed?.href) throw new Error('locator_mapping_missing')
+        await this.goTo(seed.href)
+        const content = this.view.renderer?.getContents?.().find(item =>
+            item.index === Number(seed.spine_index))
+            || this.view.renderer?.getContents?.()[0]
+        if (!content?.doc) throw new Error('locator_mapping_missing')
+        const range = rangeFromCanonicalOffsets(
+            content.doc, seed.original_start, seed.original_end)
+        return {
+            ...seed,
+            cfi: this.view.getCFI(content.index, range),
+            section_index: content.index,
+            progression: this.getCurrentLocator().progression,
+        }
+    }
+
+    clearBrowserSelection() {
+        for (const content of this.view?.renderer?.getContents?.() || []) {
+            content.doc?.defaultView?.getSelection?.()?.removeAllRanges?.()
+        }
+        globalThis.getSelection?.()?.removeAllRanges?.()
+    }
+
+    async #drawValue(value) {
+        const records = [...this.decorations.values()].filter(item => item.value === value)
+        const kinds = new Set(records.map(item => item.kind))
+        const kind = kinds.size > 1 ? 'shared' : records[0]?.kind || 'user'
+        await this.view.addAnnotation({
+            value,
+            kind,
+            recordIds: records.map(item => item.id),
+            color: kind === 'xiaxia' ? '#6f8795' : kind === 'shared' ? '#776b7b' : '#8b5c45',
+        })
+    }
 
     #subscribe(name, callback) {
         this.listeners[name].add(callback)
@@ -144,6 +208,26 @@ export class FoliateReaderAdapter {
     }
 
     #bindEvents() {
+        this.view.addEventListener('draw-annotation', event => {
+            const { annotation, draw } = event.detail
+            const drawFunction = annotation.kind === 'xiaxia'
+                ? Overlayer.underline
+                : annotation.kind === 'shared' ? Overlayer.outline : Overlayer.highlight
+            draw(drawFunction, {
+                color: annotation.color,
+                width: annotation.kind === 'xiaxia' ? 2 : 3,
+                radius: 2,
+            })
+        })
+        this.view.addEventListener('show-annotation', event => {
+            const records = [...this.decorations.values()]
+                .filter(item => item.value === event.detail.value)
+            this.#emit('annotation', { ...event.detail, records })
+        })
+        this.view.addEventListener('create-overlay', () => {
+            const values = new Set([...this.decorations.values()].map(item => item.value))
+            values.forEach(value => this.#drawValue(value))
+        })
         this.view.addEventListener('relocate', event => {
             this.#emit('relocate', this.getCurrentLocator(event.detail || {}))
         })
@@ -153,13 +237,16 @@ export class FoliateReaderAdapter {
                 const selection = doc.defaultView?.getSelection()
                 if (!selection || selection.isCollapsed || !selection.rangeCount) return
                 const range = selection.getRangeAt(0)
-                const quote = selection.toString().trim()
+                const text = selectionContext(doc, range)
+                const quote = text.highlight
                 if (!quote) return
                 this.#emit('selection', {
                     quote,
+                    text,
                     cfi: this.view.getCFI(index, range),
                     href: this.book.sections[index]?.id || '',
                     section_index: index,
+                    progression: this.getCurrentLocator().progression,
                 })
             }
             doc.addEventListener('pointerup', capture)

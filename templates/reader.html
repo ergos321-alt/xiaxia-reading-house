@@ -12,6 +12,7 @@
       data-book-id="{{ book_id }}"
       data-reader-engine="pending"
       data-reader-engine-enabled="{{ 'true' if reader_engine_enabled else 'false' }}"
+      data-dual-anchor-enabled="{{ 'true' if dual_anchor_enabled else 'false' }}"
       data-text-index-ready="false">
   <header class="reader-toolbar">
     <a class="icon-button reader-back" href="{{ url_for('library_page') }}" aria-label="返回书架">←</a>

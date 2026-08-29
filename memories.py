@@ -98,15 +98,35 @@ def complete_book_for_user(book_id: UUID):
         progress = conn.execute(
             """
             select rp.chapter_id, rp.chapter_index, rp.percentage, rp.updated_at,
-                   b.chapter_count
+                   b.chapter_count, b.reader_engine, b.source_sha256,
+                   ppr.progression as publication_progression,
+                   ppr.locator as publication_locator
             from reading_progress rp
             join books b on b.id = rp.book_id
+            left join publication_reading_progress ppr on ppr.book_id = b.id
             where rp.book_id = %s
             for update of rp
             """,
             (book_id,),
         ).fetchone()
-        if not progress:
+        legacy_at_end = False
+        final_index = 0
+        if progress:
+            final_index = max(0, int(progress["chapter_count"]) - 1)
+            legacy_at_end = (
+                int(progress["chapter_index"]) == final_index
+                and float(progress["percentage"]) >= 99.5
+            )
+        publication = None
+        if progress and progress.get("reader_engine") == "foliate":
+            publication = {
+                "id": book_id,
+                "reader_engine": progress.get("reader_engine"),
+                "source_sha256": progress.get("source_sha256"),
+                "progression": progress.get("publication_progression"),
+                "locator": progress.get("publication_locator"),
+            }
+        if not progress and not publication:
             if not conn.execute("select id from books where id = %s", (book_id,)).fetchone():
                 return jsonify({"error": "book_not_found", "message": "没有找到这本书。"}), 404
             return (
@@ -118,18 +138,24 @@ def complete_book_for_user(book_id: UUID):
                 ),
                 409,
             )
-        final_index = max(0, int(progress["chapter_count"]) - 1)
-        if (
-            int(progress["chapter_index"]) != final_index
-            or float(progress["percentage"]) < 99.5
-        ):
+        locator = publication.get("locator") if publication else None
+        foliate_at_end = bool(
+            publication
+            and publication.get("reader_engine") == "foliate"
+            and publication.get("progression") is not None
+            and float(publication["progression"]) >= 0.995
+            and isinstance(locator, dict)
+            and locator.get("source_sha256") == publication.get("source_sha256")
+            and str(locator.get("cfi") or "").startswith("epubcfi(")
+        )
+        if not legacy_at_end and not foliate_at_end:
             return (
                 jsonify(
                     {
                         "error": "book_not_at_end",
                         "message": "尚未读到最后一章末尾。",
                         "required_chapter_index": final_index,
-                        "current_percentage": float(progress["percentage"]),
+                        "current_percentage": float(progress["percentage"]) if progress else float(publication.get("progression") or 0) * 100,
                     }
                 ),
                 409,

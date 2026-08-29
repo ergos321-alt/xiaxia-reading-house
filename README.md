@@ -4,6 +4,8 @@
 
 V2 以已验收的 V1.1 为唯一基础，保留章节/block、批注、Reply、Undo、进度与现有 Action 契约；在书籍读完以后增加私人记忆层。当前可靠性返修只加强“不同 EPUB → 既有 normalized chapter/block 模型”的入口，不改变稳定锚点或历史阅读数据。
 
+Phase 3 在固定版 foliate-js 上增加版本化 Locator Bridge 和 dual anchor。部署前执行 `migrations/007_reader_engine_dual_anchor.sql`；`DUAL_ANCHOR_ENABLED=false` 为默认安全状态，关闭时 foliate 仍可只读。详细架构、部署与实机验收边界见 `PHASE3_DUAL_ANCHOR_REPORT.md` 和 `PHASE3_TEST_MATRIX.md`。
+
 ## 项目目录
 
 ```text

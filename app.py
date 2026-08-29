@@ -56,6 +56,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         SESSION_COOKIE_SECURE=_env_bool("COOKIE_SECURE", True),
         READER_ENGINE_POC_ENABLED=_env_bool("READER_ENGINE_POC_ENABLED", False),
         READER_ENGINE_ENABLED=_env_bool("READER_ENGINE_ENABLED", False),
+        DUAL_ANCHOR_ENABLED=_env_bool("DUAL_ANCHOR_ENABLED", False),
         READER_SOURCE_SIGNED_URL_TTL=int(
             os.getenv(
                 "READER_SOURCE_SIGNED_URL_TTL",
@@ -147,6 +148,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 "reader.html",
                 book_id=str(book_id),
                 reader_engine_enabled=app.config["READER_ENGINE_ENABLED"],
+                dual_anchor_enabled=app.config["DUAL_ANCHOR_ENABLED"],
             )
         )
         supabase = urlsplit(app.config.get("SUPABASE_URL", ""))

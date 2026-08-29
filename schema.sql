@@ -52,6 +52,13 @@ create table if not exists books (
     text_index_failure_detail text,
     publication_validated_at timestamptz,
     text_index_updated_at timestamptz not null default now(),
+    locator_bridge_status text not null default 'pending'
+        check (locator_bridge_status in ('pending', 'building', 'ready', 'failed')),
+    locator_bridge_version integer check (locator_bridge_version is null or locator_bridge_version > 0),
+    locator_bridge_object_path text,
+    locator_bridge_sha256 char(64),
+    locator_bridge_failure_code text,
+    locator_bridge_updated_at timestamptz,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -118,6 +125,9 @@ create table if not exists annotations (
     owner text not null default 'user' check (owner = 'user'),
     content_type text not null default 'user_annotation'
         check (content_type = 'user_annotation'),
+    engine_locator jsonb,
+    engine_locator_version integer check (engine_locator_version is null or engine_locator_version > 0),
+    engine_anchor_verified_at timestamptz,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -154,6 +164,9 @@ create table if not exists xiaxia_thoughts (
     owner text not null default 'xiaxia' check (owner = 'xiaxia'),
     content_type text not null default 'xiaxia_thought'
         check (content_type = 'xiaxia_thought'),
+    engine_locator jsonb,
+    engine_locator_version integer check (engine_locator_version is null or engine_locator_version > 0),
+    engine_anchor_verified_at timestamptz,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     check (
@@ -301,6 +314,12 @@ create index if not exists idx_xiaxia_thoughts_chapter_created
     on xiaxia_thoughts (chapter_id, created_at);
 create index if not exists idx_xiaxia_thoughts_book_created
     on xiaxia_thoughts (book_id, created_at);
+create index if not exists idx_books_locator_bridge_state
+    on books (locator_bridge_status, locator_bridge_updated_at desc);
+create index if not exists idx_annotations_engine_locator
+    on annotations (book_id, engine_locator_version) where engine_locator is not null;
+create index if not exists idx_thoughts_engine_locator
+    on xiaxia_thoughts (book_id, engine_locator_version) where engine_locator is not null;
 create index if not exists idx_thought_user_replies_thought
     on thought_user_replies (thought_id);
 create index if not exists idx_thought_candidates_batch

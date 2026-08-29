@@ -26,8 +26,36 @@
 
 .foliate-reader-page .chapter-thoughts,
 .foliate-reader-page .finish-book-entry,
-.foliate-reader-page .selection-menu {
+.foliate-reader-page:not(.foliate-dual-anchor) .selection-menu {
   display: none !important;
+}
+
+.foliate-reader-page.foliate-dual-anchor .selection-menu:not([hidden]) {
+  position: fixed;
+  z-index: 80;
+  top: auto !important;
+  right: auto;
+  bottom: calc(4.4rem + env(safe-area-inset-bottom));
+  left: 50% !important;
+  display: flex !important;
+  transform: translateX(-50%) rotate(-.25deg) !important;
+}
+
+.foliate-reader-page.foliate-dual-anchor .chapter-thoughts:not([hidden]) {
+  position: fixed;
+  z-index: 30;
+  top: 26%;
+  right: .55rem;
+  display: block;
+  width: min(15rem, 42vw);
+}
+
+.foliate-reader-page.foliate-dual-anchor .finish-book-entry:not([hidden]) {
+  position: fixed;
+  z-index: 35;
+  right: 1.2rem;
+  bottom: calc(4.5rem + env(safe-area-inset-bottom));
+  display: block;
 }
 
 .foliate-reader-page .chapter-navigation {

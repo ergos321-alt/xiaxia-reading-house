@@ -15,6 +15,7 @@ from annotations import (
     XIA_THOUGHT_FIELDS,
     _clean_mark_type,
     _clean_text,
+    _action_trace_payload,
     _thought_anchor,
 )
 from auth import action_required, web_api_required
@@ -133,6 +134,9 @@ def update_xiaxia_thought(thought_id: UUID):
                 scope = %s, mark_type = %s, content = %s, selected_text = %s,
                 start_block_id = %s, start_offset = %s, end_block_id = %s,
                 end_offset = %s, prefix_text = %s, suffix_text = %s,
+                engine_locator = case when %s then null else engine_locator end,
+                engine_locator_version = case when %s then null else engine_locator_version end,
+                engine_anchor_verified_at = case when %s then null else engine_anchor_verified_at end,
                 updated_at = now()
             where id = %s
             returning *
@@ -141,7 +145,11 @@ def update_xiaxia_thought(thought_id: UUID):
                 scope, mark_type, content, anchor["selected_text"],
                 anchor["start_block_id"], anchor["start_offset"],
                 anchor["end_block_id"], anchor["end_offset"],
-                anchor["prefix_text"], anchor["suffix_text"], thought_id,
+                anchor["prefix_text"], anchor["suffix_text"],
+                bool(anchor_fields.intersection(payload)),
+                bool(anchor_fields.intersection(payload)),
+                bool(anchor_fields.intersection(payload)),
+                thought_id,
             ),
         ).fetchone()
         operations.record(
@@ -155,7 +163,7 @@ def update_xiaxia_thought(thought_id: UUID):
             previous_records=[operations.snapshot(existing, "xiaxia_thought")],
             new_records=[operations.snapshot(updated, "xiaxia_thought")],
         )
-    return jsonify({"xiaxia_thought": _json_safe(updated)})
+    return jsonify({"xiaxia_thought": _action_trace_payload(updated)})
 
 
 @management_bp.delete("/api/xiaxia/thoughts/<uuid:thought_id>")

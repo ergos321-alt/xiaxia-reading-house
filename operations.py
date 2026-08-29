@@ -22,6 +22,7 @@ RECORD_META: dict[str, dict[str, Any]] = {
             "id", "book_id", "chapter_id", "selected_text", "start_block_id",
             "start_offset", "end_block_id", "end_offset", "prefix_text",
             "suffix_text", "comment", "status", "owner", "content_type",
+            "engine_locator", "engine_locator_version", "engine_anchor_verified_at",
             "created_at", "updated_at",
         ),
     },
@@ -38,6 +39,7 @@ RECORD_META: dict[str, dict[str, Any]] = {
             "id", "book_id", "chapter_id", "scope", "mark_type", "content",
             "selected_text", "start_block_id", "start_offset", "end_block_id",
             "end_offset", "prefix_text", "suffix_text", "owner", "content_type",
+            "engine_locator", "engine_locator_version", "engine_anchor_verified_at",
             "created_at", "updated_at",
         ),
     },
@@ -194,7 +196,7 @@ def _restore_insert(conn: Any, item: dict[str, Any]) -> None:
     placeholders = ", ".join(["%s"] * len(columns))
     conn.execute(
         f"insert into {meta['table']} ({', '.join(columns)}) values ({placeholders})",
-        tuple(item[column] for column in columns),
+        tuple(_restore_value(column, item[column]) for column in columns),
     )
 
 
@@ -208,8 +210,12 @@ def _restore_update(conn: Any, item: dict[str, Any]) -> None:
     assignments = ", ".join(f"{column} = %s" for column in columns)
     conn.execute(
         f"update {meta['table']} set {assignments}, updated_at = now() where id = %s",
-        tuple(item[column] for column in columns) + (item["id"],),
+        tuple(_restore_value(column, item[column]) for column in columns) + (item["id"],),
     )
+
+
+def _restore_value(column: str, value: Any) -> Any:
+    return Jsonb(value) if column == "engine_locator" and value is not None else value
 
 
 def _after_delete(conn: Any, item: dict[str, Any]) -> None:

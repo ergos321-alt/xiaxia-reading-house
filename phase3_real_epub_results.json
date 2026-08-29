@@ -1,0 +1,50 @@
+{
+  "results": [
+    {
+      "file": "卡瓦菲斯诗集(重庆大学出版社2014)＋当你起航前往伊萨卡(上海人民出版社2021) (C. P. 卡瓦菲斯 著 黄灿然 译) (z-library.sk, 1lib.sk, z-lib.sk).epub",
+      "size_bytes": 712008,
+      "epub_version": "2.0",
+      "chapters": 323,
+      "bridge_chapters": 323,
+      "blocks_sampled": 200,
+      "legacy_roundtrip_exact": 200,
+      "publisher_quote_unique": 199,
+      "ambiguous_without_context": 0,
+      "failures": [],
+      "bridge_bytes": 3865181,
+      "duration_ms": 6686.2,
+      "result": "PASS"
+    },
+    {
+      "file": "唐诗选注 (葛兆光) (z-library.sk, 1lib.sk, z-lib.sk).epub",
+      "size_bytes": 4306793,
+      "epub_version": "2.0",
+      "chapters": 85,
+      "bridge_chapters": 85,
+      "blocks_sampled": 200,
+      "legacy_roundtrip_exact": 200,
+      "publisher_quote_unique": 199,
+      "ambiguous_without_context": 0,
+      "failures": [],
+      "bridge_bytes": 2436355,
+      "duration_ms": 1659.83,
+      "result": "PASS"
+    },
+    {
+      "file": "唐诗选（全二册） (中国社会科学院文学研究所) (z-library.sk, 1lib.sk, z-lib.sk).epub",
+      "size_bytes": 927996,
+      "epub_version": "3.0",
+      "chapters": 71,
+      "bridge_chapters": 71,
+      "blocks_sampled": 200,
+      "legacy_roundtrip_exact": 200,
+      "publisher_quote_unique": 200,
+      "ambiguous_without_context": 0,
+      "failures": [],
+      "bridge_bytes": 1258795,
+      "duration_ms": 3914.58,
+      "result": "PASS"
+    }
+  ],
+  "passed": 3
+}

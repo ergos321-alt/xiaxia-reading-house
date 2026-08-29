@@ -606,8 +606,10 @@ def test_phase2_migration_and_reader_gate_are_additive():
     assert "publication_reading_progress" in migration
     assert "delete from books" not in migration.lower()
     assert "query.get('engine') !== 'legacy'" in loader
-    assert "/annotations" not in foliate
-    assert "/thoughts" not in foliate
+    assert "DUAL_ANCHOR_ENABLED" in (root / ".env.example").read_text()
+    assert "/api/annotations" in foliate
+    assert "engine_locator" in foliate
+    assert "/thoughts/" in foliate
     assert "publication-progress" in foliate
 
 
