@@ -5,11 +5,12 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 UTILS = ROOT / "static/js/reader-utils.js"
 READER = ROOT / "static/js/reader.js"
 LIBRARY = ROOT / "static/js/library.js"
+FOLIATE_READER = ROOT / "static/js/foliate-reader.js"
+FOLIATE_ADAPTER = ROOT / "static/js/foliate-reader-adapter.js"
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
@@ -145,3 +146,38 @@ def test_library_distinguishes_killed_worker_from_json_storage_failure():
     assert 'error: "epub_import_timeout"' in source
     assert "const diagnostic = data.error" in source
     assert 'url === "/api/books" && options.method === "POST"' in source
+
+
+def test_foliate_mobile_selection_uses_stable_snapshot_and_blocks_paginator_only():
+    reader = FOLIATE_READER.read_text(encoding="utf-8")
+    adapter = FOLIATE_ADAPTER.read_text(encoding="utf-8")
+
+    assert "pendingSelectionSnapshot = structuredClone(savedSelection)" in reader
+    assert "saveAnnotation(noteText.value.trim(), pendingSelectionSnapshot)" in reader
+    assert "adapter.clearBrowserSelection()" in reader
+    assert "noteDialog.open" in reader
+    assert "save_post_started" in reader
+    assert "save_persisted" in reader
+    assert "decoration_deferred" in reader
+
+    assert "selectionchange', selectionChanged, { capture: true }" in adapter
+    assert "touchmove', blockPaginatorTouchMove, { capture: true, passive: true }" in adapter
+    assert "event.stopImmediatePropagation()" in adapter
+    assert "Do not preventDefault()" in adapter
+    assert "selection_page_moved" in adapter
+    assert "start_section_index" in adapter and "end_section_index" in adapter
+    assert "selection.type !== 'Range'" in adapter
+    assert "range.startContainer?.ownerDocument" in adapter
+    assert "range.endContainer?.ownerDocument" in adapter
+
+
+def test_foliate_diagnostics_are_opt_in_and_rebuild_only_renderer_locators():
+    reader = FOLIATE_READER.read_text(encoding="utf-8")
+    style = (ROOT / "static/css/reader-engine.css").read_text(encoding="utf-8")
+
+    assert "selection_debug') === '1'" in reader
+    assert "Selection diagnostics" in reader
+    assert "复制诊断 JSON" in reader
+    assert "rebuild_all: true" in reader
+    assert "__readingHouseSelectionDebug" in reader
+    assert ".selection-diagnostics" in style

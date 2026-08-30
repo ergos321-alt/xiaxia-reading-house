@@ -481,6 +481,34 @@ annotation、Thought、Reply 与 shared-stop anchor 不会删除或改写。
 不会再回退到当前 `getContents()[0]`。本 hotfix 不需要新 migration 或环境变量。
 详见 `PHASE3_LOCATOR_INTEGRITY_HOTFIX_REPORT.md`。
 
+## Phase 3 Production Stabilization
+
+本轮把 foliate 分页 Selection、modal snapshot、annotation 持久化与 decoration restore
+收口为明确状态机。Android 原生 handles 仍可使用；选区活动期间 Reading House adapter
+只阻止 paginator 继续消费 selection touch/selectionchange，不阻止浏览器默认 selection。
+若选区期间 section/page 仍发生 relocate，系统会 fail closed 并恢复原页，不会提交扩张
+后的 Range。
+
+“写在书页旁”打开前会冻结不可变 selection snapshot，textarea、软键盘和 viewport resize
+不再改变保存 anchor。annotation POST 成功与即时 decoration 绘制已分离：数据库成功就是
+保存成功；当前 section 暂不可绘制时由 trace reload/lazy restore 补画，不再误报“保存
+失败”。Xiaxia legacy anchor 只允许在声明 block span 内做唯一、近距离、context 一致的
+安全纠偏。
+
+临时移动端诊断入口：
+
+```text
+/reader/{book_id}?selection_debug=1
+```
+
+面板可复制选区状态、href、section、CFI 指纹、page-before/after 和 save stage，也可对
+当前书执行 renderer locator 重验。重验只清 engine locator，保留所有 legacy anchor 与
+共读数据。无需新 migration、环境变量、Node runtime、Render command 或 Supabase 改动。
+
+部署与验收边界见 `PHASE3_PRODUCTION_STABILIZATION_REPORT.md`、
+`PHASE3_STATEFUL_E2E_MATRIX.md` 和 `PHASE3_DEVICE_VALIDATION_CHECKLIST.md`。在 Android
+Chrome 与 iPad Safari 真机完成清单前，状态为 `PENDING USER DEVICE VALIDATION`。
+
 ## V1 边界
 
 没有增加 PDF、Kindle、用户注册、公共书库、社交、全文搜索、标签、统计 Dashboard、语音朗读、推荐算法、AI 自动总结、服务器人格生成、AI 后台自主阅读、多 AI 角色、复杂主题或多色管理。DRM EPUB 不处理。

@@ -15,7 +15,6 @@ import annotations
 import locator_bridge as bridge
 from app import create_app
 
-
 BOOK_ID = UUID("11111111-1111-4111-8111-111111111111")
 CHAPTER_ID = UUID("22222222-2222-4222-8222-222222222222")
 SOURCE_HASH = "a" * 64
@@ -49,7 +48,8 @@ def make_browser_epub(path: Path) -> None:
         archive.writestr(
             "OEBPS/Text/chapter.xhtml",
             """<html xmlns='http://www.w3.org/1999/xhtml'><head><title>A</title></head><body>
-            <p>此时相望不相闻，愿逐月华流照君</p><p>后来选择的那一句话</p></body></html>""",
+            <p>此时相望不相闻，愿逐月华流照君</p><p>后来选择的那一句话</p>
+            <p>在河之洲<br/>窈窕淑女<br/>君子好逑<br/>参差荇菜<br/>左右流之</p></body></html>""",
         )
         archive.writestr(
             "OEBPS/Text/other.xhtml",
@@ -222,20 +222,72 @@ def test_xiaxia_thought_offset_slip_is_corrected_only_when_unique_and_nearby():
         }, duplicate)
 
 
+def test_xiaxia_thought_correction_runs_before_empty_out_of_bounds_rejection():
+    text = "甲此时相望不相闻，愿逐月华流照君乙"
+    content = f'<p data-block-id="b000001">{text}</p>'
+    anchor = annotations._thought_anchor("range", {
+        "start_block_id": "b000001",
+        "end_block_id": "b000001",
+        "start_offset": 0,
+        # One-past-the-block made _text_across_blocks() empty before this hotfix.
+        "end_offset": len(text) + 1,
+        "selected_text": "此时相望不相闻，愿逐月华流照君",
+        "prefix_text": "甲",
+        "suffix_text": "乙",
+    }, content)
+    assert anchor["start_offset"] == 1
+    assert anchor["end_offset"] == len(text) - 1
+    assert anchor["selected_text"] == "此时相望不相闻，愿逐月华流照君"
+
+    footnoted = (
+        '<p data-block-id="b000001">甲此时相望不相闻，愿逐月华流照君\n\t[12]。乙</p>'
+    )
+    footnote_anchor = annotations._thought_anchor("range", {
+        "start_block_id": "b000001", "end_block_id": "b000001",
+        "start_offset": 0, "end_offset": 18,
+        "selected_text": "此时相望不相闻，愿逐月华流照君",
+        "prefix_text": "甲", "suffix_text": "\n\t[12]。乙",
+    }, footnoted)
+    assert footnote_anchor["start_offset"] == 1
+    assert footnote_anchor["selected_text"] == "此时相望不相闻，愿逐月华流照君"
+
+
+def test_xiaxia_thought_cross_block_offset_correction_is_bounded_and_exact():
+    content = (
+        '<p data-block-id="b000001">甲君子</p>'
+        '<p data-block-id="b000002">好逑乙</p>'
+    )
+    anchor = annotations._thought_anchor("range", {
+        "start_block_id": "b000001", "end_block_id": "b000002",
+        "start_offset": 0, "end_offset": 3,
+        "selected_text": "君子 好逑", "prefix_text": "甲", "suffix_text": "乙",
+    }, content)
+    assert anchor["start_offset"] == 1
+    assert anchor["end_offset"] == 2
+    assert bridge.normalize_text_v1(anchor["selected_text"]) == "君子 好逑"
+
+    with pytest.raises(ValueError):
+        annotations._thought_anchor("range", {
+            "start_block_id": "b000001", "end_block_id": "b000002",
+            "start_offset": 100, "end_offset": 100,
+            "selected_text": "君子 好逑", "prefix_text": "甲", "suffix_text": "乙",
+        }, content)
+
+
 def test_live_chromium_locator_identity_and_truth(tmp_path):
     epub = tmp_path / "browser.epub"
     make_browser_epub(epub)
     root = Path(__file__).resolve().parents[1]
     probe = subprocess.run(
         ["node", "-e", "process.stdout.write(require('playwright').chromium.executablePath())"],
-        cwd=root, capture_output=True, text=True,
+        cwd=root, capture_output=True, text=True, check=False,
     )
     if probe.returncode != 0 or not Path(probe.stdout).is_file():
         pytest.skip("Playwright Chromium binary is not installed")
     env = {**os.environ, "PHASE3_BROWSER_EPUB": str(epub)}
     result = subprocess.run(
         ["node", "tests/phase3_locator_integrity_browser.mjs"],
-        cwd=root, env=env, capture_output=True, text=True, timeout=90,
+        cwd=root, env=env, capture_output=True, text=True, timeout=90, check=False,
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
@@ -249,6 +301,42 @@ def test_live_chromium_locator_identity_and_truth(tmp_path):
     assert payload["keys"] == ["annotation:B", "annotation:C", "thought:A"]
     assert payload["wrongTextError"] == "locator_mapping_validation_failed"
     assert payload["wrongSectionError"] == "locator_mapping_missing"
+
+
+def test_live_mobile_stateful_selection_save_restore_and_identity(tmp_path):
+    epub = tmp_path / "stateful-browser.epub"
+    make_browser_epub(epub)
+    root = Path(__file__).resolve().parents[1]
+    probe = subprocess.run(
+        ["node", "-e", "process.stdout.write(require('playwright').chromium.executablePath())"],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    if probe.returncode != 0 or not Path(probe.stdout).is_file():
+        pytest.skip("Playwright Chromium binary is not installed")
+    env = {**os.environ, "PHASE3_BROWSER_EPUB": str(epub)}
+    result = subprocess.run(
+        ["node", "tests/phase3_stateful_interaction_browser.mjs"],
+        cwd=root, env=env, capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["touchResult"]["selected"] == "君子好逑"
+    assert payload["touchResult"]["pageBefore"] == payload["touchResult"]["pageAfter"]
+    assert payload["pageBefore"] == payload["touchResult"]["pageBefore"]
+    assert payload["frozenText"] == payload["firstSavedText"] == "君子好逑"
+    assert payload["liveSelectionAfterModal"] is None
+    assert payload["secondSavedText"] == "此时相望不相闻，愿逐月华流照君"
+    assert payload["thoughtLocatorText"] == "后来选择的那一句话"
+    assert payload["navigation"] == {
+        "thought": "后来选择的那一句话",
+        "annotation": "此时相望不相闻，愿逐月华流照君",
+        "thoughtAgain": "后来选择的那一句话",
+    }
+    assert payload["sameCfiKeys"] == ["annotation:u1", "thought:t2"]
+    assert payload["decorationKeys"] == [
+        "annotation:u1", "annotation:u2", "thought:t1", "thought:t2",
+    ]
+    assert payload["pageErrors"] == []
 
 
 class Cursor:
@@ -376,6 +464,50 @@ def test_revalidate_clears_only_unverified_locator_and_keeps_legacy_anchor(monke
     assert not [item for item in queries if item[0].startswith("update xiaxia_thoughts")]
 
 
+def test_explicit_per_book_rebuild_clears_all_locators_but_never_legacy_anchors(monkeypatch):
+    annotation_id = UUID("33333333-3333-4333-8333-333333333333")
+    thought_id = UUID("55555555-5555-4555-8555-555555555555")
+    queries = []
+
+    class RebuildConnection:
+        def execute(self, query, params=()):
+            compact = " ".join(query.split())
+            queries.append((compact, params))
+            if "from annotations" in compact:
+                return Cursor(rows=[{
+                    "id": annotation_id, "selected_text": "正文",
+                    "engine_locator": locator("正文"),
+                }])
+            if "from xiaxia_thoughts" in compact:
+                return Cursor(rows=[{
+                    "id": thought_id, "selected_text": "正文",
+                    "engine_locator": locator("正文"),
+                }])
+            return Cursor()
+
+    @contextmanager
+    def transaction():
+        yield RebuildConnection()
+
+    monkeypatch.setattr(
+        annotations.db, "fetch_one",
+        lambda *_args: {"id": BOOK_ID, "source_sha256": SOURCE_HASH},
+    )
+    monkeypatch.setattr(annotations.db, "transaction", transaction)
+    response = web_client().post(
+        f"/api/books/{BOOK_ID}/engine-traces/revalidate",
+        json={"rebuild_all": True},
+    )
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "status": "revalidated", "mode": "rebuild_all", "cleared": 2,
+    }
+    updates = [item for item in queries if item[0].startswith("update ")]
+    assert len(updates) == 2
+    assert all("engine_locator = null" in query for query, _ in updates)
+    assert all("selected_text" not in query and "start_block_id" not in query for query, _ in updates)
+
+
 def test_phase3_migration_is_additive_and_actions_schema_unchanged():
     root = Path(__file__).resolve().parents[1]
     migration = (root / "migrations/007_reader_engine_dual_anchor.sql").read_text()
@@ -395,4 +527,10 @@ def test_phase3_migration_is_additive_and_actions_schema_unchanged():
     assert "records[records.length - 1]" not in foliate
     assert "recordKey" in adapter and "trace-record-choices" in foliate
     assert "browser_truth" in adapter and "verifyLocator" in adapter
+    assert "selectionchange', selectionChanged, { capture: true }" in adapter
+    assert "event.stopImmediatePropagation()" in adapter
+    assert "Do not preventDefault()" in adapter
+    assert "pendingSelectionSnapshot" in foliate
+    assert "save_post_started" in foliate and "decoration_deferred" in foliate
+    assert "rebuild_all: true" in foliate
     assert "engine_locator" not in (root / "openapi.yaml").read_text()

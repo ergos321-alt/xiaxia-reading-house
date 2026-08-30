@@ -23,6 +23,7 @@ let book = null
 let source = null
 let bridgeReady = false
 let savedSelection = null
+let pendingSelectionSnapshot = null
 let selectionEpoch = 0
 let selectionSuppressedUntil = 0
 let selectionSubmitting = false
@@ -34,6 +35,8 @@ let tracePoll = null
 let traceRefreshPromise = null
 let traceRevalidated = false
 let initialTraceHandled = false
+const selectionDebugEnabled = new URLSearchParams(location.search).get('selection_debug') === '1'
+let selectionDebugState = { state: 'idle', save_stage: 'idle' }
 
 const api = async (url, options = {}) => {
     const response = await fetch(url, {
@@ -48,6 +51,8 @@ const api = async (url, options = {}) => {
     if (!response.ok) {
         const error = new Error(data.message || data.error || `request_${response.status}`)
         error.code = data.error
+        error.status = response.status
+        error.detail = data
         throw error
     }
     return data
@@ -63,6 +68,75 @@ const showStatus = message => {
     setTimeout(() => { node.hidden = true }, 2200)
 }
 
+const cfiFingerprint = value => {
+    const text = String(value || '')
+    let hash = 2166136261
+    for (let index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index)
+        hash = Math.imul(hash, 16777619)
+    }
+    return text ? `${text.slice(0, 30)}… #${(hash >>> 0).toString(16).padStart(8, '0')}` : ''
+}
+
+const updateSelectionDebug = (stage, detail = {}) => {
+    if (!selectionDebugEnabled) return
+    selectionDebugState = {
+        ...selectionDebugState,
+        ...detail,
+        state: detail.state || selectionDebugState.state,
+        last_stage: stage,
+        updated_at: new Date().toISOString(),
+    }
+    const panel = $('#selection-diagnostics')
+    if (!panel) return
+    const output = panel.querySelector('pre')
+    output.textContent = JSON.stringify({
+        ...selectionDebugState,
+        cfi: cfiFingerprint(selectionDebugState.cfi),
+        page_before_cfi: cfiFingerprint(selectionDebugState.page_before?.cfi),
+        page_after_cfi: cfiFingerprint(selectionDebugState.page_after?.cfi),
+    }, null, 2)
+}
+
+const installSelectionDiagnostics = () => {
+    if (!selectionDebugEnabled) return
+    const panel = document.createElement('aside')
+    panel.id = 'selection-diagnostics'
+    panel.className = 'selection-diagnostics'
+    panel.innerHTML = `
+        <div><strong>Selection diagnostics</strong><button type="button" data-close>×</button></div>
+        <pre></pre>
+        <div class="selection-diagnostics-actions">
+          <button type="button" data-copy>复制诊断 JSON</button>
+          <button type="button" data-rebuild>重验本书定位</button>
+        </div>`
+    panel.querySelector('[data-close]').addEventListener('click', () => panel.remove())
+    panel.querySelector('[data-copy]').addEventListener('click', async () => {
+        await navigator.clipboard?.writeText?.(JSON.stringify(selectionDebugState, null, 2))
+        showStatus('诊断信息已复制。')
+    })
+    panel.querySelector('[data-rebuild]').addEventListener('click', async () => {
+        if (!confirm('只清空并按需重建本书的 renderer locator？原有批注、Thought 和 legacy anchor 都会保留。')) return
+        await api(`/api/books/${bookId}/engine-traces/revalidate`, {
+            method: 'POST', body: JSON.stringify({ rebuild_all: true }),
+        })
+        location.reload()
+    })
+    body.append(panel)
+    globalThis.__readingHouseSelectionDebug = {
+        adapter,
+        getState: () => ({
+            ...selectionDebugState,
+            saved_selection: savedSelection && structuredClone(savedSelection),
+            pending_selection: pendingSelectionSnapshot && structuredClone(pendingSelectionSnapshot),
+            adapter: adapter.getSelectionDiagnostics(),
+        }),
+        refreshTraces: () => refreshTraces(),
+        navigateToTrace: (kind, id) => navigateToTrace(kind, id),
+    }
+    updateSelectionDebug('diagnostics_ready')
+}
+
 const hideSelectionMenu = clear => {
     selectionMenu.hidden = true
     selectionMenu.classList.add('is-hidden')
@@ -75,9 +149,30 @@ const clearSelectionInteraction = () => {
     selectionEpoch += 1
     selectionSuppressedUntil = Date.now() + 900
     savedSelection = null
+    pendingSelectionSnapshot = null
     selectionSubmitting = false
     adapter.clearBrowserSelection()
     hideSelectionMenu(false)
+}
+
+const freezeSelectionForModal = () => {
+    if (!savedSelection) return null
+    pendingSelectionSnapshot = structuredClone(savedSelection)
+    selectionEpoch += 1
+    selectionSuppressedUntil = Date.now() + 900
+    savedSelection = null
+    adapter.clearBrowserSelection()
+    hideSelectionMenu(false)
+    updateSelectionDebug('modal_snapshot_frozen', {
+        state: 'snapshot_frozen',
+        selected_text: pendingSelectionSnapshot.text?.highlight || '',
+        selected_text_length: pendingSelectionSnapshot.text?.highlight?.length || 0,
+        href: pendingSelectionSnapshot.href,
+        start_section: pendingSelectionSnapshot.spine_index,
+        end_section: pendingSelectionSnapshot.spine_index,
+        cfi: pendingSelectionSnapshot.cfi,
+    })
+    return pendingSelectionSnapshot
 }
 
 const showSelectionMenu = () => {
@@ -197,14 +292,12 @@ const ensureRecordLocator = async (record, kind, { navigate = false } = {}) => {
 }
 
 const addTraceDecoration = async (record, kind) => {
-    if (validLocator(record.engine_locator, record)) {
-        await adapter.addDecoration({ ...record, kind })
-        return
-    }
-    if (!record.locator_seed || !bridgeReady) return
     try {
         await ensureRecordLocator(record, kind)
-        await adapter.addDecoration({ ...record, kind })
+        const drawn = await adapter.addDecoration({ ...record, kind })
+        if (!drawn) throw Object.assign(new Error('locator_mapping_missing'), {
+            code: 'locator_mapping_missing',
+        })
     } catch (error) {
         console.info('locator backfill skipped', record.id, error.code || error.message)
     }
@@ -247,35 +340,82 @@ const renderChapterThoughtMarker = href => {
     }
 }
 
-const saveAnnotation = async comment => {
-    if (!savedSelection || selectionSubmitting) return false
-    const snapshot = structuredClone(savedSelection)
+const saveAnnotation = async (comment, candidate = savedSelection) => {
+    if (!candidate || selectionSubmitting) return false
+    const snapshot = structuredClone(candidate)
     selectionSubmitting = true
     hideSelectionMenu(false)
+    updateSelectionDebug('save_handler', {
+        save_stage: 'handler',
+        selected_text_length: snapshot.text?.highlight?.length || 0,
+        href: snapshot.href,
+        start_section: snapshot.spine_index,
+        end_section: snapshot.spine_index,
+        cfi: snapshot.cfi,
+        comment_length: comment.length,
+    })
+    let annotation
     try {
-        const { annotation } = await api('/api/annotations', {
+        updateSelectionDebug('save_post_started', { save_stage: 'post_started' })
+        const result = await api('/api/annotations', {
             method: 'POST', body: JSON.stringify({ book_id: bookId, engine_locator: snapshot, comment }),
         })
-        annotations.push(annotation)
-        await adapter.addDecoration({ ...annotation, kind: 'user' })
-        clearSelectionInteraction()
-        showStatus(comment ? '批注已经留在书页旁。' : '划线已经保存。')
-        return true
+        annotation = result.annotation
     } catch (error) {
         selectionSubmitting = false
+        updateSelectionDebug('save_post_failed', {
+            save_stage: 'post_failed', error_code: error.code || 'request_failed',
+            http_status: error.status || null,
+        })
+        console.info('reading_house_trace_write', {
+            stage: 'post_failed', book_id: bookId, record_type: 'annotation',
+            href: snapshot.href, section_index: snapshot.spine_index,
+            selected_text_length: snapshot.text?.highlight?.length || 0,
+            cfi: cfiFingerprint(snapshot.cfi), error_code: error.code || 'request_failed',
+        })
         showStatus(error.code?.startsWith('locator_')
             ? '这处文字暂时无法留下共读痕迹。' : `保存失败：${error.message}`)
+        if (savedSelection && !noteDialog.open) setTimeout(showSelectionMenu, 40)
         return false
     }
+    const existing = annotations.findIndex(item => String(item.id) === String(annotation.id))
+    if (existing >= 0) annotations[existing] = annotation
+    else annotations.push(annotation)
+    selectionSubmitting = false
+    clearSelectionInteraction()
+    updateSelectionDebug('save_persisted', {
+        save_stage: 'persisted', record_id: annotation.id, error_code: null,
+    })
+    let drawn = false
+    try {
+        drawn = await adapter.addDecoration({ ...annotation, kind: 'user' })
+    } catch (error) {
+        console.info('reading_house_trace_write', {
+            stage: 'decoration_deferred', book_id: bookId,
+            record_type: 'annotation', record_id: annotation.id,
+            href: snapshot.href, section_index: snapshot.spine_index,
+            selected_text_length: annotation.selected_text?.length || 0,
+            cfi: cfiFingerprint(annotation.engine_locator?.cfi),
+            error_code: error.code || 'decoration_failed',
+        })
+    }
+    updateSelectionDebug('save_complete', {
+        save_stage: drawn ? 'decoration_drawn' : 'decoration_deferred',
+        decoration_drawn: Boolean(drawn),
+    })
+    if (!drawn) setTimeout(() => refreshTraces().catch(() => {}), 80)
+    showStatus(comment ? '批注已经留在书页旁。' : '划线已经保存。')
+    return true
 }
 
 const openNewNote = () => {
     if (!savedSelection) return
+    const snapshot = freezeSelectionForModal()
+    if (!snapshot) return
     editingAnnotationId = null
     $('#note-dialog-title').textContent = '写在书页旁'
-    $('#selected-quote').textContent = savedSelection.text.highlight
+    $('#selected-quote').textContent = snapshot.text.highlight
     noteText.value = ''
-    hideSelectionMenu(false)
     noteDialog.showModal()
     setTimeout(() => noteText.focus(), 0)
 }
@@ -334,7 +474,6 @@ const navigateToTrace = async (kind, id, { open = true } = {}) => {
     if (!record || !record.start_block_id) throw new Error('locator_mapping_missing')
     try {
         const locator = await ensureRecordLocator(record, kind, { navigate: true })
-        await adapter.verifyLocator(locator, record.selected_text, { navigate: true })
         await adapter.addDecoration({ ...record, kind })
         if (open) openTrace(kind, id)
         return true
@@ -462,7 +601,12 @@ adapter.onRelocate(locator => {
 })
 
 adapter.onSelection(detail => {
-    if (!bridgeReady || selectionSubmitting || Date.now() < selectionSuppressedUntil) return
+    if (!bridgeReady || selectionSubmitting || noteDialog.open || Date.now() < selectionSuppressedUntil) return
+    if (detail.selection_state !== 'stable'
+        || Number(detail.start_section_index) !== Number(detail.end_section_index)) {
+        showStatus('选区跨过了书页边界，请重新选择。')
+        return
+    }
     const epoch = ++selectionEpoch
     savedSelection = {
         engine: 'foliate-js', engine_adapter_version: 1, bridge_version: 1,
@@ -472,7 +616,32 @@ adapter.onSelection(detail => {
         locator_integrity_version: detail.locator_integrity_version,
         browser_truth: detail.browser_truth,
     }
+    updateSelectionDebug('selection_stable', {
+        state: 'stable',
+        selected_text: detail.text.highlight,
+        selected_text_length: detail.text.highlight.length,
+        href: detail.href,
+        start_section: detail.start_section_index,
+        end_section: detail.end_section_index,
+        cfi: detail.cfi,
+        page_before: detail.page_before,
+        page_after: detail.page_after,
+    })
     setTimeout(() => { if (epoch === selectionEpoch) showSelectionMenu() }, 40)
+})
+
+adapter.onSelectionState(detail => {
+    updateSelectionDebug('selection_state', detail)
+    if (detail.state === 'rejected') {
+        savedSelection = null
+        hideSelectionMenu(false)
+        showStatus(detail.error === 'selection_page_moved'
+            ? '分页选区发生了移动，已恢复书页，请重新选择。'
+            : '这次选区没有稳定下来，请重新选择。')
+    } else if (detail.state === 'cleared' && !noteDialog.open && !selectionSubmitting) {
+        savedSelection = null
+        hideSelectionMenu(false)
+    }
 })
 
 adapter.onAnnotation(({ records }) => {
@@ -488,7 +657,10 @@ adapter.onSectionLoad(() => {
 })
 adapter.onError(error => console.error('foliate-reader', error))
 
-$('#highlight-selection').addEventListener('click', () => saveAnnotation(''))
+$('#highlight-selection').addEventListener('click', () => {
+    const snapshot = savedSelection && structuredClone(savedSelection)
+    saveAnnotation('', snapshot)
+})
 $('#note-selection').addEventListener('click', openNewNote)
 $('#note-form').addEventListener('submit', async event => {
     event.preventDefault()
@@ -501,13 +673,19 @@ $('#note-form').addEventListener('submit', async event => {
         noteDialog.close()
         editingAnnotationId = null
         showStatus('批注已经更新。')
-    } else if (await saveAnnotation(noteText.value.trim())) noteDialog.close()
+    } else if (await saveAnnotation(noteText.value.trim(), pendingSelectionSnapshot)) {
+        noteDialog.close()
+    }
 })
 document.querySelectorAll('[data-close-note]').forEach(button => button.addEventListener('click', () => {
     noteDialog.close()
     if (!editingAnnotationId) clearSelectionInteraction()
     editingAnnotationId = null
 }))
+noteDialog.addEventListener('cancel', () => {
+    if (!editingAnnotationId) clearSelectionInteraction()
+    editingAnnotationId = null
+})
 
 $('#trace-menu-button').addEventListener('click', () => {
     $('#trace-actions-menu').hidden = !$('#trace-actions-menu').hidden
@@ -517,10 +695,22 @@ $('#delete-annotation').addEventListener('click', () => deleteCurrentAnnotation(
 $('#thought-reply-edit').addEventListener('click', () => writeThoughtReply().catch(error => showStatus(error.message)))
 $('#thought-reply-delete').addEventListener('click', () => deleteThoughtReply().catch(error => showStatus(error.message)))
 
-$('#page-previous').addEventListener('click', () => adapter.previous())
-$('#page-next').addEventListener('click', () => adapter.next())
-$('#previous-chapter').addEventListener('click', () => adapter.previous())
-$('#next-chapter').addEventListener('click', () => adapter.next())
+$('#page-previous').addEventListener('click', () => {
+    clearSelectionInteraction()
+    adapter.previous()
+})
+$('#page-next').addEventListener('click', () => {
+    clearSelectionInteraction()
+    adapter.next()
+})
+$('#previous-chapter').addEventListener('click', () => {
+    clearSelectionInteraction()
+    adapter.previous()
+})
+$('#next-chapter').addEventListener('click', () => {
+    clearSelectionInteraction()
+    adapter.next()
+})
 $('#toc-button').addEventListener('click', () => {
     $('#toc-drawer').classList.add('open')
     $('#toc-drawer').setAttribute('aria-hidden', 'false')
@@ -532,17 +722,20 @@ $('#reader-menu-button').addEventListener('click', () => {
     $('#reader-menu').hidden = !$('#reader-menu').hidden
 })
 $('#reading-mode').addEventListener('click', () => {
+    clearSelectionInteraction()
     flow = flow === 'scrolled' ? 'paginated' : 'scrolled'
     localStorage.setItem('xiaxia-foliate-flow', flow)
     applyFlowUI()
     $('#reader-menu').hidden = true
 })
 $('#font-down').addEventListener('click', () => {
+    clearSelectionInteraction()
     fontSize = Math.max(12, fontSize - 2)
     localStorage.setItem('xiaxia-foliate-font-size', String(fontSize))
     adapter.setPreferences({ fontSize })
 })
 $('#font-up').addEventListener('click', () => {
+    clearSelectionInteraction()
     fontSize = Math.min(36, fontSize + 2)
     localStorage.setItem('xiaxia-foliate-font-size', String(fontSize))
     adapter.setPreferences({ fontSize })
@@ -573,4 +766,5 @@ addEventListener('pagehide', () => {
     adapter.closePublication()
 })
 
+installSelectionDiagnostics()
 initialize()

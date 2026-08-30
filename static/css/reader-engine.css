@@ -101,6 +101,53 @@
   display: none !important;
 }
 
+.selection-diagnostics {
+  position: fixed;
+  z-index: 120;
+  right: max(.75rem, env(safe-area-inset-right));
+  bottom: max(.75rem, env(safe-area-inset-bottom));
+  width: min(31rem, calc(100vw - 1.5rem));
+  max-height: min(70dvh, 38rem);
+  padding: .8rem;
+  overflow: auto;
+  border: 1px solid rgba(74, 64, 55, .28);
+  border-radius: .75rem;
+  color: #332f2b;
+  background: rgba(250, 245, 235, .97);
+  box-shadow: 0 .8rem 2.2rem rgba(50, 40, 30, .18);
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.selection-diagnostics > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .6rem;
+}
+
+.selection-diagnostics pre {
+  max-height: 46dvh;
+  margin: .65rem 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.selection-diagnostics .selection-diagnostics-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.selection-diagnostics button {
+  min-height: 2rem;
+  padding: .3rem .6rem;
+  border: 1px solid rgba(83, 66, 51, .22);
+  border-radius: .45rem;
+  color: inherit;
+  background: #f4eadb;
+}
+
 .foliate-scroll-mode .page-turn { display: none !important; }
 
 @media (max-width: 620px) {

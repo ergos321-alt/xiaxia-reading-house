@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
+import time
 from typing import Any
 from uuid import UUID
 
@@ -13,7 +16,6 @@ from psycopg.types.json import Jsonb
 import database as db
 import operations
 from auth import action_required, api_or_session_required, web_api_required
-from reading import _chapter_blocks, _json_safe, _text_across_blocks, _uuid_or_none
 from locator_bridge import (
     BRIDGE_VERSION,
     LOCATOR_INTEGRITY_VERSION,
@@ -27,7 +29,7 @@ from locator_bridge import (
     unique_normalized_span_v1,
     validate_backfill_locator,
 )
-
+from reading import _chapter_blocks, _json_safe, _text_across_blocks, _uuid_or_none
 
 annotations_bp = Blueprint("annotations", __name__)
 logger = logging.getLogger(__name__)
@@ -142,6 +144,7 @@ def list_book_annotations(book_id: UUID):
 @annotations_bp.post("/api/annotations")
 @web_api_required
 def create_annotation():
+    started = time.perf_counter()
     payload = request.get_json(silent=True) or {}
     book_id = _uuid_or_none(payload.get("book_id"))
     comment = _clean_text(payload.get("comment"), 20_000, allow_empty=True)
@@ -154,6 +157,12 @@ def create_annotation():
         try:
             mapped = map_engine_selection(book_id, engine_locator)
         except LocatorBridgeError as exc:
+            _log_trace_write(
+                stage="mapping_failed", book_id=book_id, record_type="annotation",
+                locator=engine_locator, selected_length=len(str(
+                    (engine_locator.get("text") or {}).get("highlight") or ""
+                )), started=started, error_code=exc.code,
+            )
             return jsonify({"error": exc.code, "message": exc.message}), exc.status
         chapter_id = mapped["chapter_id"]
         selected_text = mapped["selected_text"]
@@ -189,6 +198,12 @@ def create_annotation():
         chapter["content_html"], selected_text, start_block_id, start_offset,
         end_block_id, end_offset,
     ):
+        _log_trace_write(
+            stage="legacy_validation_failed", book_id=book_id,
+            record_type="annotation", locator=engine_locator,
+            selected_length=len(selected_text), started=started,
+            error_code="locator_mapping_validation_failed",
+        )
         return jsonify({"error": "locator_mapping_validation_failed"}), 422
 
     with db.transaction() as conn:
@@ -219,6 +234,11 @@ def create_annotation():
         )
     result = _json_safe(row)
     result["xiaxia_response"] = None
+    _log_trace_write(
+        stage="persisted", book_id=book_id, record_type="annotation",
+        record_id=row["id"], locator=engine_locator,
+        selected_length=len(selected_text), started=started,
+    )
     return jsonify({"annotation": result}), 201
 
 
@@ -323,6 +343,7 @@ def revalidate_engine_traces(book_id: UUID):
     if not book:
         return jsonify({"error": "book_not_found"}), 404
     payload = request.get_json(silent=True) or {}
+    rebuild_all = payload.get("rebuild_all") is True
     invalid = payload.get("invalid_records") or []
     invalid_keys = {
         (str(item.get("record_type") or ""), _uuid_or_none(item.get("record_id")))
@@ -338,7 +359,7 @@ def revalidate_engine_traces(book_id: UUID):
             ).fetchall()
             for row in rows:
                 explicitly_invalid = (record_type, row["id"]) in invalid_keys
-                if not explicitly_invalid and locator_has_integrity(
+                if not rebuild_all and not explicitly_invalid and locator_has_integrity(
                     row.get("engine_locator"), book["source_sha256"], row.get("selected_text")
                 ):
                     continue
@@ -353,8 +374,12 @@ def revalidate_engine_traces(book_id: UUID):
                     (row["id"],),
                 )
                 cleared += 1
-    logger.info("locator_revalidated book_id=%s cleared=%s", book_id, cleared)
-    return jsonify({"status": "revalidated", "cleared": cleared})
+    mode = "rebuild_all" if rebuild_all else "integrity_check"
+    logger.info(
+        "locator_revalidated book_id=%s mode=%s cleared=%s",
+        book_id, mode, cleared,
+    )
+    return jsonify({"status": "revalidated", "mode": mode, "cleared": cleared})
 
 
 @annotations_bp.patch("/api/annotations/<uuid:annotation_id>")
@@ -586,6 +611,7 @@ def reply_to_annotation(annotation_id: UUID):
 @annotations_bp.post("/api/xiaxia/thoughts")
 @action_required
 def create_xiaxia_thought():
+    started = time.perf_counter()
     payload = request.get_json(silent=True) or {}
     book_id = _uuid_or_none(payload.get("book_id"))
     chapter_id = _uuid_or_none(payload.get("chapter_id"))
@@ -608,6 +634,11 @@ def create_xiaxia_thought():
     try:
         anchor = _thought_anchor(scope, payload, chapter["content_html"])
     except ValueError as exc:
+        _log_trace_write(
+            stage="legacy_validation_failed", book_id=book_id,
+            record_type="thought", selected_length=len(str(payload.get("selected_text") or "")),
+            started=started, error_code="invalid_thought_anchor",
+        )
         return jsonify({"error": "invalid_thought_anchor", "message": str(exc)}), 400
     with db.transaction() as conn:
         row = conn.execute(
@@ -632,6 +663,11 @@ def create_xiaxia_thought():
             book_id=book_id, chapter_id=chapter_id,
             new_records=[operations.snapshot(row, "xiaxia_thought")],
         )
+    _log_trace_write(
+        stage="persisted", book_id=book_id, record_type="thought",
+        record_id=row["id"], selected_length=len(anchor["selected_text"]),
+        started=started,
+    )
     return jsonify({"xiaxia_thought": _action_trace_payload(row)}), 201
 
 
@@ -674,18 +710,18 @@ def _thought_anchor(scope: str, payload: dict[str, Any], content_html: str):
         end_offset = int(payload.get("end_offset"))
     except (TypeError, ValueError) as exc:
         raise ValueError("range offsets must be integers") from exc
+    supplied = _clean_selected_text(payload.get("selected_text"), 20_000)
     selected = _text_across_blocks(
         blocks, start_block_id, start_offset, end_block_id, end_offset
     )
-    if not selected.strip():
-        raise ValueError("range is empty or outside the chapter")
-    supplied = _clean_selected_text(payload.get("selected_text"), 20_000)
-    if supplied and _normalize_text(supplied) != _normalize_text(selected):
+    corrected = None
+    if supplied and (not selected.strip() or _normalize_text(supplied) != _normalize_text(selected)):
         corrected = _correct_thought_anchor(
-            block_map,
+            blocks,
             start_block_id,
             end_block_id,
             start_offset,
+            end_offset,
             supplied,
             _clean_text(payload.get("prefix_text"), 500, allow_empty=True),
             _clean_text(payload.get("suffix_text"), 500, allow_empty=True),
@@ -696,6 +732,8 @@ def _thought_anchor(scope: str, payload: dict[str, Any], content_html: str):
         selected = _text_across_blocks(
             blocks, start_block_id, start_offset, end_block_id, end_offset
         )
+    if not selected.strip():
+        raise ValueError("range is empty or outside the chapter")
     start_text = block_map[start_block_id]["text"]
     end_text = block_map[end_block_id]["text"]
     return {
@@ -710,36 +748,66 @@ def _thought_anchor(scope: str, payload: dict[str, Any], content_html: str):
 
 
 def _correct_thought_anchor(
-    block_map: dict[str, dict[str, Any]],
+    blocks: list[dict[str, Any]],
     start_block_id: str,
     end_block_id: str,
     alleged_start: int,
+    alleged_end: int,
     supplied: str,
     prefix: str,
     suffix: str,
 ) -> tuple[int, int] | None:
-    """Correct only a unique, nearby, same-block range; never weaken validation."""
-    if start_block_id != end_block_id:
+    """Correct one unique nearby match inside the declared block span only."""
+    positions = {block["block_id"]: index for index, block in enumerate(blocks)}
+    start_index = positions.get(start_block_id)
+    end_index = positions.get(end_block_id)
+    if start_index is None or end_index is None or start_index > end_index:
         return None
-    block = block_map.get(start_block_id)
-    if not block:
+    span = blocks[start_index:end_index + 1]
+    canonical_parts = [normalize_text_v1(block["text"]) for block in span]
+    if any(not part for part in canonical_parts):
         return None
-    text = block["text"]
-    match = unique_normalized_span_v1(text, supplied, prefix, suffix)
+    canonical = " ".join(canonical_parts)
+    match = unique_normalized_span_v1(canonical, supplied, prefix, suffix)
     if match is None:
         return None
     canonical_start, canonical_end = match
-    raw_start = canonical_offset_to_raw_v1(text, canonical_start)
-    raw_end = canonical_offset_to_raw_v1(text, canonical_end)
-    # A repair is for an offset slip, not a license to relocate across a block.
-    if abs(raw_start - alleged_start) > 32:
+
+    bounds: list[tuple[int, int, dict[str, Any]]] = []
+    cursor = 0
+    for part, block in zip(canonical_parts, span):
+        bounds.append((cursor, cursor + len(part), block))
+        cursor += len(part) + 1
+    start_bound = next((item for item in bounds if item[0] <= canonical_start < item[1]), None)
+    end_point = max(canonical_start, canonical_end - 1)
+    end_bound = next((item for item in bounds if item[0] <= end_point < item[1]), None)
+    if not start_bound or not end_bound:
         return None
-    actual = text[raw_start:raw_end]
+    # The supplied block range is a hard safety boundary. Correction may fix
+    # offsets, but may not silently move the Thought to neighboring blocks.
+    if start_bound[2]["block_id"] != start_block_id or end_bound[2]["block_id"] != end_block_id:
+        return None
+    raw_start = canonical_offset_to_raw_v1(
+        start_bound[2]["text"], canonical_start - start_bound[0]
+    )
+    raw_end = canonical_offset_to_raw_v1(
+        end_bound[2]["text"], canonical_end - end_bound[0]
+    )
+    # A repair is for an offset slip, not a license to relocate across a block span.
+    if abs(raw_start - alleged_start) > 32 or abs(raw_end - alleged_end) > 32:
+        return None
+    actual = _text_across_blocks(
+        blocks, start_block_id, raw_start, end_block_id, raw_end
+    )
     if normalize_text_v1(actual) != normalize_text_v1(supplied):
         return None
-    if prefix and not normalize_text_v1(text[:raw_start]).endswith(normalize_text_v1(prefix)):
+    if prefix and not normalize_text_v1(canonical[:canonical_start]).endswith(
+        normalize_text_v1(prefix)
+    ):
         return None
-    if suffix and not normalize_text_v1(text[raw_end:]).startswith(normalize_text_v1(suffix)):
+    if suffix and not normalize_text_v1(canonical[canonical_end:]).startswith(
+        normalize_text_v1(suffix)
+    ):
         return None
     return raw_start, raw_end
 
@@ -823,3 +891,35 @@ def _clean_mark_type(value: Any) -> str:
 
 def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _log_trace_write(
+    *,
+    stage: str,
+    book_id: Any,
+    record_type: str,
+    selected_length: int,
+    started: float,
+    record_id: Any = None,
+    locator: dict[str, Any] | None = None,
+    error_code: str | None = None,
+) -> None:
+    cfi = str((locator or {}).get("cfi") or "")
+    logger.info(
+        "reading_trace_write %s",
+        json.dumps(
+            {
+                "stage": stage,
+                "book_id": str(book_id) if book_id else None,
+                "record_type": record_type,
+                "record_id": str(record_id) if record_id else None,
+                "href": str((locator or {}).get("href") or "")[:500],
+                "section_index": (locator or {}).get("spine_index", (locator or {}).get("section_index")),
+                "selected_text_length": selected_length,
+                "cfi_sha256_12": hashlib.sha256(cfi.encode("utf-8")).hexdigest()[:12] if cfi else None,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                "error_code": error_code,
+            },
+            ensure_ascii=False,
+        ),
+    )

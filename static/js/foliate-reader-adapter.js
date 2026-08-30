@@ -25,12 +25,15 @@ export class FoliateReaderAdapter {
             relocate: new Set(),
             link: new Set(),
             selection: new Set(),
+            selectionState: new Set(),
             annotation: new Set(),
             sectionLoad: new Set(),
             locatorInvalid: new Set(),
             error: new Set(),
         }
         this.decorations = new Map()
+        this.selectionSession = null
+        this.selectionSerial = 0
     }
 
     static async downloadPublication(url, filename, signal) {
@@ -64,6 +67,8 @@ export class FoliateReaderAdapter {
     }
 
     closePublication() {
+        this.#resetSelectionSession('publication_closed')
+        this.selectionSession = null
         if (this.view) closeSecurePublication(this.view)
         this.view = null
         this.book = null
@@ -73,21 +78,26 @@ export class FoliateReaderAdapter {
 
     async goTo(target) {
         if (!this.view) return
+        this.clearBrowserSelection()
         return this.view.goTo(target)
     }
 
     async next() {
         if (!this.view) return
+        this.clearBrowserSelection()
         return this.view.next()
     }
 
     async previous() {
         if (!this.view) return
+        this.clearBrowserSelection()
         return this.view.prev()
     }
 
     setFlow(flow) {
-        this.flow = flow === 'scrolled' ? 'scrolled' : 'paginated'
+        const nextFlow = flow === 'scrolled' ? 'scrolled' : 'paginated'
+        if (this.view && nextFlow !== this.flow) this.clearBrowserSelection()
+        this.flow = nextFlow
         this.view?.renderer?.setAttribute('flow', this.flow)
         this.#applyStyles()
     }
@@ -123,6 +133,7 @@ export class FoliateReaderAdapter {
     onRelocate(callback) { return this.#subscribe('relocate', callback) }
     onLink(callback) { return this.#subscribe('link', callback) }
     onSelection(callback) { return this.#subscribe('selection', callback) }
+    onSelectionState(callback) { return this.#subscribe('selectionState', callback) }
     onAnnotation(callback) { return this.#subscribe('annotation', callback) }
     onSectionLoad(callback) { return this.#subscribe('sectionLoad', callback) }
     onLocatorInvalid(callback) { return this.#subscribe('locatorInvalid', callback) }
@@ -157,8 +168,7 @@ export class FoliateReaderAdapter {
             expectedText: String(record.selected_text || ''),
             locator: record.engine_locator,
         })
-        await this.#drawValue(cfi)
-        return true
+        return this.#drawValue(cfi)
     }
 
     async removeDecoration(recordType, recordId) {
@@ -235,15 +245,33 @@ export class FoliateReaderAdapter {
     }
 
     clearBrowserSelection() {
+        this.#resetSelectionSession('cleared')
         for (const content of this.view?.renderer?.getContents?.() || []) {
             content.doc?.defaultView?.getSelection?.()?.removeAllRanges?.()
         }
         globalThis.getSelection?.()?.removeAllRanges?.()
     }
 
+    getSelectionDiagnostics() {
+        const session = this.selectionSession
+        if (!session) return { state: 'idle', flow: this.flow }
+        return {
+            state: session.state,
+            flow: this.flow,
+            href: session.href,
+            section_index: session.index,
+            pointer_down: session.pointerDown,
+            touch_down: session.touchDown,
+            page_before: session.pageBefore,
+            page_after: session.pageAfter,
+            relocation_during_selection: session.relocated,
+            selected_text_length: session.selectedTextLength || 0,
+        }
+    }
+
     async #drawValue(value) {
         const records = this.recordsForValue(value)
-        if (!records.length) return
+        if (!records.length) return false
         const valid = []
         for (const record of records) {
             try {
@@ -255,7 +283,7 @@ export class FoliateReaderAdapter {
                 }
             }
         }
-        if (!valid.length) return
+        if (!valid.length) return false
         const kinds = new Set(valid.map(item => item.kind))
         const kind = kinds.size > 1 ? 'shared' : valid[0]?.kind || 'user'
         await this.view.addAnnotation({
@@ -264,6 +292,7 @@ export class FoliateReaderAdapter {
             recordKeys: valid.map(item => item.recordKey),
             color: kind === 'xiaxia' ? '#6f8795' : kind === 'shared' ? '#776b7b' : '#8b5c45',
         })
+        return true
     }
 
     #expectedSection(locator) {
@@ -347,34 +376,23 @@ export class FoliateReaderAdapter {
             values.forEach(value => this.#drawValue(value))
         })
         this.view.addEventListener('relocate', event => {
-            this.#emit('relocate', this.getCurrentLocator(event.detail || {}))
+            const locator = this.getCurrentLocator(event.detail || {})
+            const session = this.selectionSession
+            if (this.flow === 'paginated' && session?.active) {
+                session.relocated = true
+                session.pageAfter = locator
+                this.#emit('selectionState', {
+                    ...this.getSelectionDiagnostics(),
+                    state: 'page_moved',
+                    error: 'selection_page_moved',
+                })
+                return
+            }
+            this.#emit('relocate', locator)
         })
         this.view.addEventListener('load', event => {
             const { doc, index } = event.detail
-            const capture = () => {
-                const selection = doc.defaultView?.getSelection()
-                if (!selection || selection.isCollapsed || !selection.rangeCount) return
-                const range = selection.getRangeAt(0)
-                const text = selectionContext(doc, range)
-                const quote = text.highlight
-                if (!quote) return
-                this.#emit('selection', {
-                    quote,
-                    text,
-                    cfi: this.view.getCFI(index, range),
-                    href: this.book.sections[index]?.id || '',
-                    section_index: index,
-                    progression: this.getCurrentLocator().progression,
-                    locator_integrity_version: 1,
-                    browser_truth: {
-                        href: canonicalHref(this.book.sections[index]?.id || ''),
-                        section_index: index,
-                        text: quote,
-                    },
-                })
-            }
-            doc.addEventListener('pointerup', capture)
-            doc.addEventListener('keyup', capture)
+            this.#bindSelectionLifecycle(doc, index)
             this.#emit('sectionLoad', {
                 href: canonicalHref(this.book.sections[index]?.id || ''), index,
             })
@@ -382,5 +400,241 @@ export class FoliateReaderAdapter {
         attachSafeLinkPolicy(this.view, (kind, detail) => {
             this.#emit('link', { kind, ...detail })
         })
+    }
+
+    #bindSelectionLifecycle(doc, index) {
+        this.#resetSelectionSession('section_changed')
+        const session = {
+            doc,
+            index,
+            href: canonicalHref(this.book.sections[index]?.id || ''),
+            state: 'idle',
+            active: false,
+            pointerDown: false,
+            touchDown: false,
+            relocated: false,
+            pageBefore: null,
+            pageAfter: null,
+            timer: null,
+            epoch: 0,
+            stableSignature: null,
+            selectedTextLength: 0,
+        }
+        this.selectionSession = session
+
+        const markPointer = value => {
+            if (this.selectionSession !== session) return
+            session.pointerDown = value
+            if (!value && this.#selectionRange(doc)) this.#scheduleSelectionCapture(session, 'pointerup')
+        }
+        const markTouch = (event, value) => {
+            if (this.selectionSession !== session) return
+            const hasRange = Boolean(this.#selectionRange(doc))
+            session.touchDown = value
+            if (hasRange) {
+                this.#markSelectionActive(session, 'touch')
+                if (this.flow === 'paginated') event.stopImmediatePropagation()
+                if (!value) this.#scheduleSelectionCapture(session, 'touchend')
+            }
+        }
+        const blockPaginatorTouchMove = event => {
+            if (this.selectionSession !== session || !this.#selectionRange(doc)) return
+            this.#markSelectionActive(session, 'touchmove')
+            // Do not preventDefault(): Android must keep control of its native
+            // selection handles. Only stop foliate paginator's swipe handler.
+            if (this.flow === 'paginated') event.stopImmediatePropagation()
+        }
+        const selectionChanged = event => {
+            if (this.selectionSession !== session) return
+            const range = this.#selectionRange(doc)
+            if (!range) {
+                this.#resetSelectionSession('selection_cleared', session)
+                return
+            }
+            this.#markSelectionActive(session, 'selectionchange')
+            // Pinned foliate paginator otherwise calls prev()/next() after a
+            // 700ms selection debounce when a handle crosses its visible range.
+            if (this.flow === 'paginated') event.stopImmediatePropagation()
+            this.#scheduleSelectionCapture(session, 'selectionchange')
+        }
+
+        doc.addEventListener('selectionchange', selectionChanged, { capture: true })
+        doc.addEventListener('touchmove', blockPaginatorTouchMove, { capture: true, passive: true })
+        doc.addEventListener('touchend', event => markTouch(event, false), { capture: true, passive: true })
+        doc.addEventListener('touchcancel', event => markTouch(event, false), { capture: true, passive: true })
+        doc.addEventListener('touchstart', event => markTouch(event, true), { capture: true, passive: true })
+        doc.addEventListener('pointerdown', () => markPointer(true))
+        doc.addEventListener('pointerup', () => markPointer(false))
+        doc.addEventListener('pointercancel', () => markPointer(false))
+        doc.addEventListener('keyup', () => {
+            if (this.#selectionRange(doc)) this.#scheduleSelectionCapture(session, 'keyup')
+        })
+    }
+
+    #selectionRange(doc) {
+        const selection = doc?.defaultView?.getSelection?.()
+        if (!selection || selection.isCollapsed || selection.type !== 'Range' || selection.rangeCount !== 1) {
+            return null
+        }
+        const range = selection.getRangeAt(0)
+        const startDocument = range.startContainer?.ownerDocument ||
+            (range.startContainer === doc ? doc : null)
+        const endDocument = range.endContainer?.ownerDocument ||
+            (range.endContainer === doc ? doc : null)
+        if (range.collapsed || startDocument !== doc || endDocument !== doc) return null
+        return range
+    }
+
+    #markSelectionActive(session, reason) {
+        if (this.selectionSession !== session) return
+        if (!session.active) {
+            session.pageBefore = this.getCurrentLocator()
+            session.pageAfter = session.pageBefore
+            session.relocated = false
+        }
+        session.active = true
+        session.state = 'selecting'
+        this.#emit('selectionState', {
+            ...this.getSelectionDiagnostics(), state: 'selecting', reason,
+        })
+    }
+
+    #scheduleSelectionCapture(session, reason) {
+        if (this.selectionSession !== session) return
+        clearTimeout(session.timer)
+        const epoch = ++session.epoch
+        session.stableSignature = null
+        session.timer = setTimeout(
+            () => this.#confirmStableSelection(session, epoch, reason), 180,
+        )
+    }
+
+    #confirmStableSelection(session, epoch, reason) {
+        if (this.selectionSession !== session || epoch !== session.epoch) return
+        if (session.pointerDown || session.touchDown) {
+            session.timer = setTimeout(
+                () => this.#confirmStableSelection(session, epoch, reason), 90,
+            )
+            return
+        }
+        const range = this.#selectionRange(session.doc)
+        if (!range) {
+            this.#resetSelectionSession('selection_cleared', session)
+            return
+        }
+        const signature = this.#rangeSignature(range)
+        if (session.stableSignature !== signature) {
+            session.stableSignature = signature
+            session.timer = setTimeout(
+                () => this.#confirmStableSelection(session, epoch, reason), 90,
+            )
+            return
+        }
+        this.#finalizeSelection(session, range.cloneRange(), reason)
+    }
+
+    #finalizeSelection(session, range, reason) {
+        if (this.selectionSession !== session) return
+        if (session.relocated) {
+            const restore = session.pageBefore?.cfi
+            this.#emit('selectionState', {
+                ...this.getSelectionDiagnostics(),
+                state: 'rejected',
+                error: 'selection_page_moved',
+                reason,
+            })
+            this.clearBrowserSelection()
+            if (restore) this.view?.goTo(restore).catch(() => {})
+            return
+        }
+        let text
+        let cfi
+        try {
+            text = selectionContext(session.doc, range)
+            cfi = this.view.getCFI(session.index, range)
+        } catch {
+            this.#rejectSelection(session, 'selection_range_invalid', reason)
+            return
+        }
+        const quote = text.highlight
+        if (!quote || quote.length > 20_000) {
+            this.#rejectSelection(
+                session, quote ? 'selection_too_long' : 'selection_range_invalid', reason,
+            )
+            return
+        }
+        const actualHref = canonicalHref(this.book.sections[session.index]?.id || '')
+        if (!actualHref || actualHref !== session.href) {
+            this.#rejectSelection(session, 'selection_section_mismatch', reason)
+            return
+        }
+        session.state = 'stable'
+        session.selectedTextLength = quote.length
+        session.pageAfter = this.getCurrentLocator()
+        const detail = {
+            quote,
+            text,
+            cfi,
+            href: actualHref,
+            section_index: session.index,
+            start_section_index: session.index,
+            end_section_index: session.index,
+            progression: session.pageAfter.progression,
+            locator_integrity_version: 1,
+            browser_truth: {
+                href: actualHref,
+                section_index: session.index,
+                text: quote,
+            },
+            selection_state: 'stable',
+            page_before: session.pageBefore,
+            page_after: session.pageAfter,
+        }
+        this.#emit('selectionState', {
+            ...this.getSelectionDiagnostics(), state: 'stable', reason,
+        })
+        this.#emit('selection', detail)
+    }
+
+    #rejectSelection(session, error, reason) {
+        this.#emit('selectionState', {
+            ...this.getSelectionDiagnostics(), state: 'rejected', error, reason,
+        })
+        this.clearBrowserSelection()
+    }
+
+    #resetSelectionSession(reason, expected = this.selectionSession) {
+        const session = this.selectionSession
+        if (!session || session !== expected) return
+        clearTimeout(session.timer)
+        const shouldEmit = session.active || session.state !== 'idle'
+        session.active = false
+        session.state = 'idle'
+        session.pointerDown = false
+        session.touchDown = false
+        session.relocated = false
+        session.timer = null
+        session.stableSignature = null
+        session.selectedTextLength = 0
+        if (shouldEmit) this.#emit('selectionState', {
+            ...this.getSelectionDiagnostics(), state: 'cleared', reason,
+        })
+    }
+
+    #rangeSignature(range) {
+        const path = node => {
+            const parts = []
+            let current = node
+            while (current?.parentNode && parts.length < 16) {
+                parts.push(Array.prototype.indexOf.call(current.parentNode.childNodes, current))
+                current = current.parentNode
+            }
+            return parts.reverse().join('.')
+        }
+        return [
+            path(range.startContainer), range.startOffset,
+            path(range.endContainer), range.endOffset,
+            normalizeTextV1(range.toString()),
+        ].join('|')
     }
 }
