@@ -967,27 +967,122 @@ def save_progress(book_id: UUID):
     return jsonify({"progress": _json_safe(row)})
 
 
-@reading_bp.get("/api/reading/state")
-@api_or_session_required
-def get_reading_state():
-    current = db.fetch_one(
+def _current_reading_state(book_id: UUID | None = None) -> dict[str, Any] | None:
+    book_filter = "and b.id = %s" if book_id else ""
+    params = (book_id,) if book_id else ()
+    row = db.fetch_one(
         f"""
-        select {BOOK_FIELDS}, rp.chapter_id, rp.chapter_index, rp.position,
-               rp.percentage, rp.updated_at as progress_updated_at,
-               c.title as current_chapter,
+        select {BOOK_FIELDS},
+               rp.chapter_id as legacy_chapter_id,
+               rp.chapter_index as legacy_chapter_index,
+               rp.position as legacy_position,
+               rp.percentage as legacy_percentage,
+               rp.updated_at as legacy_updated_at,
+               c.title as legacy_chapter_title,
+               ppr.locator as publication_locator,
+               ppr.progression as publication_progression,
+               ppr.updated_at as publication_progress_updated_at,
+               (b.reader_engine = 'foliate' and ppr.book_id is not null)
+                   as publication_current,
                ais.last_chapter_read, ais.last_chunk_index, ais.last_chunk_id,
                ais.last_block_id,
                ais.chapter_completed, ais.last_annotation_seen,
                ais.updated_at as ai_updated_at,
                (select count(*) from annotations a
                 where a.book_id = b.id and a.status = 'pending') as pending_count
-        from reading_progress rp
-        join books b on b.id = rp.book_id
-        join chapters c on c.id = rp.chapter_id
+        from books b
+        left join reading_progress rp on rp.book_id = b.id
+        left join publication_reading_progress ppr on ppr.book_id = b.id
+        left join chapters c on c.id = rp.chapter_id
         left join ai_reading_state ais on ais.book_id = b.id
-        order by rp.updated_at desc limit 1
-        """
+        where case
+            when b.reader_engine = 'foliate' then ppr.updated_at
+            else rp.updated_at
+        end is not null
+        {book_filter}
+        order by case
+            when b.reader_engine = 'foliate' then ppr.updated_at
+            else rp.updated_at
+        end desc
+        limit 1
+        """,
+        params,
     )
+    if not row:
+        return None
+    if not row.get("publication_current"):
+        row["chapter_id"] = row.get("legacy_chapter_id", row.get("chapter_id"))
+        row["chapter_index"] = row.get("legacy_chapter_index", row.get("chapter_index"))
+        row["position"] = row.get("legacy_position", row.get("position"))
+        row["percentage"] = row.get("legacy_percentage", row.get("percentage"))
+        row["progress_updated_at"] = row.get(
+            "legacy_updated_at", row.get("progress_updated_at")
+        )
+        row["current_chapter"] = row.get(
+            "legacy_chapter_title", row.get("current_chapter")
+        )
+        row["_publication_current"] = False
+        return row
+
+    locator = row.get("publication_locator") or {}
+    chapter_id = _publication_chapter_id(row["id"], locator)
+    chapter = None
+    if chapter_id:
+        chapter = db.fetch_one(
+            """
+            select id, chapter_index, title, href
+            from chapters where id = %s and book_id = %s
+            """,
+            (chapter_id, row["id"]),
+        )
+    row["chapter_id"] = chapter["id"] if chapter else None
+    row["chapter_index"] = (
+        chapter["chapter_index"] if chapter else locator.get("section_index")
+    )
+    row["current_chapter"] = chapter["title"] if chapter else None
+    row["position"] = locator
+    row["percentage"] = float(row.get("publication_progression") or 0) * 100
+    row["progress_updated_at"] = row.get("publication_progress_updated_at")
+    row["_publication_current"] = True
+    return row
+
+
+def _publication_chapter_id(book_id: UUID, locator: dict[str, Any]) -> UUID | None:
+    try:
+        from locator_bridge import (
+            LocatorBridgeError,
+            _bridge_chapter,
+            _validated_bridge,
+            canonical_href,
+        )
+
+        _, bridge = _validated_bridge(book_id, locator)
+        chapter = _bridge_chapter(
+            bridge,
+            canonical_href(locator.get("href") or ""),
+            locator.get("spine_index", locator.get("section_index")),
+        )
+        return UUID(str(chapter["chapter_id"]))
+    except (LocatorBridgeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _publication_progress_payload(current: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "engine": "foliate-js",
+        "chapter_id": current.get("chapter_id"),
+        "chapter_index": current.get("chapter_index"),
+        "position": current.get("publication_locator") or {},
+        "percentage": current.get("percentage", 0),
+        "progression": current.get("publication_progression", 0),
+        "updated_at": current.get("publication_progress_updated_at"),
+    }
+
+
+@reading_bp.get("/api/reading/state")
+@api_or_session_required
+def get_reading_state():
+    current = _current_reading_state()
     if not current:
         return jsonify({"current": None, "message": "书架中还没有阅读进度"})
     return jsonify({"current": _serialize_reading_state(current)})
@@ -1030,12 +1125,18 @@ def get_reading_context():
             return jsonify({"error": "annotation_not_found"}), 404
         chapter_id = annotation["chapter_id"]
 
+    current = None
     if not chapter_id:
-        current = db.fetch_one(
-            "select chapter_id from reading_progress order by updated_at desc limit 1"
-        )
+        current = _current_reading_state(requested_book_id)
         chapter_id = current["chapter_id"] if current else None
     if not chapter_id:
+        if current and current.get("_publication_current"):
+            return jsonify(
+                {
+                    "error": "publication_section_not_mapped",
+                    "current": _serialize_reading_state(current),
+                }
+            ), 409
         return jsonify({"error": "no_current_reading"}), 404
 
     chapter = db.fetch_one(
@@ -1051,13 +1152,16 @@ def get_reading_context():
     )
     if not chapter:
         return jsonify({"error": "chapter_not_found"}), 404
-    progress = db.fetch_one(
-        """
-        select chapter_id, chapter_index, position, percentage, updated_at
-        from reading_progress where book_id = %s
-        """,
-        (chapter["book_id"],),
-    )
+    if current and current.get("_publication_current"):
+        progress = _publication_progress_payload(current)
+    else:
+        progress = db.fetch_one(
+            """
+            select chapter_id, chapter_index, position, percentage, updated_at
+            from reading_progress where book_id = %s
+            """,
+            (chapter["book_id"],),
+        )
     chapter_annotations = db.fetch_all(
         """
         select a.id, a.selected_text, a.start_block_id, a.start_offset,
@@ -1798,16 +1902,32 @@ def _serialize_book(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _serialize_reading_state(row: dict[str, Any]) -> dict[str, Any]:
+    user_progress = {
+        "chapter_id": str(row["chapter_id"]) if row.get("chapter_id") else None,
+        "chapter_index": row.get("chapter_index"),
+        "chapter_title": row.get("current_chapter"),
+        "position": row.get("position") or {},
+        "percentage": float(row.get("percentage") or 0),
+        "updated_at": row["progress_updated_at"].isoformat()
+        if row.get("progress_updated_at")
+        else None,
+    }
+    if row.get("_publication_current"):
+        locator = row.get("publication_locator") or {}
+        user_progress.update(
+            {
+                "engine": "foliate-js",
+                "progression": float(row.get("publication_progression") or 0),
+                "section": {
+                    "href": locator.get("href"),
+                    "section_index": locator.get("section_index"),
+                    "cfi": locator.get("cfi"),
+                },
+            }
+        )
     return {
         "book": _serialize_book(row),
-        "user_progress": {
-            "chapter_id": str(row["chapter_id"]),
-            "chapter_index": row["chapter_index"],
-            "chapter_title": row["current_chapter"],
-            "position": row["position"],
-            "percentage": float(row["percentage"]),
-            "updated_at": row["progress_updated_at"].isoformat(),
-        },
+        "user_progress": user_progress,
         "xiaxia_progress": {
             "last_chapter_read": str(row["last_chapter_read"])
             if row.get("last_chapter_read")
