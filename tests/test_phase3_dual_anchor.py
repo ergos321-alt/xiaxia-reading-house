@@ -20,24 +20,29 @@ CHAPTER_ID = UUID("22222222-2222-4222-8222-222222222222")
 SOURCE_HASH = "a" * 64
 
 
-def make_epub(path: Path, body: str) -> None:
+def make_epub(path: Path, body: str, package_path: str = "OEBPS/content.opf") -> None:
+    package_dir = package_path.rsplit("/", 1)[0] if "/" in package_path else ""
+    resource_path = f"{package_dir}/Text/chapter.xhtml" if package_dir else "Text/chapter.xhtml"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("META-INF/container.xml", """<?xml version='1.0'?>
-          <container><rootfiles><rootfile full-path='OEBPS/content.opf'/></rootfiles></container>""")
-        archive.writestr("OEBPS/content.opf", """<package version='3.0'><manifest>
+          <container><rootfiles><rootfile full-path='{}'/></rootfiles></container>""".format(package_path))
+        archive.writestr(package_path, """<package version='3.0'><manifest>
           <item id='c1' href='Text/chapter.xhtml' media-type='application/xhtml+xml'/>
           </manifest><spine><itemref idref='c1'/></spine></package>""")
-        archive.writestr("OEBPS/Text/chapter.xhtml", f"<html><body>{body}</body></html>")
+        archive.writestr(resource_path, f"<html><body>{body}</body></html>")
 
 
-def make_browser_epub(path: Path) -> None:
+def make_browser_epub(path: Path, package_path: str = "OEBPS/content.opf") -> None:
+    package_dir = package_path.rsplit("/", 1)[0] if "/" in package_path else ""
+    chapter_path = f"{package_dir}/Text/chapter.xhtml" if package_dir else "Text/chapter.xhtml"
+    other_path = f"{package_dir}/Text/other.xhtml" if package_dir else "Text/other.xhtml"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
         archive.writestr("META-INF/container.xml", """<?xml version='1.0'?>
           <container xmlns='urn:oasis:names:tc:opendocument:xmlns:container'>
-          <rootfiles><rootfile full-path='OEBPS/content.opf'
-          media-type='application/oebps-package+xml'/></rootfiles></container>""")
-        archive.writestr("OEBPS/content.opf", """<?xml version='1.0'?>
+          <rootfiles><rootfile full-path='{}'
+          media-type='application/oebps-package+xml'/></rootfiles></container>""".format(package_path))
+        archive.writestr(package_path, """<?xml version='1.0'?>
           <package xmlns='http://www.idpf.org/2007/opf' version='3.0' unique-identifier='id'>
           <metadata xmlns:dc='http://purl.org/dc/elements/1.1/'>
           <dc:identifier id='id'>phase3-browser</dc:identifier><dc:title>Locator Test</dc:title>
@@ -46,13 +51,13 @@ def make_browser_epub(path: Path) -> None:
           <item id='c2' href='Text/other.xhtml' media-type='application/xhtml+xml'/>
           </manifest><spine><itemref idref='c1'/><itemref idref='c2'/></spine></package>""")
         archive.writestr(
-            "OEBPS/Text/chapter.xhtml",
+            chapter_path,
             """<html xmlns='http://www.w3.org/1999/xhtml'><head><title>A</title></head><body>
             <p>此时相望不相闻，愿逐月华流照君</p><p>后来选择的那一句话</p>
             <p>在河之洲<br/>窈窕淑女<br/>君子好逑<br/>参差荇菜<br/>左右流之</p></body></html>""",
         )
         archive.writestr(
-            "OEBPS/Text/other.xhtml",
+            other_path,
             "<html xmlns='http://www.w3.org/1999/xhtml'><body><p>另一章</p></body></html>",
         )
 
@@ -135,6 +140,71 @@ def test_bridge_href_mapping_and_web_to_legacy_round_trip(tmp_path, monkeypatch)
     assert seed["href"] == "Text/chapter.xhtml"
     assert seed["text"]["highlight"] == "江流天地外"
     assert payload["bridge_version"] == 1
+
+
+@pytest.mark.parametrize(
+    ("package_path", "native_href"),
+    [
+        ("content.opf", "Text/chapter.xhtml"),
+        ("OEBPS/content.opf", "OEBPS/Text/chapter.xhtml"),
+        ("EPUB/package/content.opf", "EPUB/package/Text/chapter.xhtml"),
+    ],
+)
+def test_native_highlight_href_resolves_against_opf_directory(
+    tmp_path, monkeypatch, package_path, native_href,
+):
+    epub = tmp_path / "book.epub"
+    make_epub(epub, "<p>正文</p>", package_path)
+    payload = bridge.build_bridge_payload(
+        epub,
+        book_id=BOOK_ID,
+        source_sha256=SOURCE_HASH,
+        chapters=[chapter('<p data-block-id="b000001">正文</p>')],
+    )
+    install_payload(monkeypatch, payload)
+    native = locator("正文")
+    native["href"] = native_href
+    native["browser_truth"]["href"] = native_href
+
+    mapped = bridge.map_engine_selection(BOOK_ID, native)
+
+    assert payload["package_path"] == package_path
+    assert mapped["chapter_id"] == CHAPTER_ID
+    assert mapped["engine_locator"]["href"] == native_href
+    assert mapped["engine_locator"]["browser_truth"]["href"] == native_href
+
+
+def test_existing_bridge_without_package_path_uses_spine_and_path_boundary(monkeypatch):
+    payload = {
+        "bridge_version": 1,
+        "canonical_text_version": 1,
+        "engine": "foliate-js",
+        "engine_adapter_version": 1,
+        "book_id": str(BOOK_ID),
+        "source_sha256": SOURCE_HASH,
+        "chapters": [{
+            "spine_index": 0,
+            "href": "Text/chapter.xhtml",
+            "chapter_id": str(CHAPTER_ID),
+            "original_text": "正文",
+            "normalized_text": "正文",
+            "blocks": [{
+                "block_id": "b000001",
+                "text": "正文",
+                "canonical_start": 0,
+                "canonical_end": 2,
+                "text_sha256": hashlib.sha256("正文".encode()).hexdigest(),
+            }],
+        }],
+    }
+    install_payload(monkeypatch, payload)
+    native = locator("正文")
+    native["href"] = "OEBPS/Text/chapter.xhtml"
+    native["browser_truth"]["href"] = "OEBPS/Text/chapter.xhtml"
+
+    mapped = bridge.map_engine_selection(BOOK_ID, native)
+
+    assert mapped["engine_locator"]["href"] == "OEBPS/Text/chapter.xhtml"
 
 
 def test_duplicate_quote_requires_context(tmp_path, monkeypatch):
@@ -274,9 +344,17 @@ def test_xiaxia_thought_cross_block_offset_correction_is_bounded_and_exact():
         }, content)
 
 
-def test_live_chromium_locator_identity_and_truth(tmp_path):
+@pytest.mark.parametrize(
+    ("package_path", "native_href"),
+    [
+        ("content.opf", "Text/chapter.xhtml"),
+        ("OEBPS/content.opf", "OEBPS/Text/chapter.xhtml"),
+        ("EPUB/package/content.opf", "EPUB/package/Text/chapter.xhtml"),
+    ],
+)
+def test_live_chromium_locator_identity_and_truth(tmp_path, package_path, native_href):
     epub = tmp_path / "browser.epub"
-    make_browser_epub(epub)
+    make_browser_epub(epub, package_path)
     root = Path(__file__).resolve().parents[1]
     probe = subprocess.run(
         ["node", "-e", "process.stdout.write(require('playwright').chromium.executablePath())"],
@@ -284,7 +362,11 @@ def test_live_chromium_locator_identity_and_truth(tmp_path):
     )
     if probe.returncode != 0 or not Path(probe.stdout).is_file():
         pytest.skip("Playwright Chromium binary is not installed")
-    env = {**os.environ, "PHASE3_BROWSER_EPUB": str(epub)}
+    env = {
+        **os.environ,
+        "PHASE3_BROWSER_EPUB": str(epub),
+        "PHASE3_BRIDGE_HREF": "Text/chapter.xhtml",
+    }
     result = subprocess.run(
         ["node", "tests/phase3_locator_integrity_browser.mjs"],
         cwd=root, env=env, capture_output=True, text=True, timeout=90, check=False,
@@ -301,6 +383,8 @@ def test_live_chromium_locator_identity_and_truth(tmp_path):
     assert payload["keys"] == ["annotation:B", "annotation:C", "thought:A"]
     assert payload["wrongTextError"] == "locator_mapping_validation_failed"
     assert payload["wrongSectionError"] == "locator_mapping_missing"
+    assert payload["resourceHref"] == native_href
+    assert payload["thoughtChapterMatches"] is True
 
 
 def test_live_mobile_stateful_selection_save_restore_and_identity(tmp_path):

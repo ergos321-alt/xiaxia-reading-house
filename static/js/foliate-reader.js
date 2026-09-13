@@ -320,14 +320,19 @@ const refreshTraces = async () => {
         for (const item of thoughts.filter(item => item.scope !== 'chapter')) {
             await addTraceDecoration(item, 'xiaxia')
         }
-        renderChapterThoughtMarker(lastLocator?.href)
+        renderChapterThoughtMarker(lastLocator)
     })()
     try { await traceRefreshPromise } finally { traceRefreshPromise = null }
 }
 
-const renderChapterThoughtMarker = href => {
+const renderChapterThoughtMarker = locator => {
     const panel = $('#chapter-thoughts')
-    const current = thoughts.filter(item => item.scope === 'chapter' && item.chapter_href === href)
+    const current = thoughts.filter(item => item.scope === 'chapter'
+        && adapter.hrefsIdentifySameSection(
+            item.chapter_href,
+            locator?.href,
+            Number(locator?.spine_index ?? locator?.section_index),
+        ))
     panel.replaceChildren()
     panel.hidden = current.length === 0
     for (const thought of current) {
@@ -596,7 +601,7 @@ adapter.onRelocate(locator => {
     $('#reader-progress span').style.width = `${percentage}%`
     $('#chapter-position').textContent = `${percentage.toFixed(1)}%`
     saveProgress(locator)
-    renderChapterThoughtMarker(locator.href)
+    renderChapterThoughtMarker(locator)
     $('#finish-book-entry').hidden = locator.progression < .995
 })
 

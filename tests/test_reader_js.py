@@ -181,3 +181,13 @@ def test_foliate_diagnostics_are_opt_in_and_rebuild_only_renderer_locators():
     assert "rebuild_all: true" in reader
     assert "__readingHouseSelectionDebug" in reader
     assert ".selection-diagnostics" in style
+
+
+def test_chapter_thought_uses_publication_section_resource_identity():
+    reader = FOLIATE_READER.read_text(encoding="utf-8")
+    adapter = FOLIATE_ADAPTER.read_text(encoding="utf-8")
+
+    assert "adapter.hrefsIdentifySameSection(" in reader
+    assert "item.chapter_href === href" not in reader
+    assert "hrefIdentifiesSection(href, index)" in adapter
+    assert "getElementsByTagNameNS?.('*', 'item')" in adapter

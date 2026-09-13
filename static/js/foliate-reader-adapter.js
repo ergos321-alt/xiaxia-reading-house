@@ -130,6 +130,18 @@ export class FoliateReaderAdapter {
         return this.book?.toc || []
     }
 
+    hrefIdentifiesSection(href, index) {
+        const candidate = canonicalHref(href)
+        if (!candidate) return false
+        const section = this.#sectionHrefs(index)
+        return candidate === section.resource || candidate === section.manifest
+    }
+
+    hrefsIdentifySameSection(first, second, index) {
+        return this.hrefIdentifiesSection(first, index)
+            && this.hrefIdentifiesSection(second, index)
+    }
+
     onRelocate(callback) { return this.#subscribe('relocate', callback) }
     onLink(callback) { return this.#subscribe('link', callback) }
     onSelection(callback) { return this.#subscribe('selection', callback) }
@@ -185,7 +197,7 @@ export class FoliateReaderAdapter {
     async locatorFromSeed(seed, { navigate = false } = {}) {
         const expected = this.#expectedSection(seed)
         if (navigate) {
-            const resolved = await this.goTo(seed.href)
+            const resolved = await this.goTo(expected.href)
             if (Number(resolved?.index) !== expected.index) {
                 throw this.#locatorError('locator_mapping_missing')
             }
@@ -201,6 +213,7 @@ export class FoliateReaderAdapter {
         const cfi = this.view.getCFI(content.index, range)
         const locator = {
             ...seed,
+            href: expected.href,
             cfi,
             section_index: content.index,
             progression: this.getCurrentLocator().progression,
@@ -301,12 +314,23 @@ export class FoliateReaderAdapter {
         if (!Number.isInteger(index) || index < 0 || index >= (this.book?.sections?.length || 0)) {
             throw this.#locatorError('locator_mapping_missing')
         }
-        const expectedHref = canonicalHref(locator.href)
-        const actualHref = canonicalHref(this.book.sections[index]?.id)
-        if (!expectedHref || actualHref !== expectedHref) {
+        const actualHref = this.#sectionHrefs(index).resource
+        if (!actualHref || !this.hrefIdentifiesSection(locator.href, index)) {
             throw this.#locatorError('locator_mapping_missing')
         }
-        return { index, href: expectedHref }
+        return { index, href: actualHref }
+    }
+
+    #sectionHrefs(index) {
+        const resource = canonicalHref(this.book?.sections?.[index]?.id || '')
+        const idref = this.book?.resources?.spine?.[index]?.idref
+        const items = this.book?.resources?.opf
+            ?.getElementsByTagNameNS?.('*', 'item') || []
+        const item = [...items].find(element => element.getAttribute('id') === idref)
+        return {
+            resource,
+            manifest: canonicalHref(item?.getAttribute('href') || ''),
+        }
     }
 
     #loadedContent(expected) {

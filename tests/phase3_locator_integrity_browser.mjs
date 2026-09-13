@@ -7,6 +7,7 @@ const { chromium } = createRequire(join(process.cwd(), 'phase3-browser.cjs'))('p
 
 const root = process.cwd()
 const fixture = process.env.PHASE3_BROWSER_EPUB
+const bridgeHref = process.env.PHASE3_BRIDGE_HREF || 'Text/chapter.xhtml'
 if (!fixture || !statSync(fixture).isFile()) throw new Error('PHASE3_BROWSER_EPUB is required')
 
 const mime = path => ({
@@ -27,8 +28,9 @@ const server = createServer((request, response) => {
         return
     }
     try {
+        const data = readFileSync(path)
         response.writeHead(200, { 'Content-Type': mime(path) })
-        response.end(readFileSync(path))
+        response.end(data)
     } catch {
         response.writeHead(404).end()
     }
@@ -40,7 +42,7 @@ const browser = await chromium.launch({ headless: true, executablePath: chromium
 try {
     const page = await browser.newPage({ viewport: { width: 1200, height: 800 } })
     await page.goto(baseURL)
-    const result = await page.evaluate(async base => {
+    const result = await page.evaluate(async ({ base, bridgeHref }) => {
         const { FoliateReaderAdapter } = await import(`${base}/static/js/foliate-reader-adapter.js`)
         const host = document.querySelector('#host')
         const adapter = new FoliateReaderAdapter(host)
@@ -49,7 +51,7 @@ try {
 
         const textA = '此时相望不相闻，愿逐月华流照君'
         const textB = '后来选择的那一句话'
-        const href = 'Text/chapter.xhtml'
+        const href = bridgeHref
         const baseSeed = {
             engine: 'foliate-js', engine_adapter_version: 1, bridge_version: 1,
             source_sha256: 'a'.repeat(64), href, spine_index: 0,
@@ -98,10 +100,13 @@ try {
             keys: [...adapter.decorations.keys()].sort(),
             wrongTextError,
             wrongSectionError,
+            resourceHref: locatorA.href,
+            thoughtChapterMatches: adapter.hrefsIdentifySameSection(
+                href, locatorA.href, locatorA.section_index),
         }
         adapter.closePublication()
         return output
-    }, baseURL)
+    }, { base: baseURL, bridgeHref })
     process.stdout.write(JSON.stringify(result))
 } finally {
     await browser.close()

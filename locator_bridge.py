@@ -135,7 +135,7 @@ def build_bridge_payload(
     chapters: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Build a deterministic bridge without retaining publisher DOM objects."""
-    original_sections = _read_original_sections(source_path, chapters)
+    package_path, original_sections = _read_original_sections(source_path, chapters)
     mapped: list[dict[str, Any]] = []
     for chapter in chapters:
         href = canonical_href(chapter.get("href") or "")
@@ -185,6 +185,7 @@ def build_bridge_payload(
         "engine_adapter_version": ENGINE_ADAPTER_VERSION,
         "book_id": str(book_id),
         "source_sha256": source_sha256,
+        "package_path": package_path,
         "chapters": mapped,
     }
 
@@ -322,7 +323,7 @@ def map_engine_selection(book_id: UUID, locator: dict[str, Any]) -> dict[str, An
     after = normalize_text_v1(text.get("after") or "")
     if not quote:
         raise LocatorBridgeError("locator_mapping_missing", "所选文字为空", 422)
-    _validate_browser_truth(locator, chapter, quote)
+    _validate_browser_truth(locator, chapter, bridge, quote)
     match = _unique_match(chapter["normalized_text"], quote, before, after)
     if match is None:
         code = "locator_mapping_ambiguous" if _count_occurrences(chapter["normalized_text"], quote) > 1 else "locator_mapping_missing"
@@ -348,7 +349,14 @@ def map_engine_selection(book_id: UUID, locator: dict[str, Any]) -> dict[str, An
             "selected_text": selected,
             "prefix_text": anchor.pop("prefix"),
             "suffix_text": anchor.pop("suffix"),
-            "engine_locator": _sanitize_locator(locator, book["source_sha256"], href, quote, before, after),
+            "engine_locator": _sanitize_locator(
+                locator,
+                book["source_sha256"],
+                _locator_resource_href(bridge, chapter, href),
+                quote,
+                before,
+                after,
+            ),
         }
     )
     _log_mapping(book_id, None, "user_annotation", book["source_sha256"], href, "mapped", started)
@@ -536,7 +544,10 @@ def _load_bridge(object_path: str, expected_sha256: str) -> dict[str, Any]:
     return json.loads(encoded)
 
 
-def _read_original_sections(source_path: str | Path, chapters: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def _read_original_sections(
+    source_path: str | Path,
+    chapters: list[dict[str, Any]],
+) -> tuple[str, dict[str, dict[str, Any]]]:
     with zipfile.ZipFile(source_path) as archive:
         names = {canonical_href(name).lower(): name for name in archive.namelist()}
         opf_path = _opf_path(archive, names)
@@ -569,7 +580,7 @@ def _read_original_sections(source_path: str | Path, chapters: list[dict[str, An
                 "text": canonical_markup_text(archive.read(archive_name)),
                 "spine_index": spine_by_href.get(href.lower(), int(chapter.get("chapter_index") or 0)),
             }
-        return result
+        return opf_path, result
 
 
 def _opf_path(archive: zipfile.ZipFile, names: dict[str, str]) -> str:
@@ -588,7 +599,7 @@ def _opf_path(archive: zipfile.ZipFile, names: dict[str, str]) -> str:
 
 
 def _bridge_chapter(bridge: dict[str, Any], href: str, spine_index: Any) -> dict[str, Any]:
-    by_href = [item for item in bridge["chapters"] if canonical_href(item["href"]).lower() == href.lower()]
+    by_href = [item for item in bridge["chapters"] if _href_identifies_chapter(bridge, item, href)]
     if len(by_href) != 1:
         raise LocatorBridgeError("locator_mapping_missing", "无法对应到夏夏整理后的章节", 422)
     try:
@@ -598,6 +609,29 @@ def _bridge_chapter(bridge: dict[str, Any], href: str, spine_index: Any) -> dict
     if int(by_href[0]["spine_index"]) != index:
         raise LocatorBridgeError("locator_mapping_validation_failed", "阅读引擎章节身份不一致", 422)
     return by_href[0]
+
+
+def _chapter_resource_href(bridge: dict[str, Any], chapter: dict[str, Any]) -> str:
+    package_dir = posixpath.dirname(canonical_href(bridge.get("package_path") or ""))
+    return canonical_href(posixpath.join(package_dir, canonical_href(chapter.get("href") or "")))
+
+
+def _href_identifies_chapter(bridge: dict[str, Any], chapter: dict[str, Any], href: str) -> bool:
+    candidate = canonical_href(href).lower()
+    chapter_href = canonical_href(chapter.get("href") or "").lower()
+    if not candidate or not chapter_href:
+        return False
+    if bridge.get("package_path"):
+        return candidate in {chapter_href, _chapter_resource_href(bridge, chapter).lower()}
+    # Version-1 bridge objects created before package_path was retained can
+    # still use the already-validated spine identity and path boundary.
+    return candidate == chapter_href or candidate.endswith(f"/{chapter_href}")
+
+
+def _locator_resource_href(bridge: dict[str, Any], chapter: dict[str, Any], href: str) -> str:
+    if bridge.get("package_path"):
+        return _chapter_resource_href(bridge, chapter)
+    return canonical_href(href)
 
 
 def _unique_match(haystack: str, needle: str, before: str, after: str) -> tuple[int, int] | None:
@@ -709,7 +743,12 @@ def _sanitize_locator(locator: dict[str, Any], source_sha256: str, href: str, qu
     return result
 
 
-def _validate_browser_truth(locator: dict[str, Any], chapter: dict[str, Any], quote: str) -> None:
+def _validate_browser_truth(
+    locator: dict[str, Any],
+    chapter: dict[str, Any],
+    bridge: dict[str, Any],
+    quote: str,
+) -> None:
     truth = locator.get("browser_truth")
     if int(locator.get("locator_integrity_version") or 0) != LOCATOR_INTEGRITY_VERSION or not isinstance(truth, dict):
         raise LocatorBridgeError(
@@ -717,8 +756,7 @@ def _validate_browser_truth(locator: dict[str, Any], chapter: dict[str, Any], qu
             "浏览器尚未验证这处书页定位",
             422,
         )
-    expected_href = canonical_href(chapter["href"])
-    if canonical_href(truth.get("href") or "") != expected_href:
+    if not _href_identifies_chapter(bridge, chapter, truth.get("href") or ""):
         raise LocatorBridgeError("locator_mapping_validation_failed", "浏览器章节与书页索引不一致", 422)
     try:
         truth_index = int(truth.get("section_index"))
