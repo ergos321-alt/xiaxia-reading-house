@@ -203,9 +203,13 @@ Schema 采用 Actions 兼容的保守写法：路径参数在每个 operation �
 
 ### 林知夏自主连续阅读顺序
 
-1. `listBooks` 取得 `book_id`。
+询问当前书、当前章节、当前位置或继续当前阅读时，必须先调用 `getReadingState`，
+直接使用 `current.book.id`；只有 `current == null` 或用户明确要求搜索、浏览书架时，
+才调用轻量分页的 `listBooks(query?, limit=10, offset=0)`。
+
+1. 当前阅读从 `getReadingState` 取得 `book_id`；搜索或浏览书架时从分页 `listBooks` 取得。
 2. `listBookChapters` 取得真实顺序的 `chapter_id`、`chapter_index`、title、word_count。
-3. 对任意章调用 `getReadingContext(chapter_id, chunk_index=0)`。
+3. 对目标章调用 `getReadingContext(chapter_id, chunk_index=0)`。
 4. 读取响应中的 `blocks[]`；每个 block 都有与网页批注同源的 `block_id`、`block_order`、segment start/end offset 和 text。
 5. 若 `chunk_count > 1`，按 `chunk_index=1, 2, ... chunk_count-1` 连续读取。未读完所有 chunk 前不得声称已读完整章。
 6. 每读完一个 chunk 调用 `saveAiProgress`，回传 context 给出的 `chapter_id + chunk_index + chunk_id` 和可选 `last_block_id`；只有最后一个 chunk 才传 `chapter_completed=true`。完成状态会把缺失或陈旧 block 归一到本章最后一个合法 block，跨章 block 在中途 checkpoint 仍会被拒绝。
@@ -400,7 +404,7 @@ ruff check .
 
 ### Custom GPT Action
 
-1. `listBooks → listBookChapters → 任意 chapter_id → chunk_index=0`。
+1. 当前阅读使用 `getReadingState → current.book.id`；不得先调用 `listBooks`。只有搜索或浏览书架时使用 `listBooks(query?, limit=10, offset=0)`。
 2. 连续读取到最后一个 chunk，逐块保存 checkpoint，最后一块标记 completed。
 3. 新开聊天调用 `getReadingState`，检查 chapter/chunk/last_block/completed 恢复。
 4. 根据返回 block 和 offsets 创建 range thought，再在网页确认精确位置。

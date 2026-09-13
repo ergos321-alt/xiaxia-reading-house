@@ -12,7 +12,7 @@ paths:
     get:
       operationId: getReadingState
       summary: Get shared reading state
-      description: Restore the active book, user position, Xiaxia chunk checkpoint, completion flag, and pending count.
+      description: 用于获取当前正在阅读的书、章节和位置。询问当前书或继续阅读时应首先调用此工具，直接使用 current.book.id，不要先枚举整个书架。
       responses:
         "200":
           description: Current reading state.
@@ -31,7 +31,32 @@ paths:
     get:
       operationId: listBooks
       summary: List private books
-      description: Return book IDs and reading summaries. Use a book ID to list chapters.
+      description: 用于搜索或分页浏览书架。不要用此工具确定当前正在阅读的书；当前书应先调用 getReadingState。搜索时传 query，浏览时传 limit 和 offset。
+      parameters:
+        - name: query
+          in: query
+          required: false
+          description: Optional title or author substring to search for.
+          schema:
+            type: string
+            maxLength: 200
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of lightweight book records to return.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+        - name: offset
+          in: query
+          required: false
+          description: Zero-based offset for paginated shelf browsing.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
       responses:
         "200":
           description: Books on the private shelf.
@@ -44,6 +69,19 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Book"
+                  pagination:
+                    type: object
+                    properties:
+                      limit:
+                        type: integer
+                      offset:
+                        type: integer
+                      returned:
+                        type: integer
+                      has_more:
+                        type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
   /api/books/{book_id}/chapters:

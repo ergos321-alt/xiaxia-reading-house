@@ -24,7 +24,12 @@ from psycopg.types.json import Jsonb
 
 import database as db
 import storage as object_storage
-from auth import action_required, api_or_session_required, web_api_required
+from auth import (
+    action_required,
+    api_or_session_required,
+    bearer_is_valid,
+    web_api_required,
+)
 from epub_parser import BookParseError, parse_uploaded_book_path
 from source_first import SourceFirstFailure, build_text_index, create_epub_publication
 
@@ -57,6 +62,46 @@ class ImportDeadlineExceeded(RuntimeError):
 @reading_bp.get("/api/books")
 @api_or_session_required
 def list_books():
+    lightweight = bearer_is_valid() or any(
+        name in request.args for name in ("query", "limit", "offset")
+    )
+    if lightweight:
+        query = str(request.args.get("query") or "").strip()[:200]
+        try:
+            limit = int(request.args.get("limit", 10))
+            offset = int(request.args.get("offset", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid_books_pagination"}), 400
+        if not 1 <= limit <= 50 or offset < 0:
+            return jsonify({"error": "invalid_books_pagination"}), 400
+        where = "where b.title ilike %s or coalesce(b.author, '') ilike %s" if query else ""
+        params: tuple[Any, ...] = (
+            (f"%{query}%", f"%{query}%", limit + 1, offset)
+            if query
+            else (limit + 1, offset)
+        )
+        rows = db.fetch_all(
+            f"""
+            select b.id, b.title, b.author, b.format
+            from books b
+            {where}
+            order by b.updated_at desc, b.id
+            limit %s offset %s
+            """,
+            params,
+        )
+        has_more = len(rows) > limit
+        return jsonify(
+            {
+                "books": [_json_safe(row) for row in rows[:limit]],
+                "pagination": {
+                    "limit": limit,
+                    "offset": offset,
+                    "returned": min(len(rows), limit),
+                    "has_more": has_more,
+                },
+            }
+        )
     rows = db.fetch_all(
         f"""
         select {BOOK_FIELDS},
