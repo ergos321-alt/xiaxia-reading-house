@@ -172,11 +172,15 @@ EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading H
 
 1. 把整个目录提交到 Git 仓库，Render 新建 Python Web Service。
 2. Build Command：`pip install -r requirements.txt`
-3. Start Command：`gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120 app:app`
+3. Start Command：`gunicorn --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --workers 1 --timeout 120 mcp_app:app`。Gunicorn 保持现有单 worker 和 120 秒 timeout；WSGI bridge 使用两个线程，沿用现有配置。
 4. Health Check Path：`/health`
 5. 配置上表七个必填环境变量后部署。
 
 Phase 2 必须先执行 `006_reader_engine_source_first.sql`，再部署代码。Build 与 Start Command 不变，不需要 Node runtime、新服务或 Supabase bucket 改动。旧书无需重新导入。
+
+## MCP
+
+`/mcp` 暴露与当前 OpenAPI operationId 同名的工具。每个工具只转发到既有 `/api/*` 路由，并复用 `ACTION_API_TOKEN`；Reader、annotations、Thought 和 progress 业务逻辑仍由 Flask API 处理。公网 `/mcp` 入站认证暂缓至统一 MCP Security Pass。
 
 健康检查结果：
 

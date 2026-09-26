@@ -199,7 +199,7 @@ def test_poc_does_not_replace_production_reader_or_action_schema():
     assert "reader.js" in html
     assert "foliate-poc.js" not in html
     assert hashlib.sha256((ROOT / "openapi.yaml").read_bytes()).hexdigest() == (
-        "27b645bea52d6cb92f3bdc25729388b56b116e094c2b106bd6ef0269d7a319bf"
+        "c6ecc7023b08899458d0517ca5ee9ec6ef32085f52837a59a92e9801cbb113ca"
     )
     assert "reader-engine-poc" not in (ROOT / "openapi.yaml").read_text()
 

@@ -32,10 +32,11 @@ def test_required_database_tables_are_declared():
 
 def test_render_process_shape_preserves_import_memory_headroom():
     command = (ROOT / "Procfile").read_text(encoding="utf-8")
+    mcp_adapter = (ROOT / "mcp_app.py").read_text(encoding="utf-8")
 
     assert "--workers 1" in command
-    assert "--threads 2" in command
     assert "--timeout 120" in command
+    assert "WSGIMiddleware(reading_app, workers=2)" in mcp_adapter
 
 
 def test_binary_assets_are_private_storage_metadata_only():
