@@ -77,7 +77,7 @@
 ## 复测命令
 
 ```bash
-python scripts/profile_epub_memory.py /path/to/one.epub /path/to/two.epub
+python scripts/profile_epub_memory.py sample_epub_a.epub sample_epub_b.epub
 python -m pytest -q
 python -m ruff check .
 python -m py_compile app.py annotations.py auth.py database.py epub_parser.py reading.py management.py memories.py operations.py storage.py

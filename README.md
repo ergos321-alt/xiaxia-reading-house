@@ -6,6 +6,10 @@ V2 以已验收的 V1.1 为唯一基础，保留章节/block、批注、Reply、
 
 Phase 3 在固定版 foliate-js 上增加版本化 Locator Bridge 和 dual anchor。部署前执行 `migrations/007_reader_engine_dual_anchor.sql`；`DUAL_ANCHOR_ENABLED=false` 为默认安全状态，关闭时 foliate 仍可只读。详细架构、部署与实机验收边界见 `PHASE3_DUAL_ANCHOR_REPORT.md` 和 `PHASE3_TEST_MATRIX.md`。
 
+## Current ChatGPT integration
+
+The current entry point is ordinary ChatGPT → Xiaxia Plugin → Reading MCP → this service. The Custom GPT Action schema and setup notes below are historical compatibility documentation; they are not the current ChatGPT architecture.
+
 ## 项目目录
 
 ```text
@@ -68,7 +72,7 @@ xiaxia-reading-house/
 
 ## 架构与持久化边界
 
-- Flask 是唯一数据入口。浏览器使用私人密码 Session；Custom GPT Action 使用 `Authorization: Bearer <ACTION_API_TOKEN>`。
+- Flask 是唯一数据入口。浏览器使用私人密码 Session；the historical Custom GPT Action route used `Authorization: Bearer <ACTION_API_TOKEN>`.
 - `books`、`chapters`、`reading_progress`、用户 `annotations`、`annotation_replies`、独立 `xiaxia_thoughts`、`thought_user_replies`、候选记录、操作日志与 `ai_reading_state` 存在 PostgreSQL。V2 另用独立表保存逐章 AI 完成事实、整本完成状态、最终评价、读后信与稀疏记忆事件。
 - `books.source_object_path` 与 `book_assets.object_path` 只保存 Storage object path；`book_assets` 另存 MIME type 和 byte size，不存在长期 `bytea`。
 - 私有 bucket `xiaxia-reading-house-private` 保存原始上传文件、封面与 EPUB 图片。所有对象保持 `public=false`，且不向 `anon`/`authenticated` 提供对象 policy。
@@ -191,7 +195,7 @@ Phase 2 必须先执行 `006_reader_engine_source_first.sql`，再部署代码�
 
 任何必填值缺失时，除 `/health` 和静态文件外服务会返回 503，不会用假值继续运行。
 
-## Custom GPT Action 配置
+## Historical Custom GPT Action 配置
 
 `openapi.yaml` 已固定真实 HTTPS origin：
 

@@ -11,3 +11,33 @@ build/
 *.egg-info/
 .DS_Store
 
+
+# Private local configuration and runtime data
+.env.*
+!.env.example
+*.env
+logs/
+*.log
+credentials*
+secrets*
+tokens*
+cookies*
+*.cookie
+*.cookies
+sessions/
+*.session
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+*.db-*
+*.sqlite-*
+*.pem
+*.key
+*.p12
+.idea/
+.vscode/
+tmp/
+temp/
+cache/

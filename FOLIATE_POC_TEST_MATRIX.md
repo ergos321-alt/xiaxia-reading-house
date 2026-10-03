@@ -167,7 +167,7 @@ Do not mark iPad PASS until a real iPad result is attached.
 Generate the fixture:
 
 ```bash
-python scripts/create_foliate_security_fixture.py /tmp/foliate-security.epub
+python scripts/create_foliate_security_fixture.py sample_epub_a.epub
 ```
 
 Open it through the Xiaxia POC and run the browser automation. Required:
@@ -189,7 +189,7 @@ python -m py_compile app.py reader_engine_poc.py storage.py
 node --check static/js/foliate-poc-adapter.js
 node --check static/js/foliate-poc.js
 node --check tests/foliate_poc_browser.mjs
-python scripts/inspect_foliate_corpus.py /path/to/corpus/*.epub
+python scripts/inspect_foliate_corpus.py sample_epub_a.epub
 ```
 
 Optional real browser automation after deploying/enabling the POC:
@@ -197,7 +197,7 @@ Optional real browser automation after deploying/enabling the POC:
 ```bash
 FOLIATE_POC_E2E_BASE_URL=https://your-service.example \
 FOLIATE_POC_E2E_PASSWORD='<test private password>' \
-FOLIATE_POC_E2E_FILES='["/absolute/book1.epub","/absolute/book2.epub"]' \
+FOLIATE_POC_E2E_FILES='["sample_epub_a.epub","sample_epub_b.epub"]' \
 node tests/foliate_poc_browser.mjs > foliate-results.json
 ```
 
