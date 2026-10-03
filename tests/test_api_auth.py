@@ -1,6 +1,20 @@
+import hashlib
+from pathlib import Path
+import sys
+import time
+import types
+from itsdangerous import URLSafeTimedSerializer
+import pytest
+
+if sys.platform == "win32" and "resource" not in sys.modules:
+    # Reading House's optional process-memory metric uses this POSIX module.
+    resource_stub = types.ModuleType("resource")
+    resource_stub.RUSAGE_SELF = 0
+    resource_stub.getrusage = lambda _who: types.SimpleNamespace(ru_maxrss=0)
+    sys.modules["resource"] = resource_stub
+
 import reading
 from app import create_app
-from pathlib import Path
 
 import yaml
 
@@ -12,6 +26,7 @@ def make_app():
             "DATABASE_URL": "postgresql://test.invalid/test",
             "PRIVATE_ACCESS_PASSWORD": "private-test-password",
             "ACTION_API_TOKEN": "action-test-token",
+            "READING_ASSERTION_SECRET": "test-reading-bridge-secret-material-32-bytes-min",
             "SECRET_KEY": "test-session-secret",
             "SUPABASE_URL": "https://test.supabase.co",
             "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
@@ -136,6 +151,18 @@ def test_browser_password_creates_private_session(monkeypatch):
     assert captured["params"] == ()
 
 
+def test_existing_web_login_library_and_reader_routes_remain_available():
+    client = make_app().test_client()
+    assert client.get("/login").status_code == 200
+    assert client.post("/login", data={"password": "private-test-password"}).status_code == 302
+    library = client.get("/library")
+    reader = client.get("/reader/11111111-1111-4111-8111-111111111111")
+    assert library.status_code == 200
+    assert reader.status_code == 200
+    assert "library.js" in library.get_data(as_text=True)
+    assert "reader.js" in reader.get_data(as_text=True)
+
+
 def test_openapi_routes_current_book_to_state_and_books_to_bounded_search():
     root = Path(__file__).resolve().parents[1]
     document = yaml.safe_load((root / "openapi.yaml").read_text(encoding="utf-8"))
@@ -166,3 +193,78 @@ def test_wrong_action_token_is_rejected():
         "/api/books", headers={"Authorization": "Bearer not-the-token"}
     )
     assert response.status_code == 401
+
+
+def _reading_assertion(**overrides):
+    now = int(time.time())
+    claims = {
+        "aud": "xiaxia-reading-house",
+        "role": "human",
+        "sub": "human-owner",
+        "iat": now,
+        "exp": now + 60,
+        "jti": "test-one-request-id",
+        **overrides,
+    }
+    return URLSafeTimedSerializer(
+        "test-reading-bridge-secret-material-32-bytes-min",
+        salt="xiaxia-reading-human-v1",
+        signer_kwargs={"digest_method": hashlib.sha256},
+    ).dumps(claims)
+
+
+def test_core_assertion_bootstraps_human_session_for_read_only_books(monkeypatch):
+    monkeypatch.setattr(reading.db, "fetch_all", lambda *_args, **_kwargs: [])
+    app = make_app()
+    app.config["SESSION_COOKIE_SECURE"] = True
+    client = app.test_client()
+    response = client.post(
+        "/api/app/bootstrap",
+        json={"assertion": _reading_assertion()},
+    )
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "ok"}
+    assert "HttpOnly" in response.headers["Set-Cookie"]
+    assert "Secure" in response.headers["Set-Cookie"]
+    assert client.get("/api/books", base_url="https://localhost").status_code == 200
+    assert client.get(
+        "/api/xiaxia/thoughts?book_id=11111111-1111-4111-8111-111111111111",
+        base_url="https://localhost",
+    ).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"aud": "another-service"},
+        {"role": "xiaxia"},
+        {"exp": int(time.time()) - 1, "iat": int(time.time()) - 62},
+    ],
+)
+def test_bootstrap_rejects_wrong_audience_role_and_expired_assertions(claims):
+    client = make_app().test_client()
+    response = client.post(
+        "/api/app/bootstrap",
+        json={"assertion": _reading_assertion(**claims)},
+    )
+    assert response.status_code == 401
+
+
+def test_bootstrap_rejects_malformed_or_bad_signature():
+    client = make_app().test_client()
+    assert client.post("/api/app/bootstrap", json={"assertion": "not-a-token"}).status_code == 401
+    forged = URLSafeTimedSerializer(
+        "different-secret-material-that-is-at-least-32-bytes",
+        salt="xiaxia-reading-human-v1",
+        signer_kwargs={"digest_method": hashlib.sha256},
+    ).dumps({"aud": "xiaxia-reading-house", "role": "human"})
+    assert client.post("/api/app/bootstrap", json={"assertion": forged}).status_code == 401
+
+
+def test_bootstrap_unavailable_without_separate_bridge_secret():
+    app = make_app()
+    app.config["READING_ASSERTION_SECRET"] = ""
+    response = app.test_client().post(
+        "/api/app/bootstrap", json={"assertion": "not-used"}
+    )
+    assert response.status_code == 503

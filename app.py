@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import time
 from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, make_response, redirect, render_template, request, session, url_for
+from itsdangerous import BadSignature, URLSafeTimedSerializer
 from werkzeug.exceptions import RequestEntityTooLarge
 
 import database
@@ -43,6 +46,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         DATABASE_URL=os.getenv("DATABASE_URL", ""),
         PRIVATE_ACCESS_PASSWORD=os.getenv("PRIVATE_ACCESS_PASSWORD", ""),
         ACTION_API_TOKEN=os.getenv("ACTION_API_TOKEN", ""),
+        READING_ASSERTION_SECRET=os.getenv("READING_ASSERTION_SECRET", ""),
         SUPABASE_URL=os.getenv("SUPABASE_URL", ""),
         SUPABASE_SERVICE_ROLE_KEY=os.getenv("SUPABASE_SERVICE_ROLE_KEY", ""),
         SUPABASE_STORAGE_BUCKET=os.getenv("SUPABASE_STORAGE_BUCKET", ""),
@@ -128,6 +132,45 @@ def create_app(test_config: dict | None = None) -> Flask:
     def logout():
         session.clear()
         return redirect(url_for("login"))
+
+    @app.post("/api/app/bootstrap")
+    def app_bootstrap():
+        secret = app.config.get("READING_ASSERTION_SECRET", "")
+        if not secret or len(secret.encode("utf-8")) < 32:
+            return jsonify({"error": "app_bootstrap_unavailable"}), 503
+        payload = request.get_json(silent=True)
+        assertion = payload.get("assertion") if isinstance(payload, dict) else None
+        if not isinstance(assertion, str) or not assertion or len(assertion) > 4096:
+            return jsonify({"error": "invalid_assertion"}), 401
+        serializer = URLSafeTimedSerializer(
+            secret,
+            salt="xiaxia-reading-human-v1",
+            signer_kwargs={"digest_method": hashlib.sha256},
+        )
+        try:
+            claims = serializer.loads(assertion, max_age=60)
+        except (BadSignature, TypeError, ValueError):
+            return jsonify({"error": "invalid_assertion"}), 401
+        now = int(time.time())
+        if (
+            not isinstance(claims, dict)
+            or claims.get("aud") != "xiaxia-reading-house"
+            or claims.get("role") != "human"
+            or claims.get("sub") != "human-owner"
+            or not isinstance(claims.get("iat"), int)
+            or not isinstance(claims.get("exp"), int)
+            or claims["iat"] > now + 5
+            or claims["exp"] <= now
+            or claims["exp"] - claims["iat"] > 60
+            or not isinstance(claims.get("jti"), str)
+            or not claims["jti"]
+        ):
+            return jsonify({"error": "invalid_assertion"}), 401
+        session.clear()
+        session["private_access"] = True
+        response = jsonify({"status": "ok"})
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/")
     def index():

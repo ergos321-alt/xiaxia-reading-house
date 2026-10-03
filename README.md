@@ -72,7 +72,7 @@ xiaxia-reading-house/
 
 ## 架构与持久化边界
 
-- Flask 是唯一数据入口。浏览器使用私人密码 Session；the historical Custom GPT Action route used `Authorization: Bearer <ACTION_API_TOKEN>`.
+- Flask 是唯一数据入口。浏览器使用私人密码 Session；the historical Custom GPT Action route used `Authorization: Bearer <ACTION_API_TOKEN>`. Xiaxia App may exchange its existing Core credential for a 60-second, Reading-audience human assertion; `/api/app/bootstrap` turns that assertion into the same human session without granting Action identity.
 - `books`、`chapters`、`reading_progress`、用户 `annotations`、`annotation_replies`、独立 `xiaxia_thoughts`、`thought_user_replies`、候选记录、操作日志与 `ai_reading_state` 存在 PostgreSQL。V2 另用独立表保存逐章 AI 完成事实、整本完成状态、最终评价、读后信与稀疏记忆事件。
 - `books.source_object_path` 与 `book_assets.object_path` 只保存 Storage object path；`book_assets` 另存 MIME type 和 byte size，不存在长期 `bytea`。
 - 私有 bucket `xiaxia-reading-house-private` 保存原始上传文件、封面与 EPUB 图片。所有对象保持 `public=false`，且不向 `anon`/`authenticated` 提供对象 policy。
@@ -163,6 +163,7 @@ EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading H
 | `PRIVATE_ACCESS_PASSWORD` | 是 | 私人网页访问密码 |
 | `ACTION_API_TOKEN` | 是 | Custom GPT Action Bearer token |
 | `FLASK_SECRET_KEY` | 是 | 独立随机 Session 签名密钥 |
+| `READING_ASSERTION_SECRET` | 否 | 与 Xiaxia Core 单独共享的随机签名密钥；App bootstrap 启用时必填，不得复用任何现有凭据 |
 | `MAX_UPLOAD_MB` | 否 | 默认 50 |
 | `DB_POOL_MIN` | 否 | 默认 1，免费实例可设 0 |
 | `DB_POOL_MAX` | 否 | 默认 2，与单 worker / 2 threads 对齐 |
@@ -170,7 +171,7 @@ EPUB 内部链接在导入时规范化，章节 API 再映射到真实 Reading H
 | `READER_ENGINE_ENABLED` | 否 | Phase 2 总开关；默认 false，验收后设 true |
 | `READER_SOURCE_SIGNED_URL_TTL` | 否 | private EPUB signed URL 秒数，60–300，默认 180 |
 
-`SUPABASE_SERVICE_ROLE_KEY` 只能存在于 Render 后端环境变量或本地未提交 `.env`；不得写进 Git、HTML、JavaScript、OpenAPI 或聊天正文。本轮没有新增外部服务，也没有新增必填环境变量。
+`SUPABASE_SERVICE_ROLE_KEY` 只能存在于 Render 后端环境变量或本地未提交 `.env`；不得写进 Git、HTML、JavaScript、OpenAPI 或聊天正文。Reading bootstrap assertion 在 60 秒内带唯一 `jti`，但本阶段不增加消费记录存储，因此存在最多 60 秒的有界重放窗口；传输须保持 HTTPS，断言不得写入日志。
 
 ## Render 部署
 
