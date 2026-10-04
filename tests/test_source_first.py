@@ -524,6 +524,20 @@ def make_client(**config):
     return client
 
 
+def test_book_serialization_exposes_backend_retryability():
+    client = make_client()
+    with client.application.app_context():
+        base = {"id": BOOK_ID, "title": "测试书", "text_index_status": "failed"}
+        retryable = reading._serialize_book(
+            {**base, "text_index_failure_code": "text_index_parse_failed"}
+        )
+        blocked = reading._serialize_book(
+            {**base, "text_index_failure_code": "text_index_mapping_failed"}
+        )
+    assert retryable["text_index_retryable"] is True
+    assert blocked["text_index_retryable"] is False
+
+
 def test_source_access_is_authorized_short_lived_and_secret_free(monkeypatch):
     monkeypatch.setattr(
         reading.db,

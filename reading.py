@@ -1938,6 +1938,10 @@ def _serialize_book(row: dict[str, Any]) -> dict[str, Any]:
     )
     status = str(row.get("text_index_status") or "ready")
     result["text_index_ready"] = status == "ready"
+    result["text_index_retryable"] = (
+        status == "failed"
+        and row.get("text_index_failure_code") != "text_index_mapping_failed"
+    )
     result["ai_reading_note"] = {
         "pending": "夏夏正在整理这本书",
         "processing": "夏夏正在整理这本书",
