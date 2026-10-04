@@ -233,6 +233,19 @@ def test_core_assertion_bootstraps_human_session_for_read_only_books(monkeypatch
     ).status_code == 401
 
 
+def test_webview_form_bootstrap_creates_same_human_session(monkeypatch):
+    monkeypatch.setattr(reading.db, "fetch_all", lambda *_args, **_kwargs: [])
+    client = make_app().test_client()
+    response = client.post(
+        "/api/app/bootstrap",
+        data={"assertion": _reading_assertion()},
+        content_type="application/x-www-form-urlencoded",
+    )
+    assert response.status_code == 200
+    assert "HttpOnly" in response.headers["Set-Cookie"]
+    assert client.get("/api/books", base_url="https://localhost").status_code == 200
+
+
 @pytest.mark.parametrize(
     "claims",
     [

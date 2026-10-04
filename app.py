@@ -139,7 +139,12 @@ def create_app(test_config: dict | None = None) -> Flask:
         if not secret or len(secret.encode("utf-8")) < 32:
             return jsonify({"error": "app_bootstrap_unavailable"}), 503
         payload = request.get_json(silent=True)
-        assertion = payload.get("assertion") if isinstance(payload, dict) else None
+        # Android WebView POST bodies are URL-encoded and cannot set a custom header.
+        assertion = (
+            payload.get("assertion")
+            if isinstance(payload, dict)
+            else request.form.get("assertion")
+        )
         if not isinstance(assertion, str) or not assertion or len(assertion) > 4096:
             return jsonify({"error": "invalid_assertion"}), 401
         serializer = URLSafeTimedSerializer(
